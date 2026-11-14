@@ -91,6 +91,9 @@ All notable changes to this project are documented here. The format follows
   `ecr:TagResource`, which made cache pulls fail with only "repository not found" (#5).
 
 ### Changed
-- **Tests use [substrate](https://github.com/scttfrdmn/substrate)** (pinned v0.124.0, `make tools`)
-  instead of moto. Missing capabilities are filed upstream (substrate#1445, #1460–#1465) and shimmed
-  in `tests/substrate_gaps.py` until they land.
+- **Tests use [substrate](https://github.com/scttfrdmn/substrate)** (pinned v0.126.0, `make tools`)
+  instead of moto. They now run against substrate's real Auto Scaling, ECR pull-through cache, SQS
+  counts and receive attributes, S3 ownership controls and default VPC; the earlier shims are gone
+  (substrate#1445, #1460–#1465, #1472). `tests/substrate_gaps.py` keeps one workaround: substrate
+  has no Graviton instance types, so tests that need running workers retarget the group at `m5`
+  (substrate#1497). Two strict xfails cover open gaps (substrate#1471 and #1497).

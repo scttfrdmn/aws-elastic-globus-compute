@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import time
+import urllib.request
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -12,7 +14,7 @@ import pytest
 from globus_compute_endpoint.engines.base import GCFuture
 
 from aegc import naming, protocol
-from aegc.engine import AWSEngine
+from aegc.engine import STALL_AFTER_S, STALL_PAUSE_S, AWSEngine
 from aegc.infra import deployment
 from aegc.infra.deployment import Clients, DeploymentSpec, PoolSpec
 from aegc.protocol import ErrorInfo, Payload, ResultMessage
@@ -20,11 +22,12 @@ from aegc.worker.agent import Agent
 from aegc.worker.config import WorkerConfig
 from aegc.worker.testing import pack_task, unpack_result
 from tests.conftest import ACCOUNT, REGION
-from tests.substrate_gaps import FakeAutoScaling, sqs_for_worker, sqs_with_counts
+from tests.substrate_gaps import launch_on_substrate
 
 BUCKET = naming.bucket_name(ACCOUNT, REGION)
 IMAGE = f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/aegc/geospatial@sha256:" + "d" * 64
 EID = uuid.UUID(int=99)
+GROUP = "aegc-dev-geo-py314"
 
 
 def triple(x: int) -> int:
@@ -32,21 +35,19 @@ def triple(x: int) -> int:
 
 
 class Env:
-    def __init__(self, aws: Callable[[str], Any], tmp: Path, *, python: str = "3.14") -> None:
+    def __init__(
+        self, aws: Callable[[str], Any], tmp: Path, substrate_url: str, *, python: str = "3.14"
+    ) -> None:
         self.aws = aws
         self.tmp = tmp
-        self.asg = FakeAutoScaling()
+        self.substrate_url = substrate_url
+        self.asg = aws("autoscaling")
         self.sqs = aws("sqs")
         self.s3 = aws("s3")
         self.ssm = aws("ssm")
         self.s3.create_bucket(
             Bucket=BUCKET, CreateBucketConfiguration={"LocationConstraint": REGION}
         )
-        ec2 = aws("ec2")
-        vpc = ec2.create_vpc(CidrBlock="172.31.0.0/16")["Vpc"]["VpcId"]
-        subnet = ec2.create_subnet(
-            VpcId=vpc, CidrBlock="172.31.0.0/20", AvailabilityZone=f"{REGION}a"
-        )["Subnet"]["SubnetId"]
         pool = PoolSpec(
             name="geo-py314",
             env="geospatial",
@@ -60,13 +61,12 @@ class Env:
             account=ACCOUNT,
             region=REGION,
             bucket=BUCKET,
-            pools=(pool,),
-            subnet_ids=(subnet,),
+            pools=(pool,),  # in the default VPC
         )
         deployment.deploy(
             Clients(
                 iam=aws("iam"),
-                ec2=ec2,
+                ec2=aws("ec2"),
                 autoscaling=self.asg,
                 sqs=self.sqs,
                 logs=aws("logs"),
@@ -75,8 +75,9 @@ class Env:
             self.spec,
         )
         self.task_queue = self.sqs.get_queue_url(QueueName="aegc-dev-geo-py314-tasks")["QueueUrl"]
+        launch_on_substrate(self.asg, GROUP)  # substrate#1497
 
-    def engine(self, *, python_minor: str = "3.14", sqs: Any = None, **kw: Any) -> AWSEngine:
+    def engine(self, *, python_minor: str = "3.14", **kw: Any) -> AWSEngine:
         e = AWSEngine(
             deployment="dev",
             region=REGION,
@@ -88,7 +89,7 @@ class Env:
             **kw,
         )
         e._clients = {
-            "sqs": sqs or self.sqs,
+            "sqs": self.sqs,
             "s3": self.s3,
             "ssm": self.ssm,
             "autoscaling": self.asg,
@@ -107,14 +108,58 @@ class Env:
             scratch=str(self.tmp / "scratch"),
             instance_id="i-abc",
         )
-        return Agent(
-            config=cfg, sqs=sqs_for_worker(self.sqs), s3=self.s3, autoscaling=self.asg, wait_s=1
+        return Agent(config=cfg, sqs=self.sqs, s3=self.s3, autoscaling=self.asg, wait_s=1)
+
+    def demand(self, n: int) -> None:
+        """Queue n tasks no worker has claimed yet."""
+        for i in range(0, n, 10):
+            self.sqs.send_message_batch(
+                QueueUrl=self.task_queue,
+                Entries=[{"Id": str(j), "MessageBody": "{}"} for j in range(min(10, n - i))],
+            )
+
+    def drain(self) -> None:
+        """Take every queued task off the queue (workers finished them)."""
+        while msgs := self.sqs.receive_message(
+            QueueUrl=self.task_queue, MaxNumberOfMessages=10, WaitTimeSeconds=0
+        ).get("Messages"):
+            self.sqs.delete_message_batch(
+                QueueUrl=self.task_queue,
+                Entries=[
+                    {"Id": str(i), "ReceiptHandle": m["ReceiptHandle"]} for i, m in enumerate(msgs)
+                ],
+            )
+
+    def group(self) -> dict[str, Any]:
+        return dict(
+            self.asg.describe_auto_scaling_groups(AutoScalingGroupNames=[GROUP])[
+                "AutoScalingGroups"
+            ][0]
         )
+
+    def seed_launch_failure(self, message: str) -> None:
+        """Make the group's launches fail, as with no Spot capacity (substrate control plane)."""
+        req = urllib.request.Request(
+            f"{self.substrate_url}/v1/autoscaling/launch-failure",
+            data=json.dumps({"autoScalingGroupName": GROUP, "statusMessage": message}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5):
+            pass
+
+    def clear_launch_failure(self) -> None:
+        req = urllib.request.Request(
+            f"{self.substrate_url}/v1/autoscaling/launch-failure?autoScalingGroupName={GROUP}",
+            method="DELETE",
+        )
+        with urllib.request.urlopen(req, timeout=5):
+            pass
 
 
 @pytest.fixture
-def env(aws: Callable[[str], Any], tmp_path: Path) -> Env:
-    return Env(aws, tmp_path)
+def env(aws: Callable[[str], Any], tmp_path: Path, substrate: Any) -> Env:
+    return Env(aws, tmp_path, substrate.url)
 
 
 def submit(
@@ -128,14 +173,10 @@ def submit(
 
 def queued(env: Env) -> list[protocol.TaskMessage]:
     """Peek at the pool's task queue without consuming it."""
-    r = env.sqs.receive_message(QueueUrl=env.task_queue, MaxNumberOfMessages=10, WaitTimeSeconds=0)
-    msgs = r.get("Messages", [])
-    for m in msgs:
-        # substrate#1462 ignores a per-receive VisibilityTimeout, so release explicitly.
-        env.sqs.change_message_visibility(
-            QueueUrl=env.task_queue, ReceiptHandle=m["ReceiptHandle"], VisibilityTimeout=0
-        )
-    return [protocol.TaskMessage.decode(m["Body"]) for m in msgs]
+    r = env.sqs.receive_message(
+        QueueUrl=env.task_queue, MaxNumberOfMessages=10, WaitTimeSeconds=0, VisibilityTimeout=0
+    )
+    return [protocol.TaskMessage.decode(m["Body"]) for m in r.get("Messages", [])]
 
 
 @pytest.mark.timeout(120)
@@ -166,7 +207,7 @@ def test_missing_deployment_fails_tasks_not_the_endpoint(
         "sqs": aws("sqs"),
         "s3": aws("s3"),
         "ssm": aws("ssm"),
-        "autoscaling": FakeAutoScaling(),
+        "autoscaling": aws("autoscaling"),
     }
     e.start(endpoint_id=EID, run_dir=str(tmp_path))  # must not raise
     try:
@@ -298,36 +339,70 @@ def test_orphan_result_is_recovered_for_the_interchange(env: Env) -> None:
 
 @pytest.mark.timeout(60)
 def test_scaler_scales_out_only(env: Env) -> None:
-    counts: dict[str, tuple[int, int]] = {}
-    e = env.engine(sqs=sqs_with_counts(env.sqs, counts))  # substrate#1472
+    e = env.engine()
     try:
-        counts[env.task_queue] = (7, 0)
+        env.demand(7)
         snap = e.scale_once()
-        assert env.asg.groups["aegc-dev-geo-py314"]["DesiredCapacity"] == 4  # ceil(7 / 2 slots)
         assert snap.pools["geo-py314"].visible == 7
-        counts[env.task_queue] = (0, 0)
-        e.scale_once()
-        assert env.asg.groups["aegc-dev-geo-py314"]["DesiredCapacity"] == 4  # never scales in
-        counts[env.task_queue] = (50, 0)
-        e.scale_once()
-        assert env.asg.groups["aegc-dev-geo-py314"]["DesiredCapacity"] == 5  # capped at max
+        g = env.group()
+        assert g["DesiredCapacity"] == 4  # ceil(7 / 2 slots)
+        assert len(g["Instances"]) == 4  # Auto Scaling launched them
+        env.drain()
+        assert e.scale_once().pools["geo-py314"].visible == 0
+        assert env.group()["DesiredCapacity"] == 4  # never scales in; workers leave themselves
+        env.demand(50)
+        snap = e.scale_once()
+        assert snap.pools["geo-py314"].visible == 50
+        assert snap.pools["geo-py314"].desired == env.group()["DesiredCapacity"] == 5  # max
+        assert snap.pools["geo-py314"].last_scaling_error == ""
+    finally:
+        e.shutdown()
+
+
+@pytest.mark.timeout(60)
+def test_scaler_counts_claimed_tasks(env: Env) -> None:
+    e = env.engine()
+    try:
+        env.demand(3)
+        env.sqs.receive_message(QueueUrl=env.task_queue, MaxNumberOfMessages=3, WaitTimeSeconds=0)
+        m = e.scale_once().pools["geo-py314"]
+        assert (m.visible, m.inflight) == (0, 3)
+        assert env.group()["DesiredCapacity"] == 2  # ceil(3 / 2)
     finally:
         e.shutdown()
 
 
 @pytest.mark.timeout(60)
 def test_stall_breaker_pauses_scale_out(env: Env) -> None:
-    counts = {env.task_queue: (3, 0)}
-    e = env.engine(sqs=sqs_with_counts(env.sqs, counts))
+    no_capacity = "There is no Spot capacity available that matches your request."
+    env.seed_launch_failure(no_capacity)
+    e = env.engine()
     try:
-        e.scale_once(now=1000.0)  # desired -> 2
-        assert not e.scale_once(now=1010.0).pools["geo-py314"].stalled  # nothing in service yet
-        snap = e.scale_once(now=1010.0 + 15 * 60)
-        assert snap.pools["geo-py314"].stalled
+        env.demand(3)
+        t0 = 1000.0
+        snap = e.scale_once(now=t0)
+        assert snap.pools["geo-py314"].desired == env.group()["DesiredCapacity"] == 2
+        assert env.group()["Instances"] == []  # every launch failed
+        activities = env.asg.describe_scaling_activities(AutoScalingGroupName=GROUP)["Activities"]
+        assert activities and {a["StatusCode"] for a in activities} == {"Failed"}
+        assert no_capacity in activities[0]["StatusMessage"]
+
+        assert not e.scale_once(now=t0 + 10).pools["geo-py314"].stalled  # not for long yet
+        snap = e.scale_once(now=t0 + 10 + STALL_AFTER_S)
+        assert snap.pools["geo-py314"].stalled and snap.pools["geo-py314"].in_service == 0
         # Paused: even more demand doesn't scale out while stalled.
-        counts[env.task_queue] = (9, 0)
-        assert e.scale_once(now=1010.0 + 15 * 60 + 60).pools["geo-py314"].desired == 2
+        env.demand(6)
+        assert e.scale_once(now=t0 + 10 + STALL_AFTER_S + 60).pools["geo-py314"].desired == 2
+        assert env.group()["DesiredCapacity"] == 2
         assert e.get_status_report().global_state["pools"]["geo-py314"]["stalled"] is True
+
+        # Capacity comes back: the group launches, and after the pause the scaler resumes.
+        env.clear_launch_failure()
+        snap = e.scale_once(now=t0 + 10 + STALL_AFTER_S + STALL_PAUSE_S + 1)
+        assert not snap.pools["geo-py314"].stalled and snap.pools["geo-py314"].in_service == 2
+        g = env.group()
+        assert g["DesiredCapacity"] == 5  # ceil(9 / 2), capped at max
+        assert [i["LifecycleState"] for i in g["Instances"]] == ["InService"] * 5
     finally:
         e.shutdown()
 

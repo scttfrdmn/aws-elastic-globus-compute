@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
@@ -12,13 +13,13 @@ from typing import Any
 
 import pytest
 
-from aegc import payloads, protocol
+from aegc import naming, payloads, protocol
+from aegc.infra import deployment
 from aegc.protocol import Payload, ResultMessage, TaskMessage
 from aegc.worker.agent import Agent
 from aegc.worker.config import WorkerConfig
 from aegc.worker.testing import pack_task, unpack_result
 from tests.conftest import REGION
-from tests.substrate_gaps import FakeAutoScaling, sqs_for_worker
 
 BUCKET = "aegc-123456789012-us-west-2"
 EID = str(uuid.UUID(int=7))
@@ -47,19 +48,22 @@ def big() -> bytes:
     return b"x" * 900_000
 
 
+GROUP = "aegc-dev-p"
+
+
 class Rig:
-    def __init__(self, aws: Callable[[str], Any], tmp: Path, **shim: Any) -> None:
-        self.raw_sqs = aws("sqs")
-        self.sqs = sqs_for_worker(self.raw_sqs, **shim)
+    def __init__(self, aws: Callable[[str], Any], tmp: Path) -> None:
+        self.aws = aws
+        self.sqs = aws("sqs")
         self.s3 = aws("s3")
         self.s3.create_bucket(
             Bucket=BUCKET, CreateBucketConfiguration={"LocationConstraint": REGION}
         )
-        self.tasks = self.raw_sqs.create_queue(
+        self.tasks = self.sqs.create_queue(
             QueueName="aegc-dev-p-tasks", Attributes={"VisibilityTimeout": "300"}
         )["QueueUrl"]
-        self.results = self.raw_sqs.create_queue(QueueName="aegc-dev-res-x")["QueueUrl"]
-        self.asg = FakeAutoScaling()
+        self.results = self.sqs.create_queue(QueueName="aegc-dev-res-x")["QueueUrl"]
+        self.asg = aws("autoscaling")
         self.cfg = WorkerConfig(
             deployment="dev",
             pool="p",
@@ -70,6 +74,43 @@ class Rig:
             idle_timeout_s=3600,
             scratch=str(tmp),
             instance_id="i-123",
+        )
+
+    def join_group(self, *, min_size: int = 0) -> str:
+        """Run this worker on a real instance of a real group; returns the instance id."""
+        ec2 = self.aws("ec2")
+        ami = self.aws("ssm").get_parameter(Name=deployment.AMI_PARAMETER)["Parameter"]["Value"]
+        ec2.create_launch_template(
+            LaunchTemplateName=GROUP,
+            LaunchTemplateData={"ImageId": ami, "InstanceType": "m5.large"},
+        )
+        subnets = ec2.describe_subnets(Filters=[{"Name": "default-for-az", "Values": ["true"]}])[
+            "Subnets"
+        ]
+        self.asg.create_auto_scaling_group(
+            AutoScalingGroupName=GROUP,
+            MinSize=min_size,
+            MaxSize=2,
+            DesiredCapacity=min_size,
+            VPCZoneIdentifier=",".join(s["SubnetId"] for s in subnets),
+            LaunchTemplate={"LaunchTemplateName": GROUP, "Version": "$Default"},
+            NewInstancesProtectedFromScaleIn=True,
+            Tags=[
+                {"Key": k, "Value": v, "PropagateAtLaunch": True}
+                for k, v in naming.tags("dev", "asg", pool="p").items()
+            ],
+        )
+        self.asg.set_desired_capacity(AutoScalingGroupName=GROUP, DesiredCapacity=1)
+        (inst,) = self.group()["Instances"]
+        assert inst["LifecycleState"] == "InService"
+        self.cfg = WorkerConfig(**{**self.cfg.__dict__, "instance_id": inst["InstanceId"]})
+        return str(inst["InstanceId"])
+
+    def group(self) -> dict[str, Any]:
+        return dict(
+            self.asg.describe_auto_scaling_groups(AutoScalingGroupNames=[GROUP])[
+                "AutoScalingGroups"
+            ][0]
         )
 
     def agent(self, **kw: Any) -> Agent:
@@ -94,19 +135,19 @@ class Rig:
             task=task,
             walltime_s=walltime_s,
         )
-        self.raw_sqs.send_message(QueueUrl=self.tasks, MessageBody=msg.encode())
+        self.sqs.send_message(QueueUrl=self.tasks, MessageBody=msg.encode())
         return tid
 
     def replies(self, n: int, timeout_s: float = 30) -> list[ResultMessage]:
         out: list[ResultMessage] = []
         deadline = time.monotonic() + timeout_s
         while len(out) < n and time.monotonic() < deadline:
-            r = self.raw_sqs.receive_message(
+            r = self.sqs.receive_message(
                 QueueUrl=self.results, MaxNumberOfMessages=10, WaitTimeSeconds=1
             )
             for m in r.get("Messages", []):
                 out.append(ResultMessage.decode(m["Body"]))
-                self.raw_sqs.delete_message(QueueUrl=self.results, ReceiptHandle=m["ReceiptHandle"])
+                self.sqs.delete_message(QueueUrl=self.results, ReceiptHandle=m["ReceiptHandle"])
         return out
 
     def final(self, n: int) -> dict[str, ResultMessage]:
@@ -115,9 +156,7 @@ class Rig:
         return {m.task_uuid: m for m in got}
 
     def task_queue_empty(self) -> bool:
-        r = self.raw_sqs.receive_message(
-            QueueUrl=self.tasks, WaitTimeSeconds=0, VisibilityTimeout=0
-        )
+        r = self.sqs.receive_message(QueueUrl=self.tasks, WaitTimeSeconds=0, VisibilityTimeout=0)
         return not r.get("Messages")
 
 
@@ -180,11 +219,19 @@ def test_large_result_goes_through_s3(rig: Rig) -> None:
 
 
 @pytest.mark.timeout(60)
-def test_poison_task_is_not_rerun(aws: Callable[[str], Any], tmp_path: Path) -> None:
-    rig = Rig(aws, tmp_path, receive_counts={"": 5})
+def test_poison_task_is_not_rerun(rig: Rig) -> None:
     a = rig.agent()
     tid = rig.submit(double, 1)
-    a.claim_once()
+    # Workers that died holding it: each receive counts as a delivery.
+    for n in range(1, rig.cfg.max_deliveries + 1):
+        (m,) = rig.sqs.receive_message(
+            QueueUrl=rig.tasks,
+            VisibilityTimeout=0,
+            WaitTimeSeconds=0,
+            MessageSystemAttributeNames=["ApproximateReceiveCount"],
+        )["Messages"]
+        assert m["Attributes"]["ApproximateReceiveCount"] == str(n)
+    assert a.claim_once() == 1
     m = rig.final(1)[tid]
     assert m.kind == "system_failure" and m.error is not None
     assert m.error.code == "WORKER_LOST_REPEATEDLY"
@@ -205,7 +252,7 @@ def test_missing_payload(rig: Rig) -> None:
         submitted_at=time.time(),
         task=Payload(s3=protocol.S3Ref(BUCKET, "payloads/dev/tasks/gone/1.task", 10, "0" * 64)),
     )
-    rig.raw_sqs.send_message(QueueUrl=rig.tasks, MessageBody=msg.encode())
+    rig.sqs.send_message(QueueUrl=rig.tasks, MessageBody=msg.encode())
     a.claim_once()
     m = rig.final(1)[tid]
     assert m.error is not None and m.error.code == "PAYLOAD_MISSING"
@@ -220,41 +267,66 @@ def test_interruption_releases_inflight(rig: Rig) -> None:
     assert started and started[0].task_uuid == tid
     a.handle_notice("interruption")
     # Released with visibility 0: another worker can claim it straight away.
-    r = rig.raw_sqs.receive_message(QueueUrl=rig.tasks, WaitTimeSeconds=1)
+    r = rig.sqs.receive_message(QueueUrl=rig.tasks, WaitTimeSeconds=1)
     assert r.get("Messages") and tid in r["Messages"][0]["Body"]
     assert a.stats.released == 1
 
 
 @pytest.mark.timeout(60)
 def test_idle_drain_leaves_the_group(rig: Rig) -> None:
+    me = rig.join_group()
+    assert rig.group()["DesiredCapacity"] == 1
     clock = [0.0]
     a = rig.agent(clock=lambda: clock[0])
     a.config = WorkerConfig(**{**rig.cfg.__dict__, "idle_timeout_s": 10})
-    t = threading.Thread(target=a.run, daemon=True)
+    result: list[str] = []
+    t = threading.Thread(target=lambda: result.append(a.run()), daemon=True)
     clock[0] = 100.0
     t.start()
     t.join(30)
-    assert not t.is_alive()
-    assert rig.asg.terminated == [("i-123", True)]
+    assert not t.is_alive() and result == ["idle"]
+    # Terminated through Auto Scaling, decrementing desired capacity: no replacement launches.
+    g = rig.group()
+    assert g["DesiredCapacity"] == 0
+    assert me not in [i["InstanceId"] for i in g["Instances"]]
+    (r,) = rig.aws("ec2").describe_instances(InstanceIds=[me])["Reservations"]
+    assert r["Instances"][0]["State"]["Name"] in {"shutting-down", "terminated"}
 
 
 @pytest.mark.timeout(60)
 def test_idle_at_min_size_keeps_running(rig: Rig) -> None:
+    # MinSize 1: Auto Scaling refuses a decrementing terminate with ValidationError.
+    me = rig.join_group(min_size=1)
     clock = [0.0]
-    rig.asg.refuse_terminate = True
     a = rig.agent(clock=lambda: clock[0])
     a.config = WorkerConfig(**{**rig.cfg.__dict__, "idle_timeout_s": 10})
     clock[0] = 100.0
     reason = a.run(max_cycles=2)
-    assert rig.asg.terminated and reason == "stopped"
+    assert reason == "stopped"
+    g = rig.group()
+    assert g["DesiredCapacity"] == 1
+    assert [(i["InstanceId"], i["LifecycleState"]) for i in g["Instances"]] == [(me, "InService")]
 
 
 @pytest.mark.timeout(120)
-def test_heartbeat_extends_visibility(rig: Rig) -> None:
+def test_heartbeat_extends_visibility(rig: Rig, caplog: pytest.LogCaptureFixture) -> None:
     a = rig.agent()
     rig.submit(sleeper, 5)
     a.claim_once()
-    assert a.extend_visibility() == 1
+    with caplog.at_level(logging.WARNING, logger="aegc"):
+        assert a.extend_visibility() == 1
+    assert not [r for r in caplog.records if "visibility" in r.getMessage()]
+    attrs = rig.sqs.get_queue_attributes(
+        QueueUrl=rig.tasks,
+        AttributeNames=["ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible"],
+    )["Attributes"]
+    assert (
+        attrs["ApproximateNumberOfMessages"],
+        attrs["ApproximateNumberOfMessagesNotVisible"],
+    ) == (
+        "0",
+        "1",
+    )
     a.wait_idle()
 
 

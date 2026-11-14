@@ -7,16 +7,16 @@ import pytest
 from aegc import naming
 from aegc.infra import OwnershipError, bootstrap
 from tests.conftest import ACCOUNT, REGION
-from tests.substrate_gaps import FakeEcrPullThrough, s3_with_ownership_controls
 
 BUCKET = naming.bucket_name(ACCOUNT, REGION)
 ROLE = naming.ecr_template_role(REGION)
+PREFIX = naming.pull_through_prefix()
 
 
-def clients(aws: Callable[[str], Any], fake_ecr: FakeEcrPullThrough) -> dict[str, Any]:
+def clients(aws: Callable[[str], Any]) -> dict[str, Any]:
     return {
-        "s3": s3_with_ownership_controls(aws("s3")),
-        "ecr": fake_ecr.wrap(aws("ecr")),
+        "s3": aws("s3"),
+        "ecr": aws("ecr"),
         "ssm": aws("ssm"),
         "iam": aws("iam"),
         "account": ACCOUNT,
@@ -28,9 +28,27 @@ def outcomes(report: bootstrap.Report) -> dict[tuple[str, str], str]:
     return {(a.resource, a.name): a.outcome for a in report.actions}
 
 
+def pull_through_rules(ecr: Any) -> dict[str, str]:
+    try:
+        rules = ecr.describe_pull_through_cache_rules(ecrRepositoryPrefixes=[PREFIX])
+    except ecr.exceptions.PullThroughCacheRuleNotFoundException:
+        return {}
+    return {
+        r["ecrRepositoryPrefix"]: r["upstreamRegistryUrl"] for r in rules["pullThroughCacheRules"]
+    }
+
+
+def creation_template(ecr: Any) -> dict[str, Any] | None:
+    try:
+        found = ecr.describe_repository_creation_templates(prefixes=[PREFIX])
+    except ecr.exceptions.TemplateNotFoundException:
+        return None
+    templates = found["repositoryCreationTemplates"]
+    return dict(templates[0]) if templates else None
+
+
 def test_bootstrap_creates_then_is_idempotent(aws: Callable[[str], Any]) -> None:
-    fake = FakeEcrPullThrough()
-    c = clients(aws, fake)
+    c = clients(aws)
 
     first = outcomes(bootstrap.bootstrap(**c))
     assert first[("s3 bucket", BUCKET)] == "created"
@@ -51,14 +69,17 @@ def test_bootstrap_creates_then_is_idempotent(aws: Callable[[str], Any]) -> None
         "RestrictPublicBuckets"
     ]
     assert "aws:SecureTransport" in s3.get_bucket_policy(Bucket=BUCKET)["Policy"]
-    assert fake.rules == {"aegc-quay": "quay.io"}
-    template_tags = naming.tag_dict(fake.templates["aegc-quay"]["resourceTags"])
-    assert naming.is_owned("aegc-quay", template_tags, naming.BOOTSTRAP)
+    ecr = aws("ecr")
+    assert pull_through_rules(ecr) == {PREFIX: "quay.io"}
+    template = creation_template(ecr)
+    assert template is not None
+    assert template["appliedFor"] == ["PULL_THROUGH_CACHE"]
+    assert naming.is_owned(PREFIX, naming.tag_dict(template["resourceTags"]), naming.BOOTSTRAP)
 
     # The template uses aegc's own role; ECR's default role can't tag (spike #5).
     iam = aws("iam")
     role = iam.get_role(RoleName=ROLE)["Role"]
-    assert fake.templates["aegc-quay"]["customRoleArn"] == role["Arn"]
+    assert template["customRoleArn"] == role["Arn"]
     assert role["Path"] == naming.IAM_PATH
     assert naming.is_owned(
         ROLE, naming.tag_dict(iam.list_role_tags(RoleName=ROLE)["Tags"]), naming.BOOTSTRAP
@@ -72,44 +93,51 @@ def test_bootstrap_creates_then_is_idempotent(aws: Callable[[str], Any]) -> None
 
 
 def test_template_without_custom_role_is_corrected(aws: Callable[[str], Any]) -> None:
-    fake = FakeEcrPullThrough()
-    c = clients(aws, fake)
-    bootstrap.bootstrap(**c)
-    del fake.templates["aegc-quay"]["customRoleArn"]
-    report = outcomes(bootstrap.bootstrap(**c))
-    assert report[("ecr creation template", "aegc-quay")] == "updated"
-    assert fake.templates["aegc-quay"]["customRoleArn"].endswith(f"/aegc/{ROLE}")
+    ecr = aws("ecr")
+    # A template made before aegc used its own role: ECR's default role can't tag (spike #5).
+    ecr.create_repository_creation_template(
+        prefix=PREFIX, appliedFor=["PULL_THROUGH_CACHE"], imageTagMutability="MUTABLE"
+    )
+    template = creation_template(ecr)
+    assert template is not None and not template.get("customRoleArn")
+    report = outcomes(bootstrap.bootstrap(**clients(aws)))
+    assert report[("ecr creation template", PREFIX)] == "updated"
+    template = creation_template(ecr)
+    assert template is not None
+    assert template["customRoleArn"].endswith(f"/aegc/{ROLE}")
 
 
 def test_refuses_untagged_template_role(aws: Callable[[str], Any]) -> None:
     aws("iam").create_role(RoleName=ROLE, Path="/aegc/", AssumeRolePolicyDocument="{}")
     with pytest.raises(OwnershipError, match=ROLE):
-        bootstrap.bootstrap(**clients(aws, FakeEcrPullThrough()))
+        bootstrap.bootstrap(**clients(aws))
 
 
 def test_dry_run_creates_nothing(aws: Callable[[str], Any]) -> None:
-    fake = FakeEcrPullThrough()
-    report = outcomes(bootstrap.bootstrap(**clients(aws, fake), dry_run=True))
+    report = outcomes(bootstrap.bootstrap(**clients(aws), dry_run=True))
     assert set(report.values()) == {"would-create"}
     assert BUCKET not in [b["Name"] for b in aws("s3").list_buckets()["Buckets"]]
-    assert fake.rules == {} and fake.templates == {}
+    ecr = aws("ecr")
+    assert pull_through_rules(ecr) == {} and creation_template(ecr) is None
 
 
 def test_refuses_untagged_bucket_with_our_name(aws: Callable[[str], Any]) -> None:
     aws("s3").create_bucket(Bucket=BUCKET, CreateBucketConfiguration={"LocationConstraint": REGION})
     with pytest.raises(OwnershipError):
-        bootstrap.bootstrap(**clients(aws, FakeEcrPullThrough()))
+        bootstrap.bootstrap(**clients(aws))
 
 
 def test_refuses_foreign_pull_through_rule(aws: Callable[[str], Any]) -> None:
-    fake = FakeEcrPullThrough()
-    fake.rules["aegc-quay"] = "public.ecr.aws"
+    aws("ecr").create_pull_through_cache_rule(
+        ecrRepositoryPrefix=PREFIX, upstreamRegistryUrl="public.ecr.aws"
+    )
     with pytest.raises(OwnershipError, match="refusing"):
-        bootstrap.bootstrap(**clients(aws, fake))
+        bootstrap.bootstrap(**clients(aws))
+    assert pull_through_rules(aws("ecr")) == {PREFIX: "public.ecr.aws"}
 
 
 def test_unbootstrap_refuses_while_deployments_exist(aws: Callable[[str], Any]) -> None:
-    c = clients(aws, FakeEcrPullThrough())
+    c = clients(aws)
     bootstrap.bootstrap(**c)
     aws("ssm").put_parameter(Name="/aegc/dev/manifest", Value="{}", Type="String")
     with pytest.raises(RuntimeError, match="dev"):
@@ -117,8 +145,7 @@ def test_unbootstrap_refuses_while_deployments_exist(aws: Callable[[str], Any]) 
 
 
 def test_unbootstrap_dry_run_then_delete(aws: Callable[[str], Any]) -> None:
-    fake = FakeEcrPullThrough()
-    c = clients(aws, fake)
+    c = clients(aws)
     bootstrap.bootstrap(**c)
     aws("s3").put_object(Bucket=BUCKET, Key="payloads/dev/tasks/x/1.task", Body=b"x")
 
@@ -130,7 +157,9 @@ def test_unbootstrap_dry_run_then_delete(aws: Callable[[str], Any]) -> None:
     assert done[("s3 bucket", BUCKET)] == "deleted"
     assert done[("ecr pull-through rule", "aegc-quay")] == "deleted"
     assert BUCKET not in [b["Name"] for b in aws("s3").list_buckets()["Buckets"]]
-    assert fake.rules == {} and fake.templates == {}
+    assert done[("ecr creation template", PREFIX)] == "deleted"
+    ecr = aws("ecr")
+    assert pull_through_rules(ecr) == {} and creation_template(ecr) is None
     assert done[("iam role", ROLE)] == "deleted"
     with pytest.raises(aws("iam").exceptions.NoSuchEntityException):
         aws("iam").get_role(RoleName=ROLE)
@@ -138,12 +167,8 @@ def test_unbootstrap_dry_run_then_delete(aws: Callable[[str], Any]) -> None:
         aws("ssm").get_parameter(Name="/aegc/bootstrap")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="substrate#1465: ECR ListTagsForResource can't resolve namespaced repository ARNs",
-)
 def test_unbootstrap_keeps_foreign_cache_repositories(aws: Callable[[str], Any]) -> None:
-    c = clients(aws, FakeEcrPullThrough())
+    c = clients(aws)
     bootstrap.bootstrap(**c)
     ecr = aws("ecr")
     ecr.create_repository(

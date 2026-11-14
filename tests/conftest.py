@@ -2,6 +2,7 @@
 
 `make tools` installs the pinned substrate binary into .tools/. The `substrate` fixture from
 pytest-substrate resets emulator state before each test and points boto3 at it via AWS_ENDPOINT_URL.
+Where substrate still differs from AWS, tests/substrate_gaps.py has the workaround and the issue.
 """
 
 from __future__ import annotations
@@ -22,22 +23,12 @@ if "SUBSTRATE_BINARY" not in os.environ and _TOOLS.exists():
     os.environ["SUBSTRATE_BINARY"] = str(_TOOLS)
 
 
-try:
-    import pytest_substrate  # noqa: F401  (Python 3.12+)
-except ImportError:  # pragma: no cover - only on Python 3.11
+@pytest.fixture
+def aws(substrate: Any) -> Callable[[str], Any]:
+    """A factory for boto3 clients bound to the per-test substrate state, in REGION."""
+    del substrate  # requested for its side effects (reset + env)
 
-    @pytest.fixture
-    def aws() -> Callable[[str], Any]:
-        pytest.skip("pytest-substrate needs Python 3.12+")
+    def make(service: str) -> Any:
+        return boto3.client(service, region_name=REGION)  # type: ignore[call-overload]
 
-else:
-
-    @pytest.fixture
-    def aws(substrate: Any) -> Callable[[str], Any]:
-        """A factory for boto3 clients bound to the per-test substrate state, in REGION."""
-        del substrate  # requested for its side effects (reset + env)
-
-        def make(service: str) -> Any:
-            return boto3.client(service, region_name=REGION)  # type: ignore[call-overload]
-
-        return make
+    return make
