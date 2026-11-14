@@ -83,6 +83,11 @@ All notable changes to this project are documented here. The format follows
     scaling activity, and results waiting for a stopped endpoint.
   - `aegc reap`: removes aegc-owned result queues that are empty and idle for 14 days. Live engines
     refresh theirs daily (#14).
+- **Documentation for v0.1:** a quickstart; concepts (architecture, when to use aegc and its
+  limits, delivery and idempotency, the security model, cost with example prices); how-to guides
+  (configuration, worker images, operations, troubleshooting); and reference pages for the CLI,
+  endpoint configuration and `resource_specification` keys, limits, IAM policies, resources and
+  tags, and the live performance results (#16).
 
 ### Fixed
 - **Rebalance recommendations no longer strand instances.** Workers used to drain and exit on one,

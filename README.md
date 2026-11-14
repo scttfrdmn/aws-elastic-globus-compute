@@ -19,6 +19,11 @@ endpoint (laptop container) ─ AWSEngine ─▶ SQS tasks ◀── Graviton wo
 - **Managed with boto3.** Every resource is tagged when it's created, and the tool only ever deletes
   resources that carry its tags.
 
+## Documentation
+
+<https://scttfrdmn.github.io/aws-elastic-globus-compute/>. Start with the
+[quickstart](https://scttfrdmn.github.io/aws-elastic-globus-compute/quickstart/).
+
 ## Status
 
 Pre-release (0.x), being built toward v0.1. Work is tracked in this repo's issues, milestones and
