@@ -43,7 +43,7 @@ payloads > ~700 KB → S3 aegc-<acct>-<region>/payloads/<d>/...
 - **Engine registration.** Globus Compute 4.x only resolves `engine: type:` from
   `globus_compute_endpoint.engines`, so a `.pth` hook registers `AWSEngine`.
 - **AMQPS on 5671.** Port 443 suffered cut connections and a reconnect race (globus/globus-compute#2232).
-- **SQS limits.** A claim can't be extended past 12 hours, so v0.1 caps walltime at 11 hours. Messages
+- **SQS limits.** A claim can't be extended past 12 hours, so v0.1 caps walltime at 41,400 s (11.5 h; default 39,600 s). Messages
   max out at 1 MiB, so larger payloads go to S3.
 
 ## Environment
