@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aws-elastic-globus-compute"
+version = "0.1.0"
+description = "A Globus Compute endpoint engine that runs tasks on ephemeral AWS capacity"
+readme = "README.md"
+license = "Apache-2.0"
+# The worker agent runs inside science images (Python 3.11-3.14); the engine needs 3.12+.
+requires-python = ">=3.11"
+authors = [{ name = "Scott Friedman" }]
+dependencies = ["boto3>=1.35"]
+
+[project.optional-dependencies]
+engine = ["globus-compute-endpoint>=4.21,<5"]
+cli = ["click>=8.1", "globus-compute-sdk>=4.21,<5"]
+dev = [
+    "moto[server,sqs,s3,ec2,autoscaling,iam,ssm,ecr,logs]>=5",
+    "pytest>=8",
+    "pytest-timeout>=2",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "boto3-stubs[sqs,s3,ec2,autoscaling,iam,ssm,ecr,logs]",
+]
+
+[project.scripts]
+aegc = "aegc.cli:main"
+
+[project.urls]
+Repository = "https://github.com/scttfrdmn/aws-elastic-globus-compute"
+Documentation = "https://scttfrdmn.github.io/aws-elastic-globus-compute/"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aegc"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+packages = ["aegc"]
+mypy_path = "src"
+strict = true
+
+[[tool.mypy.overrides]]
+module = ["globus_compute_endpoint.*", "globus_compute_sdk.*", "globus_compute_common.*", "moto.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 60
+markers = [
+    "live: touches real AWS (requires AEGC_LIVE=1 and AWS credentials)",
+    "container: builds or runs the arm64 worker image",
+]
+addopts = "-m 'not live and not container'"

@@ -1,0 +1,46 @@
+# Project site, built from docs/. Preview: pip install -r docs/requirements.txt && mkdocs serve
+site_name: aws-elastic-globus-compute
+site_description: A Globus Compute endpoint engine on ephemeral AWS capacity
+repo_url: https://github.com/scttfrdmn/aws-elastic-globus-compute
+repo_name: scttfrdmn/aws-elastic-globus-compute
+edit_uri: edit/main/docs/
+docs_dir: docs
+strict: true
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle: {icon: material/brightness-4, name: Dark mode}
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle: {icon: material/brightness-7, name: Light mode}
+
+markdown_extensions:
+  - tables
+  - admonition
+  - toc: {permalink: true}
+  - pymdownx.superfences
+
+# Links to files outside docs/ (source, the README) become links to the repository.
+hooks:
+  - docs/hooks/repo_links.py
+
+exclude_docs: |
+  hooks/
+  requirements.txt
+  *.py
+
+validation:
+  links:
+    not_found: warn
+    anchors: warn
+
+nav:
+  - Home: index.md
+  - Architecture: architecture.md
