@@ -9,7 +9,9 @@ Semantics follow spore-host spawn's task pool:
 - **Poison tasks:** after ``max_deliveries`` receives, post a ``system_failure`` instead of
   running it again.
 - **Notices:** a Spot interruption or ASG termination releases in-flight tasks immediately
-  (visibility 0) and exits; a rebalance recommendation stops claiming and drains.
+  (visibility 0) and exits. A rebalance recommendation is only logged: with capacity rebalance on,
+  Auto Scaling launches a replacement and then terminates this instance (SIGTERM releases
+  in-flight tasks). Draining here would leave an instance with no worker in the group.
 - **Idle drain:** with nothing to do for ``idle_timeout_s``, leave the Auto Scaling group with
   TerminateInstanceInAutoScalingGroup(ShouldDecrementDesiredCapacity=True).
 """
@@ -75,6 +77,7 @@ class Agent:
         self._stop = threading.Event()  # stop everything now
         self._draining = threading.Event()  # stop claiming; finish in-flight
         self._drain_reason = ""
+        self._rebalance_seen = False
         self._pool = ThreadPoolExecutor(
             max_workers=self.config.slot_count, thread_name_prefix="aegc-slot"
         )
@@ -375,8 +378,9 @@ class Agent:
 
     def handle_notice(self, notice: Notice) -> None:
         if notice == "rebalance":
-            log.warning("rebalance recommendation: finishing in-flight tasks, then draining")
-            self._drain("rebalance")
+            if not self._rebalance_seen:
+                self._rebalance_seen = True
+                log.info("rebalance recommendation: Auto Scaling will replace this instance")
         else:
             log.warning("%s: releasing in-flight tasks and exiting", notice)
             self.stop(notice)

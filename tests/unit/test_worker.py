@@ -273,6 +273,20 @@ def test_interruption_releases_inflight(rig: Rig) -> None:
 
 
 @pytest.mark.timeout(60)
+def test_rebalance_keeps_working(rig: Rig, caplog: pytest.LogCaptureFixture) -> None:
+    # Auto Scaling's capacity rebalance replaces the instance; the worker keeps claiming until
+    # it's terminated (SIGTERM) or interrupted. Draining would strand the instance in the group.
+    a = rig.agent()
+    with caplog.at_level(logging.INFO, logger="aegc"):
+        a.handle_notice("rebalance")
+        a.handle_notice("rebalance")
+    assert sum("rebalance" in r.getMessage() for r in caplog.records) == 1
+    tid = rig.submit(pow, 3, 2)
+    a.claim_once()
+    assert rig.final(1)[tid].error is None and a.stats.completed == 1
+
+
+@pytest.mark.timeout(60)
 def test_idle_drain_leaves_the_group(rig: Rig) -> None:
     me = rig.join_group()
     assert rig.group()["DesiredCapacity"] == 1

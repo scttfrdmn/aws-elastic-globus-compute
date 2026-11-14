@@ -85,6 +85,11 @@ All notable changes to this project are documented here. The format follows
     refresh theirs daily (#14).
 
 ### Fixed
+- **Rebalance recommendations no longer strand instances.** Workers used to drain and exit on one,
+  leaving an instance with no worker in the group until the watchdog removed it 14 minutes later.
+  Spot rebalance recommendations can arrive seconds after launch. Workers now keep working:
+  Auto Scaling's capacity rebalance replaces the instance, and SIGTERM releases in-flight tasks
+  (#15).
 - **Endpoint processes no longer stop with tasks in flight.** GC's idle check counts results
   replayed from `unacked_results` as forwarded, so after a recovery it stopped the user endpoint
   process while tasks were still running, and their results waited for the next submission. The
