@@ -365,6 +365,7 @@ def deployer_policy(*, region: str, account: str) -> dict[str, Any]:
                     "s3:ListBucketVersions",
                     "s3:GetBucketTagging",
                     "s3:PutBucketTagging",
+                    "s3:TagResource",  # CreateBucket with CreateBucketConfiguration.Tags
                     "s3:PutBucketPublicAccessBlock",
                     "s3:GetBucketPublicAccessBlock",
                     "s3:PutBucketOwnershipControls",
