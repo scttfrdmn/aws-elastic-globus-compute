@@ -11,7 +11,8 @@
 
 {#- Keep user endpoint processes running. The interchange's idle check counts results replayed
     from unacked_results as forwarded, so after a recovery it would stop the process while
-    tasks are still running on AWS, and their results would wait for the next submission.
+    tasks are still running on AWS, and their results would wait for the next submission
+    (globus/globus-compute#2233).
     An idle process costs a few SQS long polls; AWS capacity drains itself regardless. #}
 idle_heartbeats_soft: 0
 
