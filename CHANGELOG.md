@@ -66,6 +66,14 @@ All notable changes to this project are documented here. The format follows
     and records the pinned digest at `/aegc/images/<env>`.
   - Verified on `geospatial` 2026.11.13.154112: the guard allowed only `click` to change, the
     smoke test and selftest passed, and the image runs Python 3.14 (#11).
+- **Endpoint:**
+  - `aegc endpoint {build,login,configure,start,stop,logs,test,id}` runs a Globus Compute endpoint
+    with `AWSEngine` in Docker.
+  - A `.pth` hook (`aegc._register`, about 0.3 ms at interpreter start) makes `engine: type:
+    AWSEngine` resolvable, because Globus Compute 4.x only looks engines up in its own module (#3).
+  - The user config template passes the submitter's Python minor version and `env` (from
+    `user_endpoint_config`) to the engine, with `amqp_port: 5671`. It's verified with Globus
+    Compute's own renderer (#13).
 
 ### Fixed
 - **The pull-through cache works with tagged repositories:** the creation template now runs as an aegc

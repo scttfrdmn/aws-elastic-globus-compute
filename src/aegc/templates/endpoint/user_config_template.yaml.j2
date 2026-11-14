@@ -1,0 +1,25 @@
+{#-
+  Globus Compute user endpoint template: AWSEngine (aws-elastic-globus-compute).
+  Rendered by `aegc endpoint configure`, which fills in the deployment, region and default env.
+
+  One user endpoint process runs per submitter runtime and per user_endpoint_config (spike #4).
+  The submitter's Python minor version selects the worker image; `env` (from
+  Executor(user_endpoint_config={"env": ...})) selects the science environment.
+  Template values from _GC.user_runtime and user_endpoint_config arrive already JSON-quoted.
+-#}
+{%- set py = _GC.user_runtime.python.version_tuple if _GC.user_runtime is defined and _GC.user_runtime.python is defined else [] %}
+
+{#- Stop the user endpoint process ~5 min after it goes idle; AWS capacity drains itself. #}
+idle_heartbeats_soft: 10
+idle_heartbeats_hard: 5760
+
+{#- AMQPS on 5671: on 443 connections were cut and the subscriber gave up (globus/globus-compute#2232). #}
+amqp_port: 5671
+
+engine:
+  type: AWSEngine
+  deployment: @@DEPLOYMENT@@
+  region: @@REGION@@
+  env: {{ env | default('"@@DEFAULT_ENV@@"') }}
+  python_minor: "{{ py[:2] | join('.') }}"
+  max_retries_on_system_failure: 1

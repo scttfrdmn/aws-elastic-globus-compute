@@ -42,6 +42,10 @@ allow-direct-references = true
 [tool.hatch.build.targets.wheel]
 packages = ["src/aegc"]
 
+[tool.hatch.build.targets.wheel.force-include]
+# Registers AWSEngine with Globus Compute's engine lookup (see src/aegc/_register.py).
+"src/aegc_engines.pth" = "aegc_engines.pth"
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"

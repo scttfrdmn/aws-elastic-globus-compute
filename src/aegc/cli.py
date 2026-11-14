@@ -53,6 +53,48 @@ def _image_build(args: argparse.Namespace) -> int:
     return 0
 
 
+def _endpoint(args: argparse.Namespace) -> int:
+    from pathlib import Path
+
+    from aegc import awsutil
+    from aegc import endpoint as ep
+
+    profile = args.profile or ep.default_profile()
+    region = args.region or awsutil.session(profile or None).region_name or ""
+    spec = ep.EndpointSpec(
+        name=args.name,
+        deployment=args.deployment,
+        region=region,
+        default_env=args.env or "",
+        aws_profile=profile,
+    )
+    cmd = args.endpoint_command
+    if cmd == "build":
+        ep.build(Path(args.project_dir))
+    elif cmd == "login":
+        ep.login(spec)
+    elif cmd == "configure":
+        if not (region and args.env):
+            print("aegc: configure needs --region (or a profile region) and --env", file=sys.stderr)
+            return 2
+        ep.configure(spec)
+        print(
+            f"configured {spec.name}: deployment {spec.deployment}, region {region}, env {args.env}"
+        )
+    elif cmd == "start":
+        ep.start(spec)
+        print(f"started {spec.container}; endpoint id {ep.endpoint_id(spec)}")
+    elif cmd == "stop":
+        ep.stop(spec)
+    elif cmd == "logs":
+        ep.logs(spec)
+    elif cmd == "test":
+        ep.smoke(spec, args.n, args.env)
+    elif cmd == "id":
+        print(ep.endpoint_id(spec))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="aegc", description="Globus Compute on ephemeral AWS capacity."
@@ -87,6 +129,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     b.add_argument("--project-dir", default=".", help="aegc source tree to build the wheel from")
     b.set_defaults(func=_image_build)
+
+    e = sub.add_parser("endpoint", help="run a Globus Compute endpoint with AWSEngine in Docker")
+    e.add_argument(
+        "endpoint_command",
+        choices=["build", "login", "configure", "start", "stop", "logs", "test", "id"],
+    )
+    e.add_argument("--name", default="aegc", help="Globus Compute endpoint name")
+    e.add_argument("--deployment", default="default", help="aegc deployment the engine uses")
+    e.add_argument("--env", help="default science environment (configure); env to test (test)")
+    e.add_argument("-n", type=int, default=10, help="tasks to submit (test)")
+    e.add_argument("--project-dir", default=".", help="aegc source tree (build)")
+    e.set_defaults(func=_endpoint)
     return parser
 
 
