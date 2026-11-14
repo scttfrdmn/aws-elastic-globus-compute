@@ -67,7 +67,7 @@ def test_rendered_template_with_globus_renderer(
         user_runtime={"python": {"version_tuple": [3, 14, 8]}},
     )
     data = yaml.safe_load(rendered)
-    assert data["amqp_port"] == 5671 and data["idle_heartbeats_soft"] == 10
+    assert data["amqp_port"] == 5671 and data["idle_heartbeats_soft"] == 0
     engine = data["engine"]
     assert engine["type"] == "AWSEngine" and engine["deployment"] == "dev"
     assert engine["env"] == env and engine["python_minor"] == "3.14"

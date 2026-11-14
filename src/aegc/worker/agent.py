@@ -157,6 +157,7 @@ class Agent:
             return
         self.stats.claimed += 1
         self._touch()
+        log.info("claimed %s (delivery %d)", msg.executor_task_id, receive_count)
         if receive_count > self.config.max_deliveries:
             self.stats.poison += 1
             self._post_failure(
@@ -216,6 +217,7 @@ class Agent:
             log.exception("runner failed for %s", msg.executor_task_id)
             outcome = runner.RunOutcome("crashed", None, f"runner error: {e}")
         finished = time.time()
+        log.info("%s: %s in %.1f s", msg.executor_task_id, outcome.outcome, finished - started)
         try:
             if job.released or self._stop.is_set():
                 return  # another worker will run it

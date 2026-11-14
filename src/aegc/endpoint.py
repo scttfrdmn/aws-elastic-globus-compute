@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from importlib import resources
@@ -22,6 +23,8 @@ IMAGE = "aegc-endpoint"
 VOLUME = "aegc-endpoint-home"
 HOME = "/home/gc"
 GC_DIR = f"{HOME}/.globus_compute"
+#: Python in the endpoint image; `aegc endpoint test` submits with it, so match a worker image.
+DEFAULT_PYTHON = "3.14"
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -78,6 +81,7 @@ def build(
     project_dir: Path,
     *,
     gce_version: str = images.DEFAULT_GCE_VERSION,
+    python: str = DEFAULT_PYTHON,
     run: Runner = subprocess.run,
 ) -> str:
     with tempfile.TemporaryDirectory(prefix="aegc-endpoint-") as tmp:
@@ -86,7 +90,8 @@ def build(
         for name in ("Dockerfile", "entrypoint.sh"):
             (ctx / name).write_text(_template(name))
         run(
-            ["docker", "build", "--build-arg", f"GCE_VERSION={gce_version}", "-t", IMAGE, str(ctx)],
+            ["docker", "build", "--build-arg", f"GCE_VERSION={gce_version}",
+             "--build-arg", f"PYTHON={python}", "-t", IMAGE, str(ctx)],
             check=True, text=True,
         )  # fmt: skip
     return IMAGE
@@ -146,6 +151,18 @@ def endpoint_id(spec: EndpointSpec, run: Runner = subprocess.run) -> str:
         check=True, text=True, capture_output=True,
     )  # fmt: skip
     return str(json.loads(out.stdout)["endpoint_id"])
+
+
+def wait_for_id(spec: EndpointSpec, timeout_s: float = 90, run: Runner = subprocess.run) -> str:
+    """The endpoint id, waiting for a first start to register the endpoint."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            return endpoint_id(spec, run)
+        except subprocess.CalledProcessError:
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(3)
 
 
 def logs(spec: EndpointSpec, run: Runner = subprocess.run) -> None:

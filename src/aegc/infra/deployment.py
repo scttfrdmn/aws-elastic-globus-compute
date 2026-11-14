@@ -517,6 +517,17 @@ def ensure_auto_scaling_group(
     groups = c.autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[name])[
         "AutoScalingGroups"
     ]
+    asg_tags = [
+        {
+            "Key": k,
+            "Value": v,
+            # Instances keep the launch template's aegc:role=worker.
+            "PropagateAtLaunch": k != naming.TAG_ROLE,
+            "ResourceId": name,
+            "ResourceType": "auto-scaling-group",
+        }
+        for k, v in tags.items()
+    ]
     if not groups:
         if dry_run:
             report.add("auto scaling group", name, "would-create")
@@ -524,16 +535,7 @@ def ensure_auto_scaling_group(
         c.autoscaling.create_auto_scaling_group(
             AutoScalingGroupName=name,
             DesiredCapacity=pool.min_workers,
-            Tags=[
-                {
-                    "Key": k,
-                    "Value": v,
-                    "PropagateAtLaunch": True,
-                    "ResourceId": name,
-                    "ResourceType": "auto-scaling-group",
-                }
-                for k, v in tags.items()
-            ],
+            Tags=asg_tags,
             **req,
         )
         outcome: Outcome = "created"
@@ -545,6 +547,7 @@ def ensure_auto_scaling_group(
             return name
         # Desired capacity is the engine's and the workers' to manage; don't reset it.
         c.autoscaling.update_auto_scaling_group(AutoScalingGroupName=name, **req)
+        c.autoscaling.create_or_update_tags(Tags=asg_tags)
         outcome = "exists"
     # Rebalancing would terminate instances that are running tasks.
     c.autoscaling.suspend_processes(AutoScalingGroupName=name, ScalingProcesses=["AZRebalance"])

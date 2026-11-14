@@ -71,7 +71,7 @@ def _endpoint(args: argparse.Namespace) -> int:
     )
     cmd = args.endpoint_command
     if cmd == "build":
-        ep.build(Path(args.project_dir))
+        ep.build(Path(args.project_dir), python=args.python)
     elif cmd == "login":
         ep.login(spec)
     elif cmd == "configure":
@@ -84,7 +84,7 @@ def _endpoint(args: argparse.Namespace) -> int:
         )
     elif cmd == "start":
         ep.start(spec)
-        print(f"started {spec.container}; endpoint id {ep.endpoint_id(spec)}")
+        print(f"started {spec.container}; endpoint id {ep.wait_for_id(spec)}")
     elif cmd == "stop":
         ep.stop(spec)
     elif cmd == "logs":
@@ -306,6 +306,11 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--env", help="default science environment (configure); env to test (test)")
     e.add_argument("-n", type=int, default=10, help="tasks to submit (test)")
     e.add_argument("--project-dir", default=".", help="aegc source tree (build)")
+    e.add_argument(
+        "--python",
+        default="3.14",
+        help="Python in the endpoint image; `test` submits with it (build)",
+    )
     e.set_defaults(func=_endpoint)
     return parser
 

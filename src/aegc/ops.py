@@ -47,7 +47,7 @@ class DeploymentStatus:
             if p.last_activity:
                 lines.append(f"    last scaling activity: {p.last_activity}")
         for name, n in sorted(self.result_queues.items()):
-            note = "  <- waiting; start the endpoint to deliver" if n else ""
+            note = "  (undelivered; if this persists, the endpoint is stopped)" if n else ""
             lines.append(f"  result queue {name}: {n} result(s){note}")
         return "\n".join(lines)
 

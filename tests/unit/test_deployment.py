@@ -170,7 +170,9 @@ def test_deploy_creates_everything(env: tuple[Clients, DeploymentSpec]) -> None:
     assert dist["SpotAllocationStrategy"] == "price-capacity-optimized"
     tags = naming.tag_dict(g["Tags"])
     assert naming.is_owned(ASG, tags, "dev") and tags[naming.TAG_POOL] == "sci-py314"
-    assert all(t["PropagateAtLaunch"] for t in g["Tags"])
+    # aegc:role stays on the group; instances get role=worker from the launch template.
+    assert {t["Key"]: t["PropagateAtLaunch"] for t in g["Tags"]}[naming.TAG_ROLE] is False
+    assert all(t["PropagateAtLaunch"] for t in g["Tags"] if t["Key"] != naming.TAG_ROLE)
     described = c.autoscaling.describe_tags(
         Filters=[{"Name": "auto-scaling-group", "Values": [ASG]}]
     )["Tags"]

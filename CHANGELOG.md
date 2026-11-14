@@ -85,6 +85,20 @@ All notable changes to this project are documented here. The format follows
     refresh theirs daily (#14).
 
 ### Fixed
+- **Endpoint processes no longer stop with tasks in flight.** GC's idle check counts results
+  replayed from `unacked_results` as forwarded, so after a recovery it stopped the user endpoint
+  process while tasks were still running, and their results waited for the next submission. The
+  template now sets `idle_heartbeats_soft: 0` (#15).
+- **Worker image tags include the aegc wheel's hash.** Rebuilding after a code change no longer
+  collides with an existing immutable tag, and rebuilding unchanged code reuses the pushed image
+  (#15).
+- **Workers keep `aegc:role=worker`.** The group's `aegc:role=asg` tag no longer propagates to
+  instances, and redeploys correct the group's tags (#15).
+- **`aegc endpoint start` waits for a first-time registration** before printing the endpoint id
+  (#15).
+- **The endpoint image uses Python 3.14** (`--python`), so `aegc endpoint test` matches the
+  aarchsci worker images (#15).
+- **Worker logs per-task lines.** Each claim and its outcome is logged with its duration (#15).
 - **The pull-through cache works with tagged repositories:** the creation template now runs as an aegc
   role (`/aegc/aegc-ecr-template-<region>`: `ecr:CreateRepository` and `ecr:TagResource` on
   `aegc-quay/*`, trusted by ECR for this account only). ECR's default role is denied

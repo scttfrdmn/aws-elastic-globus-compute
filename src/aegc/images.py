@@ -10,6 +10,7 @@ in-region.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -92,8 +93,36 @@ def base_ref(spec: ImageSpec, *, account: str, region: str, through_cache: bool 
     return f"quay.io/{repo}"
 
 
-def image_tag(python_minor: str, spec: ImageSpec) -> str:
-    return f"py{python_minor}-gce{spec.gce_version}-aegc{__version__}-b{spec.base_tag}"
+def image_tag(python_minor: str, spec: ImageSpec, wheel_hash: str) -> str:
+    """Immutable tag: Python, GCE and aegc versions, the base tag, and the aegc wheel's hash.
+
+    The wheel hash gives each code change its own tag (hatchling wheels are reproducible).
+    """
+    return (
+        f"py{python_minor}-gce{spec.gce_version}-aegc{__version__}-b{spec.base_tag}-w{wheel_hash}"
+    )
+
+
+def wheel_hash(wheel_dir: Path) -> str:
+    h = hashlib.sha256()
+    for whl in sorted(wheel_dir.glob("*.whl")):
+        h.update(whl.read_bytes())
+    return h.hexdigest()[:8]
+
+
+def existing_image(ecr: Any, env: str, tag: str) -> str | None:
+    """``<repo>@sha256:<digest>`` if the repository already has ``tag`` (tags are immutable)."""
+    name = naming.image_repository(env)
+    try:
+        d = ecr.describe_images(repositoryName=name, imageIds=[{"imageTag": tag}])["imageDetails"]
+    except Exception as e:
+        if is_not_found(e):
+            return None
+        raise
+    if not d:
+        return None
+    uri = ecr.describe_repositories(repositoryNames=[name])["repositories"][0]["repositoryUri"]
+    return f"{uri}@{d[0]['imageDigest']}"
 
 
 def ensure_repository(ecr: Any, env: str, report: Report, *, dry_run: bool = False) -> str:
@@ -244,6 +273,7 @@ def build(
     local_tag = f"aegc-build/{spec.env}:{spec.base_tag}"
     with tempfile.TemporaryDirectory(prefix="aegc-image-") as tmp:
         wheels = build_wheel(project_dir, Path(tmp) / "wheels", run=run)
+        whash = wheel_hash(wheels)
         ctx_dir = Path(tmp) / "ctx"
         ctx_dir.mkdir()
         ctx = build_context(ctx_dir, wheel_dir=wheels)
@@ -262,8 +292,12 @@ def build(
     report = Report()
     repo_uri = ensure_repository(ecr, spec.env, report)
     docker_login(ecr, run=run)
-    tag = image_tag(minor, spec)
-    pinned = push(local_tag, f"{repo_uri}:{tag}", run=run)
+    tag = image_tag(minor, spec, whash)
+    pinned = existing_image(ecr, spec.env, tag)
+    if pinned:
+        log(f"{repo_uri}:{tag} already exists (same aegc code and base); reusing it")
+    else:
+        pinned = push(local_tag, f"{repo_uri}:{tag}", run=run)
     rec = ImageRecord(
         env=spec.env,
         python_minor=minor,

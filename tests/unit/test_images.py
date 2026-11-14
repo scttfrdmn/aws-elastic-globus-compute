@@ -1,3 +1,4 @@
+import hashlib
 import json
 import subprocess
 import sys
@@ -61,7 +62,8 @@ def test_refs_and_tags() -> None:
     assert images.base_ref(SPEC, account=ACCOUNT, region=REGION, through_cache=False).startswith(
         "quay.io/aarchsci/"
     )
-    assert images.image_tag("3.14", SPEC) == "py3.14-gce4.21.0-aegc0.1.0-b2026.11.13.154112"
+    tag = images.image_tag("3.14", SPEC, "0123abcd")
+    assert tag == "py3.14-gce4.21.0-aegc0.1.0-b2026.11.13.154112-w0123abcd"
     args = images.docker_build_args(SPEC, base="B", local_tag="L", context=Path("/ctx"))
     assert args[:6] == ["docker", "buildx", "build", "--platform", "linux/arm64", "--load"]
     assert "BASE=B" in args and "AEGC_ALLOW_CHANGE=click" in args
@@ -146,3 +148,18 @@ def test_build_orchestration_without_docker(aws: Callable[[str], Any], tmp_path:
     assert images.read_image(ssm, "geospatial") == rec
     kinds = [c[1] for c in calls if c[0] == "docker"]
     assert kinds == ["login", "buildx", "run", "login", "tag", "push", "inspect"]
+    assert rec.tag.endswith("-w" + hashlib.sha256(b"w").hexdigest()[:8])
+
+
+def test_wheel_hash_follows_the_code(tmp_path: Path) -> None:
+    (tmp_path / "a.whl").write_bytes(b"one")
+    first = images.wheel_hash(tmp_path)
+    assert len(first) == 8 and images.wheel_hash(tmp_path) == first
+    (tmp_path / "a.whl").write_bytes(b"two")
+    assert images.wheel_hash(tmp_path) != first
+
+
+def test_existing_image(aws: Callable[[str], Any]) -> None:
+    ecr = aws("ecr")
+    images.ensure_repository(ecr, "geospatial", Report())
+    assert images.existing_image(ecr, "geospatial", "py3.14-x") is None

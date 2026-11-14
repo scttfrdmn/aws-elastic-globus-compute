@@ -2,7 +2,10 @@
 # Globus Compute endpoint with AWSEngine. Built by `aegc endpoint build`.
 # The endpoint process never deserializes user functions (it forwards packed tasks), so its
 # Python version needn't match the users'; workers' images must (see `aegc image build`).
-FROM python:3.13-slim
+# PYTHON matters only for `aegc endpoint test`, which submits from this container, so it defaults
+# to the Python of most aarchsci images.
+ARG PYTHON=3.14
+FROM python:${PYTHON}-slim
 ARG GCE_VERSION
 COPY dist/ /tmp/aegc-dist/
 RUN pip install --no-cache-dir "globus-compute-endpoint==${GCE_VERSION}" /tmp/aegc-dist/*.whl \
