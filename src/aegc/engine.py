@@ -128,6 +128,7 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         self._config_error = ""
         self._fatal: BaseException | None = None
         self._result_queue_url = ""
+        self._result_queue_touched = 0.0
         self._stalled_since: dict[str, float] = {}
         self._paused_until: dict[str, float] = {}
         self.run_dir = ""
@@ -383,6 +384,9 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         self._result_queue_url = sqs.create_queue(QueueName=name, Attributes=attributes, tags=tags)[
             "QueueUrl"
         ]
+        # Refreshes LastModifiedTimestamp: `aegc reap` only removes result queues idle for 14 days.
+        sqs.set_queue_attributes(QueueUrl=self._result_queue_url, Attributes=attributes)
+        self._result_queue_touched = time.time()
 
     # --- results ----------------------------------------------------------------------------
 
@@ -521,6 +525,8 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
     def _scale_loop(self) -> None:
         while not self._stop.is_set():
             try:
+                if self._result_queue_url and time.time() - self._result_queue_touched > 86400:
+                    self._ensure_result_queue()  # daily keep-alive for `aegc reap`
                 self.scale_once()
             except Exception as e:
                 self._snapshot.last_aws_error = str(e)

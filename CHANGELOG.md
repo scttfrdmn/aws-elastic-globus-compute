@@ -74,6 +74,15 @@ All notable changes to this project are documented here. The format follows
   - The user config template passes the submitter's Python minor version and `env` (from
     `user_endpoint_config`) to the engine, with `amqp_port: 5671`. It's verified with Globus
     Compute's own renderer (#13).
+- **Operations CLI:**
+  - `aegc bootstrap` / `unbootstrap`.
+  - `aegc deploy <d> --pool env[:max=,vcpu=,mem=,slots=,idle=,on-demand]` builds pools from
+    recorded images, so each pool's Python minor comes from its image.
+  - `aegc destroy` (dry run unless `--yes`).
+  - `aegc status`: per pool, the queued, running and dead-lettered tasks, the worker count, the last
+    scaling activity, and results waiting for a stopped endpoint.
+  - `aegc reap`: removes aegc-owned result queues that are empty and idle for 14 days. Live engines
+    refresh theirs daily (#14).
 
 ### Fixed
 - **The pull-through cache works with tagged repositories:** the creation template now runs as an aegc
