@@ -18,6 +18,19 @@ All notable changes to this project are documented here. The format follows
   pull-through cache rule with a tagging creation template, and `/aegc/bootstrap`. It's idempotent and
   refuses look-alikes it didn't create. `unbootstrap()` is a dry run by default and refuses while
   deployments remain (#7).
+- **Deploy and destroy:**
+  - `infra.deployment.deploy()` creates a worker role and instance profile scoped to the
+    deployment, a no-ingress security group, the log group, and for each pool a task queue with a
+    DLQ, a launch template and a Spot Auto Scaling group. It finishes by writing the manifest.
+  - Launch templates use the stock ECS AL2023 arm64 AMI (resolved at deploy time), IMDSv2 with hop
+    limit 2 and gp3 at 500 MB/s. Auto Scaling groups use attribute-based Graviton selection with
+    `price-capacity-optimized`, protect new instances from scale-in, and suspend `AZRebalance`.
+  - Worker user data follows spike #5. It disables the ECS agent, starts Docker explicitly, pulls
+    by digest and runs the worker under systemd. A watchdog terminates the instance, decrementing
+    desired capacity.
+  - Redeploy is idempotent, with a content hash on each launch template version.
+  - `destroy()` removes only tagged resources, refuses while tasks are queued unless forced, and is
+    a dry run by default. Verified live: deploy, a no-op redeploy, then destroy left nothing (#8).
 
 ### Fixed
 - **The pull-through cache works with tagged repositories:** the creation template now runs as an aegc

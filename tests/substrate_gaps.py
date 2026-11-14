@@ -110,3 +110,82 @@ class FakeEcrPullThrough:
         if self.templates.pop(prefix, None) is None:
             raise _client_error("TemplateNotFoundException", "DeleteRepositoryCreationTemplate")
         return {}
+
+
+class FakeAutoScaling:
+    """substrate#1460: Auto Scaling isn't emulated; an in-memory stand-in for aegc's calls."""
+
+    def __init__(self) -> None:
+        self.groups: dict[str, dict[str, Any]] = {}
+        self.suspended: dict[str, set[str]] = {}
+
+    def describe_auto_scaling_groups(
+        self, AutoScalingGroupNames: list[str] | None = None, **_: Any
+    ) -> dict[str, Any]:
+        names = AutoScalingGroupNames if AutoScalingGroupNames is not None else list(self.groups)
+        return {"AutoScalingGroups": [self.groups[n] for n in names if n in self.groups]}
+
+    def create_auto_scaling_group(
+        self, *, AutoScalingGroupName: str, Tags: list[dict[str, Any]], **kw: Any
+    ) -> dict[str, Any]:
+        if AutoScalingGroupName in self.groups:
+            raise _client_error("AlreadyExists", "CreateAutoScalingGroup")
+        if not kw.get("MinSize", 0) <= kw.get("DesiredCapacity", 0) <= kw.get("MaxSize", 0):
+            raise _client_error("ValidationError", "CreateAutoScalingGroup")
+        self.groups[AutoScalingGroupName] = {
+            "AutoScalingGroupName": AutoScalingGroupName,
+            "Tags": [
+                {
+                    "Key": t["Key"],
+                    "Value": t["Value"],
+                    "PropagateAtLaunch": t.get("PropagateAtLaunch", False),
+                }
+                for t in Tags
+            ],
+            "Instances": [],
+            **kw,
+        }
+        return {}
+
+    def update_auto_scaling_group(self, *, AutoScalingGroupName: str, **kw: Any) -> dict[str, Any]:
+        self.groups[AutoScalingGroupName].update(kw)
+        return {}
+
+    def suspend_processes(
+        self, *, AutoScalingGroupName: str, ScalingProcesses: list[str]
+    ) -> dict[str, Any]:
+        self.suspended.setdefault(AutoScalingGroupName, set()).update(ScalingProcesses)
+        return {}
+
+    def set_desired_capacity(
+        self, *, AutoScalingGroupName: str, DesiredCapacity: int, **_: Any
+    ) -> dict[str, Any]:
+        g = self.groups[AutoScalingGroupName]
+        if not g["MinSize"] <= DesiredCapacity <= g["MaxSize"]:
+            raise _client_error("ValidationError", "SetDesiredCapacity")
+        g["DesiredCapacity"] = DesiredCapacity
+        return {}
+
+    def delete_auto_scaling_group(
+        self, *, AutoScalingGroupName: str, ForceDelete: bool = False
+    ) -> dict[str, Any]:
+        if AutoScalingGroupName not in self.groups:
+            raise _client_error("ValidationError", "DeleteAutoScalingGroup")
+        del self.groups[AutoScalingGroupName]
+        return {}
+
+
+def sqs_with_counts(sqs: Any, counts: dict[str, tuple[int, int]]) -> Shim:
+    """substrate#1472: GetQueueAttributes omits the approximate counts; supply them per queue."""
+
+    def get_queue_attributes(*, QueueUrl: str, AttributeNames: list[str]) -> dict[str, Any]:
+        attrs = dict(
+            sqs.get_queue_attributes(QueueUrl=QueueUrl, AttributeNames=AttributeNames)["Attributes"]
+        )
+        visible, inflight = counts.get(QueueUrl, (0, 0))
+        attrs.setdefault("ApproximateNumberOfMessages", str(visible))
+        attrs.setdefault("ApproximateNumberOfMessagesNotVisible", str(inflight))
+        attrs.setdefault("ApproximateNumberOfMessagesDelayed", "0")
+        return {"Attributes": attrs}
+
+    return Shim(sqs, get_queue_attributes=get_queue_attributes)
