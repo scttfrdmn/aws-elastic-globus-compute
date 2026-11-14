@@ -34,6 +34,18 @@ All notable changes to this project are documented here. The format follows
 - **IAM policies:** `aegc iam-policy {worker,operator,deployer}` prints least-privilege documents
   scoped to a deployment. Tests run them through the IAM policy simulator (allowed and denied cases,
   including tag conditions). IAM Access Analyzer reports no findings (#9).
+- **Worker agent (`aegc-worker`):**
+  - It claims tasks from the pool's queue with a long poll and renews their visibility in batches.
+    Each task runs Globus Compute's `execute_task` in a fresh child process from a forkserver that
+    preloads Globus Compute, so a task starts in about 30 ms.
+  - The worker enforces walltime by killing the task's process group, because `GC_TASK_TIMEOUT`
+    can't interrupt blocking calls (#2).
+  - Each task posts `started`, then a result or a `system_failure`, and only then is acked.
+  - Failure handling: crashes, poison tasks (delivered more than 4 times) and missing payloads are
+    reported. Spot interruption and ASG termination release in-flight tasks immediately. A
+    rebalance recommendation drains. An idle worker leaves its group and decrements desired
+    capacity, staying up if the group is at its minimum.
+  - `aegc-worker selftest` runs a probe task through `execute_task` (#10).
 
 ### Fixed
 - **The pull-through cache works with tagged repositories:** the creation template now runs as an aegc

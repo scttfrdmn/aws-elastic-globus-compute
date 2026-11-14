@@ -118,6 +118,8 @@ class FakeAutoScaling:
     def __init__(self) -> None:
         self.groups: dict[str, dict[str, Any]] = {}
         self.suspended: dict[str, set[str]] = {}
+        self.terminated: list[tuple[str, bool]] = []
+        self.refuse_terminate = False
 
     def describe_auto_scaling_groups(
         self, AutoScalingGroupNames: list[str] | None = None, **_: Any
@@ -166,6 +168,17 @@ class FakeAutoScaling:
         g["DesiredCapacity"] = DesiredCapacity
         return {}
 
+    def terminate_instance_in_auto_scaling_group(
+        self,
+        *,
+        InstanceId: str,
+        ShouldDecrementDesiredCapacity: bool,
+    ) -> dict[str, Any]:
+        self.terminated.append((InstanceId, ShouldDecrementDesiredCapacity))
+        if self.refuse_terminate:
+            raise _client_error("ValidationError", "TerminateInstanceInAutoScalingGroup")
+        return {"Activity": {"StatusCode": "InProgress"}}
+
     def delete_auto_scaling_group(
         self, *, AutoScalingGroupName: str, ForceDelete: bool = False
     ) -> dict[str, Any]:
@@ -189,3 +202,36 @@ def sqs_with_counts(sqs: Any, counts: dict[str, tuple[int, int]]) -> Shim:
         return {"Attributes": attrs}
 
     return Shim(sqs, get_queue_attributes=get_queue_attributes)
+
+
+def sqs_for_worker(sqs: Any, receive_counts: dict[str, int] | None = None) -> Shim:
+    """substrate#1462: no ChangeMessageVisibilityBatch, and ReceiveMessage returns no attributes.
+
+    Batch visibility changes become single calls. ``receive_counts`` maps a message body substring
+    to the ApproximateReceiveCount to report; otherwise each message reports 1.
+    """
+    counts = receive_counts or {}
+
+    def change_message_visibility_batch(
+        *, QueueUrl: str, Entries: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        for e in Entries:
+            sqs.change_message_visibility(
+                QueueUrl=QueueUrl,
+                ReceiptHandle=e["ReceiptHandle"],
+                VisibilityTimeout=e["VisibilityTimeout"],
+            )
+        return {"Successful": [{"Id": e["Id"]} for e in Entries], "Failed": []}
+
+    def receive_message(**kw: Any) -> dict[str, Any]:
+        resp = sqs.receive_message(**kw)
+        for m in resp.get("Messages", []):
+            n = next((v for k, v in counts.items() if k in m["Body"]), 1)
+            m.setdefault("Attributes", {})["ApproximateReceiveCount"] = str(n)
+        return dict(resp)
+
+    return Shim(
+        sqs,
+        change_message_visibility_batch=change_message_visibility_batch,
+        receive_message=receive_message,
+    )

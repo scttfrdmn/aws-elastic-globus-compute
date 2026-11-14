@@ -20,6 +20,8 @@ dev = [
     # AWS emulator for tests (https://github.com/scttfrdmn/substrate); binary: `make tools`.
     # The plugin needs Python 3.12+; on 3.11 the AWS-backed tests are skipped.
     "pytest-substrate @ git+https://github.com/scttfrdmn/substrate@v0.124.0#subdirectory=python ; python_version >= '3.12'",
+    # Real packed tasks and execute_task in worker tests.
+    "globus-compute-endpoint>=4.21,<5",
     "pytest>=8",
     "pytest-timeout>=2",
     "ruff>=0.8",
@@ -29,6 +31,7 @@ dev = [
 
 [project.scripts]
 aegc = "aegc.cli:main"
+aegc-worker = "aegc.worker.cli:main"
 
 [project.urls]
 Repository = "https://github.com/scttfrdmn/aws-elastic-globus-compute"
