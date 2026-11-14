@@ -57,6 +57,15 @@ All notable changes to this project are documented here. The format follows
   - `start` never raises: misconfiguration fails tasks with a clear message. The status report is
     cached and never raises, `shutdown` never touches AWS, and endpoint log handlers are shared
     with `aegc.*` (#12).
+- **`aegc image build`:**
+  - It layers `globus-compute-endpoint` (micromamba, from conda-forge) and the aegc wheel into an
+    aarchsci or aarchbio environment. A guard fails the build if any existing package changes
+    outside an allowlist (`click`).
+  - The build runs the image's own smoke test and `aegc-worker selftest`, reads Python's minor
+    version from the image, pushes to ECR `aegc/<env>` (immutable tags, scan on push, lifecycle),
+    and records the pinned digest at `/aegc/images/<env>`.
+  - Verified on `geospatial` 2026.11.13.154112: the guard allowed only `click` to change, the
+    smoke test and selftest passed, and the image runs Python 3.14 (#11).
 
 ### Fixed
 - **The pull-through cache works with tagged repositories:** the creation template now runs as an aegc
