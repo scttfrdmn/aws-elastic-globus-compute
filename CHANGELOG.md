@@ -46,6 +46,17 @@ All notable changes to this project are documented here. The format follows
     rebalance recommendation drains. An idle worker leaves its group and decrements desired
     capacity, staying up if the group is at its minimum.
   - `aegc-worker selftest` runs a probe task through `execute_task` (#10).
+- **`AWSEngine`:** a Globus Compute endpoint engine.
+  - `_submit` resolves the pool from `env` and the submitter's Python minor (or an explicit
+    `pool`), and sends the task to SQS before returning.
+  - Results come back on a result queue owned by each user endpoint process. The first result per
+    task wins, a `system_failure` triggers the base class's retry, and orphaned results are
+    written atomically to `unacked_results/` for the interchange to republish.
+  - A scale-out-only scaler sizes each pool's Auto Scaling group from queue depth, with a stall
+    circuit breaker.
+  - `start` never raises: misconfiguration fails tasks with a clear message. The status report is
+    cached and never raises, `shutdown` never touches AWS, and endpoint log handlers are shared
+    with `aegc.*` (#12).
 
 ### Fixed
 - **The pull-through cache works with tagged repositories:** the creation template now runs as an aegc

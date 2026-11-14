@@ -19,6 +19,8 @@ from multiprocessing.context import BaseContext
 from pathlib import Path
 from typing import Literal
 
+from aegc.gcresult import failed_result
+
 PRELOAD = ["globus_compute_endpoint.engines.helper"]
 KILL_GRACE_S = 10.0
 #: Let GC_TASK_TIMEOUT report a clean AppTimeout for pure-Python work before the hard kill.
@@ -71,22 +73,6 @@ def _child(
     with open(tmp, "wb") as f:
         f.write(packed)
     os.replace(tmp, out_path)
-
-
-def failed_result(task_uuid: str, code: str, message: str) -> bytes:
-    """A packed Globus Compute Result reporting a failure the task itself couldn't report."""
-    from globus_compute_common import messagepack
-    from globus_compute_common.messagepack.message_types import Result, ResultErrorDetails
-
-    return bytes(
-        messagepack.pack(
-            Result(
-                task_id=uuid.UUID(task_uuid),
-                data=message,
-                error_details=ResultErrorDetails(code=code, user_message=message),
-            )
-        )
-    )
 
 
 def run_task(
