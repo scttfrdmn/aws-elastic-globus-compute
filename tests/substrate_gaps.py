@@ -56,6 +56,7 @@ class FakeEcrPullThrough:
             create_repository_creation_template=self.create_template,
             describe_repository_creation_templates=self.describe_templates,
             delete_repository_creation_template=self.delete_template,
+            update_repository_creation_template=self.update_template,
         )
 
     def create_rule(self, *, ecrRepositoryPrefix: str, upstreamRegistryUrl: str) -> dict[str, Any]:
@@ -92,6 +93,12 @@ class FakeEcrPullThrough:
             )
         self.templates[prefix] = kw
         return {"repositoryCreationTemplate": {"prefix": prefix, **kw}}
+
+    def update_template(self, *, prefix: str, **kw: Any) -> dict[str, Any]:
+        if prefix not in self.templates:
+            raise _client_error("TemplateNotFoundException", "UpdateRepositoryCreationTemplate")
+        self.templates[prefix].update(kw)
+        return {"repositoryCreationTemplate": {"prefix": prefix, **self.templates[prefix]}}
 
     def describe_templates(self, *, prefixes: list[str]) -> dict[str, Any]:
         found = [{"prefix": p, **self.templates[p]} for p in prefixes if p in self.templates]

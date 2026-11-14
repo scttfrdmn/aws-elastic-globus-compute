@@ -1,3 +1,4 @@
+import json
 from collections.abc import Callable
 from typing import Any
 
@@ -9,6 +10,7 @@ from tests.conftest import ACCOUNT, REGION
 from tests.substrate_gaps import FakeEcrPullThrough, s3_with_ownership_controls
 
 BUCKET = naming.bucket_name(ACCOUNT, REGION)
+ROLE = naming.ecr_template_role(REGION)
 
 
 def clients(aws: Callable[[str], Any], fake_ecr: FakeEcrPullThrough) -> dict[str, Any]:
@@ -16,6 +18,7 @@ def clients(aws: Callable[[str], Any], fake_ecr: FakeEcrPullThrough) -> dict[str
         "s3": s3_with_ownership_controls(aws("s3")),
         "ecr": fake_ecr.wrap(aws("ecr")),
         "ssm": aws("ssm"),
+        "iam": aws("iam"),
         "account": ACCOUNT,
         "region": REGION,
     }
@@ -34,6 +37,7 @@ def test_bootstrap_creates_then_is_idempotent(aws: Callable[[str], Any]) -> None
     assert first[("ecr pull-through rule", "aegc-quay")] == "created"
     assert first[("ecr creation template", "aegc-quay")] == "created"
     assert first[("ssm parameter", "/aegc/bootstrap")] == "created"
+    assert first[("iam role", ROLE)] == "created"
 
     second = outcomes(bootstrap.bootstrap(**c))
     assert set(second.values()) == {"exists"}
@@ -50,6 +54,37 @@ def test_bootstrap_creates_then_is_idempotent(aws: Callable[[str], Any]) -> None
     assert fake.rules == {"aegc-quay": "quay.io"}
     template_tags = naming.tag_dict(fake.templates["aegc-quay"]["resourceTags"])
     assert naming.is_owned("aegc-quay", template_tags, naming.BOOTSTRAP)
+
+    # The template uses aegc's own role; ECR's default role can't tag (spike #5).
+    iam = aws("iam")
+    role = iam.get_role(RoleName=ROLE)["Role"]
+    assert fake.templates["aegc-quay"]["customRoleArn"] == role["Arn"]
+    assert role["Path"] == naming.IAM_PATH
+    assert naming.is_owned(
+        ROLE, naming.tag_dict(iam.list_role_tags(RoleName=ROLE)["Tags"]), naming.BOOTSTRAP
+    )
+    perms = iam.get_role_policy(RoleName=ROLE, PolicyName=bootstrap.TEMPLATE_POLICY)[
+        "PolicyDocument"
+    ]
+    stmt = (json.loads(perms) if isinstance(perms, str) else perms)["Statement"][0]
+    assert sorted(stmt["Action"]) == ["ecr:CreateRepository", "ecr:TagResource"]
+    assert stmt["Resource"].endswith(":repository/aegc-quay/*")
+
+
+def test_template_without_custom_role_is_corrected(aws: Callable[[str], Any]) -> None:
+    fake = FakeEcrPullThrough()
+    c = clients(aws, fake)
+    bootstrap.bootstrap(**c)
+    del fake.templates["aegc-quay"]["customRoleArn"]
+    report = outcomes(bootstrap.bootstrap(**c))
+    assert report[("ecr creation template", "aegc-quay")] == "updated"
+    assert fake.templates["aegc-quay"]["customRoleArn"].endswith(f"/aegc/{ROLE}")
+
+
+def test_refuses_untagged_template_role(aws: Callable[[str], Any]) -> None:
+    aws("iam").create_role(RoleName=ROLE, Path="/aegc/", AssumeRolePolicyDocument="{}")
+    with pytest.raises(OwnershipError, match=ROLE):
+        bootstrap.bootstrap(**clients(aws, FakeEcrPullThrough()))
 
 
 def test_dry_run_creates_nothing(aws: Callable[[str], Any]) -> None:
@@ -96,6 +131,9 @@ def test_unbootstrap_dry_run_then_delete(aws: Callable[[str], Any]) -> None:
     assert done[("ecr pull-through rule", "aegc-quay")] == "deleted"
     assert BUCKET not in [b["Name"] for b in aws("s3").list_buckets()["Buckets"]]
     assert fake.rules == {} and fake.templates == {}
+    assert done[("iam role", ROLE)] == "deleted"
+    with pytest.raises(aws("iam").exceptions.NoSuchEntityException):
+        aws("iam").get_role(RoleName=ROLE)
     with pytest.raises(aws("ssm").exceptions.ParameterNotFound):
         aws("ssm").get_parameter(Name="/aegc/bootstrap")
 

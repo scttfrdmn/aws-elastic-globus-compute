@@ -19,6 +19,12 @@ All notable changes to this project are documented here. The format follows
   refuses look-alikes it didn't create. `unbootstrap()` is a dry run by default and refuses while
   deployments remain (#7).
 
+### Fixed
+- **The pull-through cache works with tagged repositories:** the creation template now runs as an aegc
+  role (`/aegc/aegc-ecr-template-<region>`: `ecr:CreateRepository` and `ecr:TagResource` on
+  `aegc-quay/*`, trusted by ECR for this account only). ECR's default role is denied
+  `ecr:TagResource`, which made cache pulls fail with only "repository not found" (#5).
+
 ### Changed
 - **Tests use [substrate](https://github.com/scttfrdmn/substrate)** (pinned v0.124.0, `make tools`)
   instead of moto. Missing capabilities are filed upstream (substrate#1445, #1460–#1465) and shimmed

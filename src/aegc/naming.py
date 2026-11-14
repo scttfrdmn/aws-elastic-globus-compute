@@ -124,6 +124,11 @@ def worker_role(deployment: str, region: str) -> str:
     return f"{PREFIX}-{deployment}-worker-{region}"
 
 
+def ecr_template_role(region: str) -> str:
+    """Region-wide role ECR assumes to create and tag pull-through cache repositories."""
+    return f"{PREFIX}-ecr-template-{region}"
+
+
 def security_group(deployment: str) -> str:
     return f"{PREFIX}-{deployment}-workers"
 

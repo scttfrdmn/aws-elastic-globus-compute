@@ -21,6 +21,9 @@ from aegc.infra import Outcome, OwnershipError, Report
 
 PAYLOAD_EXPIRY_DAYS = 15
 UPSTREAM = "quay.io"
+TEMPLATE_POLICY = "aegc-ecr-template"
+TEMPLATE_ROLE_RETRIES = 6
+TEMPLATE_ROLE_RETRY_S = 5.0
 
 
 def _bucket_policy(bucket: str) -> str:
@@ -117,7 +120,9 @@ def ensure_bucket(s3: Any, bucket: str, region: str, report: Report, *, dry_run:
     s3.put_bucket_policy(Bucket=bucket, Policy=_bucket_policy(bucket))
 
 
-def ensure_pull_through_cache(ecr: Any, report: Report, *, dry_run: bool) -> None:
+def ensure_pull_through_cache(
+    ecr: Any, template_role_arn: str, report: Report, *, dry_run: bool
+) -> None:
     prefix = naming.pull_through_prefix()
     try:
         rules = ecr.describe_pull_through_cache_rules(ecrRepositoryPrefixes=[prefix])
@@ -141,32 +146,118 @@ def ensure_pull_through_cache(ecr: Any, report: Report, *, dry_run: bool) -> Non
             )
             report.add("ecr pull-through rule", prefix, "created", UPSTREAM)
 
-    # Tag the repositories the cache creates, so destroy can recognise them as aegc's.
+    # Tag the repositories the cache creates, so destroy can recognise them as aegc's. A template
+    # that sets tags needs a custom role: ECR's default AWSServiceRoleForECRTemplate is denied
+    # ecr:TagResource, and the cache then fails with only "repository not found" (spike #5).
     try:
-        ecr.describe_repository_creation_templates(prefixes=[prefix])[
+        template = ecr.describe_repository_creation_templates(prefixes=[prefix])[
             "repositoryCreationTemplates"
         ][0]
-        report.add("ecr creation template", prefix, "exists")
     except (IndexError, KeyError):
-        _create_template(ecr, prefix, report, dry_run=dry_run)
+        template = None
     except Exception as e:
         if not is_not_found(e):
             raise
-        _create_template(ecr, prefix, report, dry_run=dry_run)
+        template = None
+    if template is None:
+        _create_template(ecr, prefix, template_role_arn, report, dry_run=dry_run)
+    elif template.get("customRoleArn") != template_role_arn:
+        if dry_run:
+            report.add("ecr creation template", prefix, "updated", "would set its custom role")
+        else:
+            ecr.update_repository_creation_template(prefix=prefix, customRoleArn=template_role_arn)
+            report.add("ecr creation template", prefix, "updated", "custom role set")
+    else:
+        report.add("ecr creation template", prefix, "exists")
 
 
-def _create_template(ecr: Any, prefix: str, report: Report, *, dry_run: bool) -> None:
+def _create_template(
+    ecr: Any, prefix: str, role_arn: str, report: Report, *, dry_run: bool
+) -> None:
     if dry_run:
         report.add("ecr creation template", prefix, "would-create")
         return
-    ecr.create_repository_creation_template(
+    kwargs: dict[str, Any] = dict(
         prefix=prefix,
         description="aegc: tags repositories created by the aegc-quay pull-through cache",
         appliedFor=["PULL_THROUGH_CACHE"],
         imageTagMutability="MUTABLE",
         resourceTags=naming.tag_list(naming.tags(naming.BOOTSTRAP, "cache-repo")),
+        customRoleArn=role_arn,
     )
+    # A just-created IAM role can take a few seconds to become usable.
+    for attempt in range(TEMPLATE_ROLE_RETRIES):
+        try:
+            ecr.create_repository_creation_template(**kwargs)
+            break
+        except Exception as e:
+            if error_code(e) != "InvalidParameterException" or attempt == TEMPLATE_ROLE_RETRIES - 1:
+                raise
+            time.sleep(TEMPLATE_ROLE_RETRY_S)
     report.add("ecr creation template", prefix, "created")
+
+
+def template_role_policies(account: str, region: str) -> tuple[str, str]:
+    """(trust policy, permissions policy) for the creation template's custom role."""
+    trust = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"Service": "ecr.amazonaws.com"},
+                "Action": "sts:AssumeRole",
+                "Condition": {"StringEquals": {"aws:SourceAccount": account}},
+            }
+        ],
+    }
+    perms = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": ["ecr:CreateRepository", "ecr:TagResource"],
+                "Resource": (
+                    f"arn:aws:ecr:{region}:{account}:repository/{naming.pull_through_prefix()}/*"
+                ),
+            }
+        ],
+    }
+    return json.dumps(trust), json.dumps(perms)
+
+
+def ensure_template_role(
+    iam: Any, account: str, region: str, report: Report, *, dry_run: bool
+) -> str:
+    """The IAM role ECR assumes to create and tag pull-through cache repositories."""
+    name = naming.ecr_template_role(region)
+    arn = f"arn:aws:iam::{account}:role{naming.IAM_PATH}{name}"
+    trust, perms = template_role_policies(account, region)
+    try:
+        role = iam.get_role(RoleName=name)["Role"]
+        tags = naming.tag_dict(iam.list_role_tags(RoleName=name)["Tags"])
+        if not naming.is_owned(name, tags, naming.BOOTSTRAP):
+            raise OwnershipError(f"IAM role {name} exists but isn't tagged as aegc's")
+        arn = role["Arn"]
+        outcome: Outcome = "exists"
+    except Exception as e:
+        if isinstance(e, OwnershipError) or not is_not_found(e):
+            raise
+        if dry_run:
+            report.add("iam role", name, "would-create", "ecr creation template")
+            return arn
+        arn = iam.create_role(
+            Path=naming.IAM_PATH,
+            RoleName=name,
+            AssumeRolePolicyDocument=trust,
+            Description="aegc: lets ECR create and tag aegc-quay pull-through cache repositories",
+            Tags=naming.tag_list(naming.tags(naming.BOOTSTRAP, "ecr-template-role")),
+        )["Role"]["Arn"]
+        outcome = "created"
+    if not dry_run:
+        iam.update_assume_role_policy(RoleName=name, PolicyDocument=trust)
+        iam.put_role_policy(RoleName=name, PolicyName=TEMPLATE_POLICY, PolicyDocument=perms)
+    report.add("iam role", name, outcome, "ecr creation template")
+    return str(arn)
 
 
 def ensure_manifest(ssm: Any, bucket: str, report: Report, *, dry_run: bool) -> None:
@@ -214,13 +305,14 @@ def ensure_manifest(ssm: Any, bucket: str, report: Report, *, dry_run: bool) -> 
 
 
 def bootstrap(
-    *, s3: Any, ecr: Any, ssm: Any, account: str, region: str, dry_run: bool = False
+    *, s3: Any, ecr: Any, ssm: Any, iam: Any, account: str, region: str, dry_run: bool = False
 ) -> Report:
     """Create or reconcile the region-wide resources. Safe to run repeatedly."""
     report = Report()
     bucket = naming.bucket_name(account, region)
     ensure_bucket(s3, bucket, region, report, dry_run=dry_run)
-    ensure_pull_through_cache(ecr, report, dry_run=dry_run)
+    role_arn = ensure_template_role(iam, account, region, report, dry_run=dry_run)
+    ensure_pull_through_cache(ecr, role_arn, report, dry_run=dry_run)
     ensure_manifest(ssm, bucket, report, dry_run=dry_run)
     return report
 
@@ -238,7 +330,7 @@ def deployments(ssm: Any) -> list[str]:
 
 
 def unbootstrap(
-    *, s3: Any, ecr: Any, ssm: Any, account: str, region: str, dry_run: bool = True
+    *, s3: Any, ecr: Any, ssm: Any, iam: Any, account: str, region: str, dry_run: bool = True
 ) -> Report:
     """Remove the region-wide resources; refuses while deployments remain. Dry run by default."""
     remaining = deployments(ssm)
@@ -286,11 +378,31 @@ def unbootstrap(
                     raise
         report.actions.extend(_cache_repositories(ecr, prefix, dry_run=dry_run).actions)
 
+    _delete_template_role(iam, region, report, dry_run=dry_run)
+
     if manifest:
         if not dry_run:
             ssm.delete_parameter(Name=naming.bootstrap_parameter())
         report.add("ssm parameter", naming.bootstrap_parameter(), verb)
     return report
+
+
+def _delete_template_role(iam: Any, region: str, report: Report, *, dry_run: bool) -> None:
+    name = naming.ecr_template_role(region)
+    try:
+        tags = naming.tag_dict(iam.list_role_tags(RoleName=name)["Tags"])
+    except Exception as e:
+        if is_not_found(e):
+            return
+        raise
+    if not naming.is_owned(name, tags, naming.BOOTSTRAP):
+        report.add("iam role", name, "kept", "not tagged as aegc's")
+        return
+    if not dry_run:
+        for policy in iam.list_role_policies(RoleName=name)["PolicyNames"]:
+            iam.delete_role_policy(RoleName=name, PolicyName=policy)
+        iam.delete_role(RoleName=name)
+    report.add("iam role", name, "would-delete" if dry_run else "deleted")
 
 
 def _cache_repositories(ecr: Any, prefix: str, *, dry_run: bool) -> Report:
