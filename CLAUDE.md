@@ -49,7 +49,10 @@ payloads > ~700 KB → S3 aegc-<acct>-<region>/payloads/<d>/...
 ## Environment
 - `AWS_PROFILE=aws`, account 942542972736, region us-west-2. The account holds unrelated workloads,
   for example aws-elastic-gcs DTNs.
-- Dev venv: `uv venv --python 3.13 .venv && uv pip install -e '.[engine,cli,dev]'`.
+- Dev venv: `uv venv --python 3.13 .venv && uv pip install -e '.[engine,cli,dev]'`, then `make tools`.
+- **Tests use the user's substrate AWS emulator, not moto** (pytest-substrate; pinned binary in `.tools/`).
+  If substrate lacks a capability, file an issue on scttfrdmn/substrate and shim it in
+  `tests/substrate_gaps.py` with the issue number. Remove the shim when it lands.
 - Checks: `ruff check . && ruff format --check . && mypy && pytest`. Live tests need `-m live` and
   `AEGC_LIVE=1`.
 - Reuse from aws-elastic-parsl: `globus-compute/{Dockerfile,gce.sh,user_config_template.yaml.j2}` and

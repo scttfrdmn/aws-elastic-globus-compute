@@ -1,10 +1,10 @@
 import json
 import os
 import uuid
+from collections.abc import Callable
+from typing import Any
 
-import boto3
 import pytest
-from moto import mock_aws
 
 from aegc import payloads, protocol
 from aegc.protocol import (
@@ -128,9 +128,8 @@ def test_payload_keys() -> None:
     )
 
 
-@mock_aws
-def test_make_and_read_payload_inline_and_s3() -> None:
-    s3 = boto3.client("s3", region_name="us-west-2")
+def test_make_and_read_payload_inline_and_s3(aws: Callable[[str], Any]) -> None:
+    s3 = aws("s3")
     s3.create_bucket(
         Bucket="aegc-test", CreateBucketConfiguration={"LocationConstraint": "us-west-2"}
     )
@@ -152,9 +151,8 @@ def test_make_and_read_payload_inline_and_s3() -> None:
         payloads.read_payload(big, s3=s3)
 
 
-@mock_aws
-def test_read_payload_detects_tampering() -> None:
-    s3 = boto3.client("s3", region_name="us-west-2")
+def test_read_payload_detects_tampering(aws: Callable[[str], Any]) -> None:
+    s3 = aws("s3")
     s3.create_bucket(
         Bucket="aegc-test", CreateBucketConfiguration={"LocationConstraint": "us-west-2"}
     )

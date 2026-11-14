@@ -17,7 +17,8 @@ dependencies = ["boto3>=1.35"]
 engine = ["globus-compute-endpoint>=4.21,<5"]
 cli = ["click>=8.1", "globus-compute-sdk>=4.21,<5"]
 dev = [
-    "moto[server,sqs,s3,ec2,autoscaling,iam,ssm,ecr,logs]>=5",
+    # AWS emulator for tests (https://github.com/scttfrdmn/substrate); binary: `make tools`.
+    "pytest-substrate @ git+https://github.com/scttfrdmn/substrate@v0.124.0#subdirectory=python",
     "pytest>=8",
     "pytest-timeout>=2",
     "ruff>=0.8",
@@ -31,6 +32,9 @@ aegc = "aegc.cli:main"
 [project.urls]
 Repository = "https://github.com/scttfrdmn/aws-elastic-globus-compute"
 Documentation = "https://scttfrdmn.github.io/aws-elastic-globus-compute/"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aegc"]
@@ -49,7 +53,7 @@ mypy_path = "src"
 strict = true
 
 [[tool.mypy.overrides]]
-module = ["globus_compute_endpoint.*", "globus_compute_sdk.*", "globus_compute_common.*", "moto.*"]
+module = ["globus_compute_endpoint.*", "globus_compute_sdk.*", "globus_compute_common.*", "pytest_substrate.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
