@@ -31,6 +31,9 @@ All notable changes to this project are documented here. The format follows
   - Redeploy is idempotent, with a content hash on each launch template version.
   - `destroy()` removes only tagged resources, refuses while tasks are queued unless forced, and is
     a dry run by default. Verified live: deploy, a no-op redeploy, then destroy left nothing (#8).
+- **IAM policies:** `aegc iam-policy {worker,operator,deployer}` prints least-privilege documents
+  scoped to a deployment. Tests run them through the IAM policy simulator (allowed and denied cases,
+  including tag conditions). IAM Access Analyzer reports no findings (#9).
 
 ### Fixed
 - **The pull-through cache works with tagged repositories:** the creation template now runs as an aegc
