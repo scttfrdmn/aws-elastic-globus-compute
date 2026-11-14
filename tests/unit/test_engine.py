@@ -95,6 +95,9 @@ class Env:
             "autoscaling": self.asg,
         }
         e.start(endpoint_id=EID, run_dir=str(self.tmp / "ep"))
+        # Tests drive scale_once() with a fake clock; let the scaler's real-time first pass
+        # finish first, or it can race them (it once set _stalled_since to wall-clock time).
+        assert e.first_scale_pass.wait(10)
         return e
 
     def worker(self) -> Agent:

@@ -122,6 +122,7 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         self._completed: collections.OrderedDict[str, None] = collections.OrderedDict()
         self._stop = threading.Event()
         self._scale_now = threading.Event()
+        self.first_scale_pass = threading.Event()  # set after the scaler's first pass
         self._threads: list[threading.Thread] = []
         self._snapshot = _Snapshot()
         self._manifest: dict[str, Any] | None = None
@@ -531,6 +532,7 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
             except Exception as e:
                 self._snapshot.last_aws_error = str(e)
                 log.warning("scaling pass failed: %s", e)
+            self.first_scale_pass.set()
             self._scale_now.wait(self.scale_interval_s)
             self._scale_now.clear()
 
