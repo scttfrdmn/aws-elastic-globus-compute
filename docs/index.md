@@ -28,7 +28,7 @@ It replaces the HTEX-based setup from
 submit host, which needs tunnels or exposed ports.
 
 !!! note "Status"
-    Version 0.1.0, pre-release. The version stays 0.x. Work is tracked in the repository's
+    Version 0.1.0, an early release; expect changes before later 0.x versions. Work is tracked in the repository's
     [issues](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues) and
     [milestones](https://github.com/scttfrdmn/aws-elastic-globus-compute/milestones).
 
