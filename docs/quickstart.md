@@ -107,12 +107,16 @@ must match a worker image** (3.14 here); a 3.13 client gets an error instead of 
 ```python
 from globus_compute_sdk import Executor
 
+
 def where():
     import platform
+
     return platform.node(), platform.python_version()
 
-with Executor(endpoint_id="<uuid>", amqp_port=5671,
-              user_endpoint_config={"env": "geospatial"}) as ex:
+
+with Executor(
+    endpoint_id="<uuid>", amqp_port=5671, user_endpoint_config={"env": "geospatial"}
+) as ex:
     print(ex.submit(where).result())
 ```
 

@@ -96,7 +96,7 @@ from globus_compute_sdk import Executor
 with Executor(
     endpoint_id=ENDPOINT_ID,
     amqp_port=5671,
-    user_endpoint_config={"env": "geospatial"},   # which science environment
+    user_endpoint_config={"env": "geospatial"},  # which science environment
     resource_specification={"walltime_s": 3600},  # per-task settings
 ) as ex:
     fut = ex.submit(fn, arg)
