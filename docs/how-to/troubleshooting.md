@@ -29,7 +29,7 @@ same minor version. The client is on 3.13 and the only image for `geospatial` ru
 for 3.13 and redeploy: build one from a 3.13 base with `aegc image build --env geospatial --base
 REF`, or register one, then `aegc deploy <d> --pool geospatial` adds `geospatial-py313` next to
 `geospatial-py314`. See [Several Python minors per env](images.md#several-python-minors-per-env).
-With `resource_specification={"pool": ...}` the message reads
+With `user_endpoint_config={"pool": ...}` the message reads
 `pool '<name>' runs Python 3.14, but this client is Python 3.13` instead.
 
 ## Other configuration errors
@@ -40,9 +40,11 @@ These fail the task at once, without a retry, as `AEGC_CONFIGURATION`:
 |---|---|---|
 | `deployment 'x' not found in <region>` | No manifest `/aegc/x/manifest` in the endpoint's region, or the credentials can't read it | Check `--deployment` and the region given to `aegc endpoint configure`; run `aegc deploy x`; restart the endpoint |
 | `AWS setup failed:` | The engine couldn't create AWS clients or its result queue at start (often credentials) | See [Credentials in the endpoint](#credentials-in-the-endpoint); restart the endpoint |
-| `no pool for env 'x' in 'd'; envs: [...]` | No pool in the deployment has that env | Check `user_endpoint_config` / `resource_specification`, or deploy a pool for the env |
-| `no pool 'x' in deployment 'd'` | `resource_specification={"pool": "x"}` names a pool that doesn't exist | Use a name from `aegc status` |
-| `unsupported resource_specification keys [...]` | Keys other than `env`, `pool`, `walltime_s`, `size`, `cpus`, `memory_gib`. A "did you mean" hint follows for `vcpus`, `memory` and similar | Remove or rename them. If `size`, `cpus` or `memory_gib` is refused, the endpoint runs an older engine: `aegc endpoint build`, then `stop` and `start` |
+| `no pool for env 'x' in 'd'; envs: [...]` | No pool in the deployment has that env | Check `user_endpoint_config`, or deploy a pool for the env |
+| `no pool 'x' in deployment 'd'` | `user_endpoint_config={"pool": "x"}` names a pool that doesn't exist | Use a name from `aegc status` |
+| `AWSEngine runs each task on one instance; num_nodes must be 1, not N` | `resource_specification` asks for several nodes | Use `{"num_nodes": 1}`, or leave `resource_specification` out |
+| `AWSEngine doesn't launch MPI ranks; use cpus= for a multi-core task` | `resource_specification` has `ranks_per_node` or `num_ranks` above 1, or `launcher_options` | Drop them; ask for cores with `user_endpoint_config={"cpus": N}` |
+| `unsupported resource_specification keys [...]` | A `resource_specification` key aegc doesn't know reached the engine. A "did you mean" hint follows for `vcpus`, `memory` and similar | Put aegc options in `user_endpoint_config` |
 | `resource_specification cpus must be a positive number` (or `memory_gib`) | Zero, negative or not a number | Pass a number above 0 |
 | `no size='mem' pool for env 'x'; available: ...` | No pool of that size class for the env and the client's Python | Deploy one with `--pool x:size=mem`, or ask for another size |
 | `no pool for env 'x' gives a task N vCPUs and M GiB; available: ...` | Every pool's tasks get less than `cpus` or `memory_gib` | Deploy a larger [size class](configuration.md#size-classes), or ask for less |
@@ -52,8 +54,21 @@ Running engines re-read the manifest every minute, so a fixed deployment takes e
 restart. The exceptions are `deployment ... not found` and `AWS setup failed`, which happen when
 the engine starts: restart the endpoint after fixing those.
 
-`user_endpoint_config` accepts only `env`, matching `^[a-z][a-z0-9-]{0,40}$`; Globus Compute
-rejects anything else before it reaches aegc.
+`user_endpoint_config` accepts only `env`, `pool`, `size`, `cpus`, `memory_gib` and
+`walltime_s`, with the types in the
+[configuration reference](../reference/configuration.md#user_endpoint_config); Globus Compute
+rejects anything else before it reaches aegc. If it rejects `size`, `cpus` or `memory_gib`, the
+endpoint was configured by an older aegc: run `aegc endpoint ... build` and `configure`, then
+`stop` and `start`.
+
+### Options in resource_specification are ignored, or the submission fails with HTTP 422
+
+The Globus Compute web service validates `resource_specification` as an MPI request. Without
+`num_nodes` it refuses the submission (`422 REQUEST_MALFORMED`); with it, it keeps only
+`num_nodes`, `ranks_per_node`, `num_ranks` and `launcher_options` and silently drops everything
+else. So `walltime_s`, `pool`, `size`, `cpus`, `memory_gib` and `env` set there have no effect.
+Move them to `user_endpoint_config`; see
+[Choose the env, size and walltime](configuration.md#choose-the-env-size-and-walltime-from-the-client).
 
 ## Tasks fail because of the deployment state
 
@@ -191,7 +206,7 @@ Each of these is retried once before the client sees it. See
 ## Task exceeded its walltime
 
 `AEGC_WALLTIME_EXCEEDED: task exceeded its walltime of N s and was killed`. Pass a longer
-`walltime_s` in `resource_specification` (at most the pool's `max_walltime`, 41,400 at most), raise
+`walltime_s` in `user_endpoint_config` (at most the pool's `max_walltime`, 41,400 at most), raise
 the pool's default with `walltime=`, or split the work.
 
 ## Reading S3 data fails with Access Denied

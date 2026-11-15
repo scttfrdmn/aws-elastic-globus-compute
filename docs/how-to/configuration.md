@@ -4,7 +4,7 @@ Configuration lives in three places:
 
 - **Pools**, set with `aegc deploy --pool` and recorded in the deployment's manifest.
 - **The endpoint**, written by `aegc endpoint configure`.
-- **Per submission**, chosen by the client with `user_endpoint_config` and `resource_specification`.
+- **Per executor**, chosen by the client with `user_endpoint_config`.
 
 The exact keys and defaults are in the [configuration reference](../reference/configuration.md).
 
@@ -115,11 +115,13 @@ more than the instances' minimum memory: a `whole` task is sure to get `vcpu=` v
 **Scaling.** The scaler asks for the class's vCPUs per task (`whole`: the worker's vCPUs per
 task, one instance each). `max_vcpus` bounds the pool as before.
 
-**Choosing a size from the client.** Tasks ask for a class by name, or for what they need:
+**Choosing a size from the client.** An executor asks for a class by name, or for what its tasks
+need, in `user_endpoint_config` (not `resource_specification`; see
+[below](#choose-the-env-size-and-walltime-from-the-client)):
 
 ```python
-resource_specification={"size": "mem"}                  # a pool of that class
-resource_specification={"cpus": 4, "memory_gib": 24}    # the cheapest pool that fits
+user_endpoint_config={"env": "geospatial", "size": "mem"}                    # that class
+user_endpoint_config={"env": "geospatial", "cpus": 4, "memory_gib": 24}      # cheapest that fits
 ```
 
 With `cpus` and `memory_gib` (positive numbers; either alone works), the engine takes the env's
@@ -145,8 +147,9 @@ Points to know:
 - **Rebuild worker images.** `size=` needs an image built with aegc 0.3 or later, because older
   workers ignore size classes. `deploy` refuses older ones with
   `size=mem needs a worker image built with aegc 0.3 or later (...)`.
-- **Rebuild the endpoint image** (`aegc endpoint build`, then `stop` and `start`). An older engine
-  fails tasks that pass `size`, `cpus` or `memory_gib` as unsupported keys.
+- **Rebuild and reconfigure the endpoint** (`aegc endpoint build`, `configure`, then `stop` and
+  `start`). An older endpoint's schema rejects `size`, `cpus` and `memory_gib` in
+  `user_endpoint_config`.
 - **Env names get shorter.** The pool name must fit in 40 characters; with `size=medium`, env
   names can have at most 27.
 - **A redeploy is per pool name.** `--pool geospatial:size=mem` and `--pool geospatial` are
@@ -224,7 +227,8 @@ it doesn't exist, then writes:
 
 - `user_config_template.yaml.j2`: the `AWSEngine` template, with the deployment, the region and
   the default env filled in;
-- `user_config_schema.json`: allows one `user_endpoint_config` key, `env`;
+- `user_config_schema.json`: allows the `user_endpoint_config` keys `env`, `pool`, `size`, `cpus`,
+  `memory_gib` and `walltime_s`;
 - `user_environment.yaml`: `AWS_REGION`, and `AWS_PROFILE` if one is set;
 - `amqp_port: 5671` in `config.yaml`, if it has no `amqp_port` line.
 
@@ -235,7 +239,9 @@ the file. Restart the endpoint afterwards: the template is read when a user endp
 You can run several endpoints, each with its own `--name` (and its own container,
 `aegc-endpoint-<name>`), for example one per deployment.
 
-## Choose the env and walltime from the client
+## Choose the env, size and walltime from the client
+
+Every aegc option goes in `user_endpoint_config`:
 
 ```python
 from globus_compute_sdk import Executor
@@ -243,22 +249,32 @@ from globus_compute_sdk import Executor
 with Executor(
     endpoint_id=ENDPOINT_ID,
     amqp_port=5671,
-    user_endpoint_config={"env": "geospatial"},  # which science environment
-    resource_specification={"walltime_s": 3600},  # per-task settings
+    user_endpoint_config={"env": "geospatial", "size": "mem", "walltime_s": 3600},
 ) as ex:
     fut = ex.submit(fn, arg)
 ```
 
-- `user_endpoint_config={"env": ...}` selects the env for every task from this executor. Globus
-  Compute starts a separate user endpoint process for each distinct config. Without it, the env
-  given to `configure` applies.
-- `resource_specification` can set `env` (overrides the above for these tasks), `pool` (an exact
-  pool name), `walltime_s` (1 to the pool's `max_walltime`, at most 41,400; default the pool's
-  `walltime`, else 39,600), and `size`, `cpus` and `memory_gib` (see
-  [Size classes](#size-classes)). Any other key fails the task; `vcpus`, `memory` and a few other
-  common spellings get a "did you mean" hint.
+- `env` selects the science environment. Without it, the env given to `configure` applies.
+- `size`, or `cpus` and `memory_gib`, choose the pool's [size class](#size-classes); `pool` names
+  an exact pool instead.
+- `walltime_s` (1 to the pool's `max_walltime`, at most 41,400) replaces the pool's default
+  `walltime`, else 39,600.
+- The endpoint's schema accepts only these keys and checks their types; anything else is refused
+  before it reaches aegc.
+- The options apply to every task from that executor. Globus Compute starts a separate user
+  endpoint process for each distinct `user_endpoint_config`, so use one `Executor` per
+  combination, for example one for small tasks and one for `size: mem`.
 - The client's Python minor version picks the pool among the env's minors, and must match one of
   them. It's taken from the client automatically; you don't pass it.
+
+!!! warning "Not `resource_specification`"
+    The Globus Compute web service treats `resource_specification` as an MPI request: it requires
+    `num_nodes` (otherwise the submission fails with HTTP 422 `REQUEST_MALFORMED`) and drops every
+    key but `num_nodes`, `ranks_per_node`, `num_ranks` and `launcher_options`. So aegc's keys,
+    including the `walltime_s` and `pool` that aegc 0.1 and 0.2 documented there, never reach the
+    engine that way. If shared code passes one, `{"num_nodes": 1}` is accepted; more nodes, or MPI
+    ranks, fail the task. See the
+    [configuration reference](../reference/configuration.md#resource_specification).
 
 ## Give tasks access to your data
 

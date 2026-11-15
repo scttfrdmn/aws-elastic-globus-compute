@@ -17,6 +17,21 @@ engine:
   region: us-west-2
   env: {{ env | default('"geospatial"') }}
   python_minor: "{{ py[:2] | join('.') }}"
+{%- if pool is defined %}
+  pool: {{ pool }}
+{%- endif %}
+{%- if size is defined %}
+  size: {{ size }}
+{%- endif %}
+{%- if cpus is defined %}
+  cpus: {{ cpus }}
+{%- endif %}
+{%- if memory_gib is defined %}
+  memory_gib: {{ memory_gib }}
+{%- endif %}
+{%- if walltime_s is defined %}
+  walltime_s: {{ walltime_s }}
+{%- endif %}
   max_retries_on_system_failure: 1
 ```
 
@@ -27,6 +42,7 @@ engine:
 | `engine.type` | `AWSEngine` | Resolvable through the `.pth` hook installed with aegc. |
 | `engine.env` | from `user_endpoint_config`, else the `--env` given to `configure` | Default env for this process's tasks. |
 | `engine.python_minor` | the submitter's Python, e.g. `"3.14"` | Selects the pool for the env's image of that minor. |
+| `engine.pool`, `size`, `cpus`, `memory_gib`, `walltime_s` | from `user_endpoint_config`, only if given | Pool choice and walltime for this process's tasks; see [below](#user_endpoint_config). |
 | `engine.max_retries_on_system_failure` | `1` | One resubmission after a worker system failure. |
 
 The endpoint's `user_environment.yaml` sets `AWS_REGION`, and `AWS_PROFILE` if one was given.
@@ -34,7 +50,8 @@ The endpoint's `user_environment.yaml` sets `AWS_REGION`, and `AWS_PROFILE` if o
 ## AWSEngine parameters
 
 Parameters of `AWSEngine` ([src/aegc/engine.py](../../src/aegc/engine.py)), in addition to those of
-Globus Compute's engine base class. The template sets the first four; the others keep their
+Globus Compute's engine base class. The template sets `deployment`, `region`, `env` and
+`python_minor`, and the task defaults when `user_endpoint_config` gives them; the others keep their
 defaults.
 
 | Parameter | Default | Meaning |
@@ -43,6 +60,11 @@ defaults.
 | `region` | the session's | AWS region of the deployment |
 | `env` | `""` | Default env; empty means any pool, subject to the Python check |
 | `python_minor` | `""` | Submitter's Python minor version; empty skips the Python check |
+| `pool` | `""` | Run tasks on this exact pool |
+| `size` | `""` | Run tasks on a pool of this [size class](#size-classes) |
+| `cpus` | `0` | vCPUs each task needs (0: no requirement) |
+| `memory_gib` | `0` | GiB each task needs (0: no requirement) |
+| `walltime_s` | `0` | Walltime for each task (0: the pool's default) |
 | `aws_profile` | `""` | AWS profile for the engine's clients |
 | `max_retries_on_system_failure` | `1` | Resubmissions after a system failure |
 | `scale_interval_s` | `10.0` | Seconds between scaler passes |
@@ -53,32 +75,45 @@ defaults.
 
 ## user_endpoint_config
 
-Set by the client: `Executor(user_endpoint_config={...})`. The schema
+Set by the client: `Executor(user_endpoint_config={...})`. This is where every aegc task option
+goes. The schema
 ([src/aegc/templates/endpoint/user_config_schema.json](../../src/aegc/templates/endpoint/user_config_schema.json))
-allows one key:
-
-| Key | Type | Meaning |
-|---|---|---|
-| `env` | string matching `^[a-z][a-z0-9-]{0,40}$` | Science environment for this executor's tasks |
-
-No other keys are accepted. Globus Compute runs one user endpoint process per distinct config.
-
-## resource_specification
-
-Set by the client: `Executor(resource_specification={...})`. `AWSEngine` accepts these keys and
-fails a task with any other:
+allows these keys, and the template renders them into the engine section:
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `env` | string | the engine's `env` | Run on the pool for this env |
-| `pool` | string | | Run on this exact pool (e.g. `geospatial-py314`); overrides `env` and `size`. `cpus` and `memory_gib`, if given, must fit it |
-| `walltime_s` | integer, 1 to the pool's `max_walltime` (at most 41,400) | the pool's `walltime`, else 39,600 | Kill the task after this many seconds |
+| `env` | string matching `^[a-z][a-z0-9-]{0,40}$` | the `--env` given to `configure` | Science environment for this executor's tasks |
+| `pool` | string matching `^[a-z][a-z0-9-]{0,39}$` | | Run on this exact pool (e.g. `geospatial-py314`); overrides `env` and `size`. `cpus` and `memory_gib`, if given, must fit it |
 | `size` | `small`, `medium`, `mem`, `large` or `whole` | | Run on a pool of this [size class](#size-classes); a pool without one counts as `small`. `cpus` and `memory_gib`, if given too, must fit it |
-| `cpus` | positive number | | vCPUs the task needs: run on the cheapest pool whose tasks get at least this many |
-| `memory_gib` | positive number | | GiB the task needs: run on the cheapest pool whose tasks get at least this much |
+| `cpus` | number > 0 | | vCPUs a task needs: run on the cheapest pool whose tasks get at least this many |
+| `memory_gib` | number > 0 | | GiB a task needs: run on the cheapest pool whose tasks get at least this much |
+| `walltime_s` | integer ≥ 1, at most the pool's `max_walltime` (at most 41,400) | the pool's `walltime`, else 39,600 | Kill the task after this many seconds |
 
-Common misspellings get a hint in the error: `vcpus`, `num_cores` and `cores` for `cpus`;
-`memory`, `mem` and `mem_per_worker` for `memory_gib`.
+No other keys are accepted; Globus Compute rejects the submission before it reaches aegc. Globus
+Compute runs one user endpoint process per distinct config, so each combination you use gets its
+own process (and its own result queue). For tasks with different options, use one `Executor` per
+combination.
+
+## resource_specification
+
+Don't use it for aegc options. The Globus Compute web service validates
+`Executor(resource_specification={...})` as an MPI request: it requires `num_nodes` (a request
+without it fails with HTTP 422 `REQUEST_MALFORMED`), and it drops every key except `num_nodes`,
+`ranks_per_node`, `num_ranks` and `launcher_options`. So `size`, `cpus`, `memory_gib`, `walltime_s`,
+`pool` and `env` never reach `AWSEngine` this way.
+
+If code you share with MPI endpoints passes a `resource_specification`, `AWSEngine` accepts its MPI
+keys as long as they ask for one instance and no MPI launch:
+
+| Key | Accepted | Otherwise the task fails with |
+|---|---|---|
+| `num_nodes` | `1` | `AWSEngine runs each task on one instance; num_nodes must be 1, not N` |
+| `ranks_per_node`, `num_ranks` | missing, or `1` | `AWSEngine doesn't launch MPI ranks; use cpus= for a multi-core task` |
+| `launcher_options` | missing or empty | the same |
+
+aegc's own keys, if they do reach the engine in a `resource_specification`, override those from
+`user_endpoint_config`; any other key fails the task (`unsupported resource_specification keys
+[...]`, with a hint for `vcpus`, `memory` and similar spellings).
 
 ## Pool selection
 
@@ -86,13 +121,14 @@ For each task the engine:
 
 1. fails the task with the state's code (`AEGC_BUDGET_EXCEEDED`, `AEGC_STOPPED` or `AEGC_EXPIRED`)
    if the deployment isn't running;
-2. fails the task if the deployment couldn't be loaded, or `resource_specification` has unknown
-   keys;
-3. with `pool`, uses that pool if it exists and its Python matches the submitter;
-4. otherwise takes the pools whose env is `resource_specification["env"]`, else the engine's `env`
-   (all pools if both are empty), and keeps those whose image's Python minor matches the submitter
-   (if known);
-5. from those, with `size`, picks the first by name of that class, and checks that its tasks get
+2. fails the task if the deployment couldn't be loaded, or `resource_specification` asks for more
+   than one instance, MPI ranks, or keys it doesn't know;
+3. takes `pool`, `size`, `cpus`, `memory_gib` and `walltime_s` from the engine (that is, from
+   `user_endpoint_config`), overridden by any that arrive in `resource_specification`;
+4. with `pool`, uses that pool if it exists and its Python matches the submitter;
+5. otherwise takes the pools whose env is the engine's `env` (all pools if it's empty), and keeps
+   those whose image's Python minor matches the submitter (if known);
+6. from those, with `size`, picks the first by name of that class, and checks that its tasks get
    at least `cpus` and `memory_gib`; otherwise keeps the pools whose tasks get at least `cpus`
    vCPUs and `memory_gib` GiB (both 0 if not given) and picks the cheapest: the fewest vCPUs held
    per task (for `whole`, the worker's vCPUs), then a sized pool over a `whole` one, then the
@@ -100,8 +136,8 @@ For each task the engine:
    that pool. What a task gets: its class's vCPUs and GiB; for `whole`, `vcpu=` and `mem=`; for a
    pool without a class and with fixed `slots=N`, the low end of `vcpu=` and `mem=` divided by N;
    otherwise 1 vCPU and 2 GiB;
-6. checks `walltime_s` against the chosen pool's `max_walltime`, or applies its default `walltime`;
-7. fails the task with an `AEGC_CONFIGURATION` error if any of this fails.
+7. checks `walltime_s` against the chosen pool's `max_walltime`, or applies its default `walltime`;
+8. fails the task with an `AEGC_CONFIGURATION` error if any of this fails.
 
 ## Size classes
 

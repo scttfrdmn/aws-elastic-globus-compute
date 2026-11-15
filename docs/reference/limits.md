@@ -7,16 +7,16 @@ Globus Compute limits are the services'.
 
 | Limit | Value | Notes |
 |---|---|---|
-| Walltime, default | 39,600 s (11 h), or the pool's `walltime=` | `resource_specification={"walltime_s": N}` |
+| Walltime, default | 39,600 s (11 h), or the pool's `walltime=` | `user_endpoint_config={"walltime_s": N}` |
 | Walltime, maximum | 41,400 s (11.5 h), or the pool's lower `max_walltime=` | SQS can't extend a claim past 12 hours |
 | Walltime enforcement | Globus Compute's own timeout at `walltime_s`; `SIGTERM` to the task's process group 5 s later; `SIGKILL` to the task process 10 s after that | The task fails with `AEGC_WALLTIME_EXCEEDED` |
 | Inline payload | up to 700,000 bytes | Larger task and result bodies go through S3 |
 | SQS message size | 1 MiB (1,048,576 bytes) | SQS limit; base64 adds a third, hence the inline limit |
 | Globus Compute payload | about 10 MB | Globus Compute's limit on tasks and results, not aegc's; return larger results with [`aegc.outputs`](../how-to/data.md#return-large-outputs) |
 | Python | submitter's minor version must equal an image's | aarchsci images: 3.14; an env can have an image per minor |
-| `resource_specification` keys | `env`, `pool`, `walltime_s`, `size`, `cpus`, `memory_gib` | Others fail the task |
-| `cpus`, `memory_gib` | positive numbers | The task goes to the cheapest pool that gives at least that much |
-| `user_endpoint_config` keys | `env` (`^[a-z][a-z0-9-]{0,40}$`) | Enforced by the endpoint's schema |
+| `user_endpoint_config` keys | `env` (`^[a-z][a-z0-9-]{0,40}$`), `pool` (`^[a-z][a-z0-9-]{0,39}$`), `size`, `cpus`, `memory_gib`, `walltime_s` | Enforced by the endpoint's schema; one user endpoint process per distinct config |
+| `cpus`, `memory_gib` | numbers > 0 | The task goes to the cheapest pool that gives at least that much |
+| `resource_specification` | `num_nodes: 1` at most; no MPI ranks or `launcher_options` | The Globus Compute web service requires `num_nodes` and drops every non-MPI key, so aegc options can't go here |
 
 ## Delivery
 

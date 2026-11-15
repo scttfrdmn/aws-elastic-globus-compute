@@ -31,7 +31,8 @@ flowchart LR
   submitter's Python.
 - **Your data, any size.** Grants let tasks read and write your own S3 prefixes (requester-pays
   included), `aegc.outputs` returns results over Globus Compute's 10 MB limit as `s3://` URIs, and
-  size classes give tasks up to 8 vCPUs and 32 GiB, or a whole instance.
+  size classes give tasks up to 8 vCPUs and 32 GiB, or a whole instance, chosen per executor with
+  `user_endpoint_config={"size": "mem"}`.
 - **Managed with boto3.** Every resource is tagged when it's created, and the tool only ever deletes
   resources that carry its tags.
 

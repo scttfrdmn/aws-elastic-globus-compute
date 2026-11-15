@@ -35,7 +35,9 @@ flowchart LR
 (endpoints need Linux, so this also applies on macOS). Globus Compute starts one *user endpoint
 process* per submitter runtime and per `user_endpoint_config`, from the template that
 `aegc endpoint configure` writes. Each process runs one `AWSEngine`. The template passes the
-submitter's Python minor version and the requested `env` to the engine.
+submitter's Python minor version and the `user_endpoint_config` options (`env`, `size`, `cpus`,
+`memory_gib`, `walltime_s`, `pool`) to the engine. They go there, not in `resource_specification`,
+because the Globus Compute web service keeps only MPI fields in a task's `resource_specification`.
 
 **AWSEngine** ([src/aegc/engine.py](../../src/aegc/engine.py)) has three parts:
 
@@ -114,8 +116,9 @@ sequenceDiagram
 
 1. The SDK submits a task to Globus. The endpoint receives it and calls `AWSEngine.submit()`.
 2. If the deployment isn't `running`, the task fails at once with the state's code. Otherwise the
-   engine resolves the pool from `resource_specification`, the endpoint's `env`, and the
-   submitter's Python version. If nothing matches, the task fails at once with an explanation.
+   engine resolves the pool from the options in `user_endpoint_config` (env, size, `cpus`,
+   `memory_gib`, pool) and the submitter's Python version. If nothing matches, the task fails at
+   once with an explanation.
 3. The engine writes the payload to S3 if it's large, sends the task message to the pool's queue,
    and wakes the scaler, which raises the group's desired capacity.
 4. A worker claims the message. Its heartbeat extends the claim every 100 s while the task runs. It

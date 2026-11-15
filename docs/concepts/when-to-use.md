@@ -59,8 +59,8 @@ These are the current limits. Numbers come from the live run in
   it's exhausted the group stays below its desired capacity; `aegc status` shows the scaling error.
 - **Fixed size classes.** Tasks get 1 vCPU and 2 GiB by default, or one of five
   [size classes](../how-to/configuration.md#size-classes) up to 8 vCPUs and 32 GiB, or a whole
-  instance. Each class is its own pool, and `resource_specification` picks one by `size`, or by
-  `cpus` and `memory_gib`. There's no per-task memory enforcement: tasks on a worker share it.
+  instance. Each class is its own pool, and `user_endpoint_config` picks one by `size`, or by
+  `cpus` and `memory_gib`, for every task of an executor; use one executor per size. There's no per-task memory enforcement: tasks on a worker share it.
 - **At-least-once delivery.** A task can run more than once (after a lost worker or a Spot
   interruption, for example). Write functions so a rerun is harmless. See
   [Delivery and idempotency](delivery.md).

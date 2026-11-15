@@ -139,6 +139,11 @@ with Executor(
 `amqp_port=5671` avoids dropped AMQPS connections on port 443
 ([globus/globus-compute#2232](https://github.com/globus/globus-compute/issues/2232)).
 
+Task options such as the env, the walltime (`walltime_s`) and the size class go in
+`user_endpoint_config`, not `resource_specification`, which the Globus Compute service reserves
+for MPI; see
+[Choose the env, size and walltime](how-to/configuration.md#choose-the-env-size-and-walltime-from-the-client).
+
 Next steps: [size classes](how-to/configuration.md#size-classes) for tasks that need more than
 1 vCPU and 2 GiB, and [grants and `aegc.outputs`](how-to/data.md) for reading your own buckets
 and returning results larger than 10 MB.

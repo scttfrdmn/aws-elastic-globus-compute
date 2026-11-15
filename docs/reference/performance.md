@@ -3,6 +3,8 @@
 Results from the live Globus Compute end-to-end run on 2026-11-14 in us-west-2
 ([#15](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/15)). They come from one
 deployment on one day; Spot capacity, instance types and image size all change the numbers.
+Later runs, for [v0.2](#v02-live-run-2026-11-15) and [v0.3](#v03-live-run-2026-11-15), are at the
+end.
 
 ## Setup
 
@@ -80,3 +82,29 @@ with a 30 GiB gp3 root at 125 MiB/s, the endpoint in Docker on a laptop.
 
 **AWS behaviour checked:** in a vCPU-weighted group, terminating a 2-vCPU worker with the
 decrement while desired is 1 succeeds and clamps desired to 0 (substrate#1526).
+
+## v0.3 live run (2026-11-15)
+
+us-west-2, deployment `v03`, the endpoint in Docker on a laptop with Python 3.13. Pools
+`byo:max_vcpus=4` and `byo:size=mem,max_vcpus=4`, on Spot Graviton workers. Grants
+`read=s3://<test bucket>/in/` and `write=s3://<test bucket>/out/`.
+
+| Check | Result |
+|---|---|
+| Bring your own image | `aegc image build --env byo --base <local python:3.13-slim + numpy 2.x image>` built with `Dockerfile.pip` (a pip base), detected Python 3.13, passed the selftest, and was pushed and recorded; AWS accepted both SSM record parameters |
+| `aegc image register` | a hand-built `python:3.13-slim` image (the aegc wheel, `globus-compute-endpoint` 4.21.0, `USER 57439`) passed its checks and was copied into `aegc/byoreg`; an image running as uid 1000 was refused before anything was pushed |
+| Python routing | a 3.13 client's tasks ran on the 3.13 pool |
+| Cold start, 0 workers to first result | **38–39 s**; a warm task 4 s |
+| Size classes, through `user_endpoint_config` | `size=mem`, and `memory_gib=12`, landed on `r9g.large` (2 vCPUs, 15.3 GiB visible, so 1 slot); `cpus=64` was refused with `no pool ... available: ...`; the default pool used `m7g.large` |
+| Read grant | the task read its input under `in/` |
+| `aegc.outputs` | `outputs.put` wrote a 20 MiB object to `out/<task uuid>/random.bin` |
+| A write outside the grant | `AccessDenied` from IAM, and `PermissionError` from `aegc.outputs`' own check |
+| Cost | about **$0.012** (0.29 instance-hours, Spot) |
+| `destroy --yes` (verifies) and `footprint` | nothing remains; the test bucket, image records and repositories were removed afterwards |
+
+**Found and fixed during the run:**
+- `Dockerfile.pip` linked `aegc-worker` onto itself when pip had installed it in
+  `/usr/local/bin`, as on the official `python:*` images, so the build failed.
+- The Globus Compute web service validates `resource_specification` as an MPI request: it refuses
+  one without `num_nodes` (HTTP 422) and drops every other key. aegc's task options moved to
+  `user_endpoint_config`; see [resource_specification](configuration.md#resource_specification).

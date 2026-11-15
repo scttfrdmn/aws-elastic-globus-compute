@@ -34,13 +34,13 @@ All notable changes to this project are documented here. The format follows
   `<env>-py<NNN>-<size>`, sets `MemoryGiBPerVCpu` for instance selection, raises the low end of
   `vcpu=` to fit a task, and sets the workers' slots from both vCPUs and memory, so it can't be
   combined with `slots=N`. `size=whole` needs one worker size (`vcpu=N`, 8 by default) and counts
-  that many vCPUs per task. `size=` needs an image built with aegc 0.3 or later. Tasks choose with
-  `resource_specification={"size": ...}`, or `{"cpus": N, "memory_gib": M}` for the cheapest pool
-  that fits (a sized pool before a `whole` one on a tie); with `size` or `pool`, `cpus` and
+  that many vCPUs per task. `size=` needs an image built with aegc 0.3 or later. Clients choose
+  with `user_endpoint_config={"size": ...}`, or `{"cpus": N, "memory_gib": M}` for the cheapest
+  pool that fits (a sized pool before a `whole` one on a tie); with `size` or `pool`, `cpus` and
   `memory_gib` are checked against the chosen pool. Unsized pools with fixed `slots=N` offer each
   task their smallest worker divided by N. `vcpus`, `memory` and similar get a "did you mean"
   hint. Pools without `size=` keep their name, launch template and user data. The size keys need
-  an endpoint image built from this release. Workers record the host's vCPUs in the cost ledger,
+  an endpoint built and configured from this release. Workers record the host's vCPUs in the cost ledger,
   not their slot count (#18).
 - **Worker data-access grants:** `aegc deploy <d> --grant read=s3://bucket/prefix --grant
   write=s3://bucket/prefix` (repeatable, at most 32) lets every task in the deployment read or
@@ -60,9 +60,25 @@ All notable changes to this project are documented here. The format follows
   grants from the manifest (cached 60 s), so a redeploy's grants reach running workers; the worker
   policy may now read the manifest. Without a write grant it raises `PermissionError`, naming the
   `--grant` to add. Workers export `AEGC_TASK_UUID` to each task (#54).
+- **Task options in `user_endpoint_config`:** the endpoint's schema and template now take `pool`,
+  `size`, `cpus`, `memory_gib` and `walltime_s` next to `env`, and pass them to `AWSEngine` as
+  defaults for the user endpoint process's tasks, e.g.
+  `Executor(endpoint_id=..., user_endpoint_config={"env": "geospatial", "size": "mem"})`. Each
+  distinct config gets its own user endpoint process. Rerun `aegc endpoint configure` (and restart
+  the endpoint) to get the new schema.
 - Docs: a how-to for bringing your own image and for several Python minors, a how-to for grants
   and `aegc.outputs`, size classes in the configuration guide and reference, the `aegc-grants`
   policy in the IAM reference, and a Mermaid diagram in the README.
+### Fixed
+- **`walltime_s` and `pool` in `resource_specification` never worked against the real Globus
+  Compute service**, though 0.1 and 0.2 documented them there. The web service validates
+  `resource_specification` as an MPI request: it refuses one without `num_nodes` (HTTP 422
+  `REQUEST_MALFORMED`) and drops every key but `num_nodes`, `ranks_per_node`, `num_ranks` and
+  `launcher_options`. aegc's options now go in `user_endpoint_config` (above). `AWSEngine` accepts
+  the MPI keys when they ask for one instance (`num_nodes: 1`) and refuses more nodes or MPI
+  ranks.
+- `aegc image build --base` failed on the official `python:*` images: `Dockerfile.pip` linked
+  `aegc-worker` onto itself when pip had installed it in `/usr/local/bin`.
 
 ## [0.2.0] - 2026-11-15
 
