@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-15
+
+Spend safety: aegc spends real money, so 0.2 adds limits it enforces, a kill switch, a lease, a
+cost view, and clear failures instead of silent waits. Validated live; see the
+[performance page](docs/reference/performance.md).
+
 Spend safety: deployments that bound and report what they cost, stop on request, and fail tasks
 clearly instead of leaving them queued.
 
@@ -253,5 +259,6 @@ Bugs found and fixed during validation:
 - the operator and deployer policies missed actions their commands use;
 - env names over 14 characters couldn't be deployed.
 
-[Unreleased]: https://github.com/scttfrdmn/aws-elastic-globus-compute/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/aws-elastic-globus-compute/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/scttfrdmn/aws-elastic-globus-compute/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/scttfrdmn/aws-elastic-globus-compute/releases/tag/v0.1.0

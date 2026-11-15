@@ -26,8 +26,8 @@ endpoint (laptop container) ─ AWSEngine ─▶ SQS tasks ◀── Graviton wo
 
 ## Status
 
-Early release (0.x): v0.1.0 is out, and v0.2 (spend limits, stop and resume, a cost ledger) is in
-progress. Work is tracked in this repo's issues, milestones and project board.
+Early release (0.x): v0.2.0 adds spend limits, stop and resume, a deployment lease and a cost
+ledger to v0.1.0. Work is tracked in this repo's issues, milestones and project board.
 
 Sister projects:
 - [aws-elastic-gcs](https://github.com/scttfrdmn/aws-elastic-gcs): elastic Globus Connect Server.

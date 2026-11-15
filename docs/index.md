@@ -41,8 +41,8 @@ It replaces the HTEX-based setup from
 submit host, which needs tunnels or exposed ports.
 
 !!! note "Status"
-    An early 0.x release. These pages describe the main branch, which adds v0.2's spend limits,
-    `aegc stop` and the cost ledger to v0.1.0; expect more changes before later 0.x versions.
+    An early 0.x release: v0.2.0 adds spend limits, `aegc stop`, a deployment lease and the cost
+    ledger to v0.1.0. Expect more changes before later 0.x versions.
     Work is tracked in the repository's
     [issues](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues) and
     [milestones](https://github.com/scttfrdmn/aws-elastic-globus-compute/milestones).
