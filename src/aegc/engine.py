@@ -827,6 +827,8 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
                 # Whole workers: Auto Scaling launches a whole instance for any vCPU target, so a
                 # 1-vCPU demand is a 2-vCPU worker (and rounding it down to 0 would hang it).
                 want = math.ceil((target - m.desired) / per_worker) * per_worker
+                # ...but never past the group's maximum (the call would be refused).
+                want = min(want, (m.max - m.desired) // per_worker * per_worker)
                 allowed = self._spend.admit(
                     limits,
                     now,

@@ -32,6 +32,24 @@ from tests.unit.test_engine import env as engine_env  # noqa: F401  (fixture)
 from tests.unit.test_worker import Rig, rig  # noqa: F401  (fixtures)
 
 
+class _Quiet:
+    """Stands in for the engine's wake-up event: submit() then doesn't wake the real-time
+    scaler, which would race the test's fake clock."""
+
+    def set(self) -> None: ...
+
+    def clear(self) -> None: ...
+
+    def wait(self, timeout: float | None = None) -> bool:
+        time.sleep(min(timeout or 0, 0.05))
+        return False
+
+
+def quiet(e: engine.AWSEngine) -> engine.AWSEngine:
+    e._scale_now = _Quiet()  # type: ignore[assignment]
+    return e
+
+
 def auto_slots(e: engine.AWSEngine) -> None:
     assert e._manifest is not None
     e._manifest["pools"]["geo-py314"]["slots"] = "auto"  # the default: one task per vCPU
@@ -40,7 +58,7 @@ def auto_slots(e: engine.AWSEngine) -> None:
 @pytest.mark.timeout(60)
 def test_1_one_task_under_a_limit_gets_a_worker(engine_env: Env) -> None:
     # Finding 1: 1 task = 1 vCPU, rounded down to whole 2-vCPU workers = 0: the task hung.
-    e = engine_env.engine()
+    e = quiet(engine_env.engine())
     try:
         auto_slots(e)
         set_limits(engine_env, e, max_usd_day=5.0)
@@ -54,7 +72,7 @@ def test_1_one_task_under_a_limit_gets_a_worker(engine_env: Env) -> None:
 
 @pytest.mark.timeout(60)
 def test_1_tasks_blocked_by_limits_fail_clearly(engine_env: Env) -> None:
-    e = engine_env.engine()
+    e = quiet(engine_env.engine())
     try:
         set_limits(engine_env, e, max_usd_day=0.10)  # less than an hour of one worker x 1.2
         f = submit(e, triple, 1)
@@ -274,3 +292,24 @@ def test_cap_reset_restores_minimums(engine_env: Env) -> None:
         assert g["MinSize"] == 2
     finally:
         e.shutdown()
+
+
+@pytest.mark.timeout(60)
+def test_a_idle_worker_leaves_a_vcpu_weighted_group(env: tuple[Clients, DeploymentSpec]) -> None:
+    # Desired 1 vCPU launches one 2-vCPU worker; its decrement (2) exceeds desired, which the
+    # group refuses. The worker lowers desired by its weight and leaves without a replacement.
+    from aegc.worker.agent import Agent
+
+    c, spec = env
+    deployment.deploy(c, spec)
+    c.autoscaling.set_desired_capacity(AutoScalingGroupName=ASG, DesiredCapacity=1)
+    g = c.autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[ASG])
+    (inst,) = g["AutoScalingGroups"][0]["Instances"]
+    cfg = WorkerConfig(deployment="dev", pool=POOL.name, region=REGION, task_queue_url="",
+                       bucket="b", instance_id=inst["InstanceId"])  # fmt: skip
+    a = Agent(config=cfg, sqs=c.sqs, s3=None, autoscaling=c.autoscaling)
+    assert a._leave_group()
+    g = c.autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[ASG])
+    assert g["AutoScalingGroups"][0]["DesiredCapacity"] == 0
+    left = {i["InstanceId"]: i["LifecycleState"] for i in g["AutoScalingGroups"][0]["Instances"]}
+    assert not left.get(inst["InstanceId"], "Terminating").startswith("InService")

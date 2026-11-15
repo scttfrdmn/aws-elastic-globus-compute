@@ -5,7 +5,7 @@ from aegc import cli
 
 
 def test_version_is_0x() -> None:
-    major, minor, _ = aegc.__version__.split(".")
+    major, minor, _ = aegc.__version__.split(".", 2)  # e.g. 0.2.0 or 0.2.0.dev0
     assert major == "0", "stay on 0.x until the owner says otherwise"
     assert minor.isdigit()
 

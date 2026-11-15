@@ -1,8 +1,6 @@
 from collections.abc import Callable
 from typing import Any
 
-import pytest
-
 from aegc import quotas
 
 
@@ -19,7 +17,6 @@ def test_on_demand_quota_from_service_quotas(aws: Callable[[str], Any]) -> None:
     assert "can ask for up to 48" in w and "--quota-code L-1216C47A --desired-value 48" in w
 
 
-@pytest.mark.xfail(strict=True, reason="substrate#1498: no Spot vCPU quota L-34B43A08")
 def test_spot_quota_from_service_quotas(aws: Callable[[str], Any]) -> None:
     (c,) = quotas.check([pool("geo")], sq=aws("service-quotas"), cw=aws("cloudwatch"))
     assert c.quota is not None

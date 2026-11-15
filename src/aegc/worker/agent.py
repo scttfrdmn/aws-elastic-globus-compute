@@ -25,6 +25,7 @@ Semantics follow spore-host spawn's task pool:
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -34,7 +35,7 @@ from multiprocessing.context import BaseContext
 from pathlib import Path
 from typing import Any
 
-from aegc import __version__, ledger, payloads, protocol
+from aegc import __version__, ledger, naming, payloads, protocol
 from aegc.awsutil import error_code
 from aegc.gcresult import failed_result
 from aegc.protocol import ErrorInfo, ProtocolError, ResultMessage, TaskMessage
@@ -605,6 +606,8 @@ class Agent:
             log.info("leaving the group")
             return True
         except Exception as e:
+            if error_code(e) == "ValidationError" and self._shrink_and_leave():
+                return True
             if error_code(e) == "ValidationError":
                 if replace_at_minimum:
                     try:
@@ -621,6 +624,47 @@ class Agent:
                 return False
             log.warning("couldn't leave the group: %s", e)
             self._touch()
+            return False
+
+    def _shrink_and_leave(self) -> bool:
+        """A vCPU-weighted group refuses a decrement larger than its desired capacity (desired
+        1, a 2-vCPU worker). Above the group's minimum, lower desired by this worker's weight
+        (never below the minimum) and terminate without a decrement, so nothing replaces it.
+        Protected instances are never terminated to meet the lower number."""
+        assert self.autoscaling is not None
+        group = naming.auto_scaling_group(self.config.deployment, self.config.pool)
+        try:
+            found = self.autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[group])[
+                "AutoScalingGroups"
+            ]
+            if not found:
+                return False
+            g = found[0]
+            desired, minimum = int(g.get("DesiredCapacity", 0)), int(g.get("MinSize", 0))
+            weight = 1
+            if g.get("DesiredCapacityType") == "vcpu":
+                mine = [
+                    i for i in g.get("Instances", []) if i["InstanceId"] == self.config.instance_id
+                ]
+                weight = int(
+                    (mine[0].get("WeightedCapacity") if mine else 0) or os.cpu_count() or 1
+                )
+            if desired - min(desired, weight) < minimum or desired <= minimum:
+                return False  # at the minimum: the caller decides
+            self.autoscaling.set_desired_capacity(
+                AutoScalingGroupName=group,
+                DesiredCapacity=max(minimum, desired - weight),
+                HonorCooldown=False,
+            )
+            self.autoscaling.terminate_instance_in_auto_scaling_group(
+                InstanceId=self.config.instance_id, ShouldDecrementDesiredCapacity=False
+            )
+            log.info(
+                "leaving the group (desired %d -> %d)", desired, max(minimum, desired - weight)
+            )
+            return True
+        except Exception as e:
+            log.warning("couldn't shrink the group to leave it: %s", e)
             return False
 
     # --- helpers ----------------------------------------------------------------------------

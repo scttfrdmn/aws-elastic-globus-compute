@@ -137,7 +137,7 @@ def test_footprint_of_nothing(aws: Callable[[str], Any]) -> None:
 
 @pytest.mark.xfail(
     strict=True,
-    reason="substrate gap (not filed): GetResources omits EC2 security groups, launch templates "
+    reason="substrate#1523: GetResources omits EC2 security groups, launch templates "
     "and volumes, and IAM instance profiles",
 )
 def test_footprint_tagging_api_covers_ec2_and_profiles(

@@ -62,7 +62,6 @@ def test_firing_freezes_the_deployment(env: tuple[Clients, DeploymentSpec]) -> N
     assert g[0]["MinSize"] == 0
 
 
-@pytest.mark.xfail(strict=True, reason="substrate#1501: no schedule groups or tags")
 @pytest.mark.timeout(60)
 def test_ensure_renew_destroy(aws: Callable[[str], Any]) -> None:
     sch, iam = aws("scheduler"), aws("iam")

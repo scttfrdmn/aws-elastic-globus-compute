@@ -63,6 +63,11 @@ def stop(
     if hard:
         sleep(grace_s)
         for name, group in sorted(groups.items()):
+            # Desired 0 first: then terminating needs no decrement (which a vCPU-weighted group
+            # can refuse) and nothing is replaced. Protected instances aren't terminated by this.
+            autoscaling.set_desired_capacity(
+                AutoScalingGroupName=group, DesiredCapacity=0, HonorCooldown=False
+            )
             found = autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[group])[
                 "AutoScalingGroups"
             ]
@@ -71,7 +76,7 @@ def stop(
                     continue
                 try:
                     autoscaling.terminate_instance_in_auto_scaling_group(
-                        InstanceId=inst["InstanceId"], ShouldDecrementDesiredCapacity=True
+                        InstanceId=inst["InstanceId"], ShouldDecrementDesiredCapacity=False
                     )
                     report.add(f"  pool {name}: terminated {inst['InstanceId']}")
                 except Exception as e:

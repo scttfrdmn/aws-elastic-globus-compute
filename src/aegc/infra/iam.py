@@ -77,6 +77,23 @@ def worker_policy(*, deployment: str, region: str, account: str, bucket: str) ->
                 "Resource": f"arn:aws:s3:::{bucket}/payloads/{d}/results/*",
             },
             {
+                # vCPU-weighted groups refuse a decrement larger than desired: the worker lowers
+                # desired by its own weight, then terminates without decrementing.
+                "Sid": "ShrinkToLeave",
+                "Effect": "Allow",
+                "Action": "autoscaling:SetDesiredCapacity",
+                "Resource": "*",
+                "Condition": {
+                    "StringEquals": {f"autoscaling:ResourceTag/{naming.TAG_DEPLOYMENT}": d}
+                },
+            },
+            {
+                "Sid": "ReadOwnGroup",
+                "Effect": "Allow",
+                "Action": "autoscaling:DescribeAutoScalingGroups",
+                "Resource": "*",
+            },
+            {
                 "Sid": "SelfDrain",
                 "Effect": "Allow",
                 "Action": "autoscaling:TerminateInstanceInAutoScalingGroup",

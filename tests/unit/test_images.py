@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+import aegc
 from aegc import images, naming
 from aegc.infra import Report
 from tests.conftest import ACCOUNT, REGION
@@ -63,7 +64,7 @@ def test_refs_and_tags() -> None:
         "quay.io/aarchsci/"
     )
     tag = images.image_tag("3.14", SPEC, "0123abcd")
-    assert tag == "py3.14-gce4.21.0-aegc0.1.0-b2026.11.13.154112-w0123abcd"
+    assert tag == f"py3.14-gce4.21.0-aegc{aegc.__version__}-b2026.11.13.154112-w0123abcd"
     args = images.docker_build_args(SPEC, base="B", local_tag="L", context=Path("/ctx"))
     assert args[:6] == ["docker", "buildx", "build", "--platform", "linux/arm64", "--load"]
     assert "BASE=B" in args and "AEGC_ALLOW_CHANGE=click" in args
@@ -279,7 +280,7 @@ def test_protect_refuses_missing_and_foreign(aws: Callable[[str], Any]) -> None:
 
 @pytest.mark.xfail(
     strict=True,
-    reason="substrate gap (not filed): no StartLifecyclePolicyPreview, so the rule order can't be "
+    reason="substrate#1524: no StartLifecyclePolicyPreview, so the rule order can't be "
     "evaluated here. AWS documents that an image matching a higher-priority rule's tag selection "
     "can't be expired by a lower-priority one.",
 )

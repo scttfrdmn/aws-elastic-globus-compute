@@ -10,7 +10,7 @@ from aegc.awsutil import paginate
 from aegc.infra import OwnershipError, Report, deployment
 from aegc.infra.deployment import Clients, DeploymentSpec, PoolSpec
 from tests.conftest import ACCOUNT, REGION
-from tests.substrate_gaps import launch_on_substrate, no_network_interfaces
+from tests.substrate_gaps import no_network_interfaces
 from tests.unit.test_images import push_fake, tags_of
 
 IMAGE = f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/aegc/geospatial@sha256:" + "b" * 64
@@ -208,7 +208,6 @@ def test_launch_template_requests_imdsv2() -> None:
     }
 
 
-@pytest.mark.xfail(strict=True, reason="substrate#1471: launch templates drop MetadataOptions")
 def test_launch_template_metadata_options_round_trip(
     env: tuple[Clients, DeploymentSpec],
 ) -> None:
@@ -220,10 +219,6 @@ def test_launch_template_metadata_options_round_trip(
     assert data["MetadataOptions"]["HttpTokens"] == "required"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="substrate#1497: no Graviton types in the catalog, so the group launches nothing",
-)
 def test_deployed_group_launches_graviton_spot(env: tuple[Clients, DeploymentSpec]) -> None:
     c, spec = env
     deployment.deploy(c, spec)
@@ -234,7 +229,7 @@ def test_deployed_group_launches_graviton_spot(env: tuple[Clients, DeploymentSpe
     assert inst["LifecycleState"] == "InService" and inst["ProtectedFromScaleIn"] is True
     (r,) = c.ec2.describe_instances(InstanceIds=[inst["InstanceId"]])["Reservations"]
     assert r["Instances"][0]["InstanceLifecycle"] == "spot"
-    assert r["Instances"][0]["Architecture"] == "arm64"
+    assert inst["InstanceType"].split(".")[0].endswith("g")  # Graviton
 
 
 def test_deploy_is_idempotent(env: tuple[Clients, DeploymentSpec]) -> None:
@@ -250,8 +245,7 @@ def test_changed_image_adds_launch_template_version(
 ) -> None:
     c, spec = env
     deployment.deploy(c, spec)
-    launch_on_substrate(c.autoscaling, ASG)  # substrate#1497
-    c.autoscaling.set_desired_capacity(AutoScalingGroupName=ASG, DesiredCapacity=2)
+    c.autoscaling.set_desired_capacity(AutoScalingGroupName=ASG, DesiredCapacity=4)  # vCPUs
     newer = PoolSpec(**{**POOL.__dict__, "image": IMAGE.replace("b" * 64, "c" * 64)})
     r = outcomes(deployment.deploy(c, DeploymentSpec(**{**spec.__dict__, "pools": (newer,)})))
     assert r[("launch template", "aegc-dev-sci-py314")] == "updated"
@@ -261,7 +255,7 @@ def test_changed_image_adds_launch_template_version(
     assert lt["DefaultVersionNumber"] == 2
     # Redeploying never resets capacity the engine set, nor touches the running workers.
     g = group(c)
-    assert g is not None and g["DesiredCapacity"] == 2 and len(g["Instances"]) == 2
+    assert g is not None and g["DesiredCapacity"] == 4 and len(g["Instances"]) == 2
     mixed = g["MixedInstancesPolicy"]["LaunchTemplate"]["LaunchTemplateSpecification"]
     assert mixed["Version"] == "$Default"
 
@@ -294,8 +288,7 @@ def test_destroy_dry_run_then_delete_leaves_foreign_resources(
     c, spec = env
     deployment.deploy(c, spec)
     # Running workers: destroy has to force-delete the group and wait for it to go.
-    launch_on_substrate(c.autoscaling, ASG)  # substrate#1497
-    c.autoscaling.set_desired_capacity(AutoScalingGroupName=ASG, DesiredCapacity=2)
+    c.autoscaling.set_desired_capacity(AutoScalingGroupName=ASG, DesiredCapacity=4)  # 2 workers
     g = group(c)
     assert g is not None
     workers = [i["InstanceId"] for i in g["Instances"]]
@@ -341,7 +334,6 @@ def test_destroy_dry_run_then_delete_leaves_foreign_resources(
 def test_destroy_refuses_with_queued_tasks(env: tuple[Clients, DeploymentSpec]) -> None:
     c, spec = env
     deployment.deploy(c, spec)
-    launch_on_substrate(c.autoscaling, ASG)  # substrate#1497
     c.autoscaling.set_desired_capacity(AutoScalingGroupName=ASG, DesiredCapacity=1)
     tq = c.sqs.get_queue_url(QueueName="aegc-dev-sci-py314-tasks")["QueueUrl"]
     c.sqs.send_message(QueueUrl=tq, MessageBody="{}")
@@ -502,7 +494,6 @@ def test_destroy_reports_what_remains(env: tuple[Clients, DeploymentSpec]) -> No
 def test_verify_lists_every_kind_before_destroy(env: tuple[Clients, DeploymentSpec]) -> None:
     c, spec = env
     deployment.deploy(c, spec)
-    launch_on_substrate(c.autoscaling, ASG)  # substrate#1497
     c.autoscaling.set_desired_capacity(AutoScalingGroupName=ASG, DesiredCapacity=1)
     kinds = {a.resource for a in deployment.verify_destroyed(
         c, deployment="dev", region=REGION, wait_s=0
@@ -514,7 +505,7 @@ def test_verify_lists_every_kind_before_destroy(env: tuple[Clients, DeploymentSp
 
 
 @pytest.mark.xfail(
-    strict=True, reason="substrate gap (not filed): no DescribeNetworkInterfaces (InvalidAction)"
+    strict=True, reason="substrate#1522: no DescribeNetworkInterfaces (InvalidAction)"
 )
 def test_verify_sees_worker_network_interfaces(aws: Callable[[str], Any]) -> None:
     ec2 = aws("ec2")

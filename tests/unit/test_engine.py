@@ -22,7 +22,6 @@ from aegc.worker.agent import Agent
 from aegc.worker.config import WorkerConfig
 from aegc.worker.testing import pack_task, unpack_result
 from tests.conftest import ACCOUNT, REGION
-from tests.substrate_gaps import launch_on_substrate
 
 BUCKET = naming.bucket_name(ACCOUNT, REGION)
 IMAGE = f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/aegc/geospatial@sha256:" + "d" * 64
@@ -75,7 +74,6 @@ class Env:
             self.spec,
         )
         self.task_queue = self.sqs.get_queue_url(QueueName="aegc-dev-geo-py314-tasks")["QueueUrl"]
-        launch_on_substrate(self.asg, GROUP)  # substrate#1497
 
     def engine(self, *, python_minor: str = "3.14", **kw: Any) -> AWSEngine:
         e = AWSEngine(
@@ -601,7 +599,6 @@ def test_running_engine_picks_up_a_redeploy(env: Env) -> None:
         e.shutdown()
 
 
-@pytest.mark.xfail(strict=True, reason="substrate#1502: DesiredCapacityType=vcpu isn't modelled")
 @pytest.mark.timeout(60)
 def test_vcpu_capacity_launches_workers_not_units(env: Env) -> None:
     e = env.engine()
@@ -610,6 +607,6 @@ def test_vcpu_capacity_launches_workers_not_units(env: Env) -> None:
         e.scale_once()
         g = env.group()
         assert g["DesiredCapacity"] == 8  # vCPUs
-        assert len(g["Instances"]) == 4  # 2-vCPU workers (m5.large on substrate#1497's shim)
+        assert len(g["Instances"]) == 4  # 2-vCPU Graviton workers, not 8 instances
     finally:
         e.shutdown()

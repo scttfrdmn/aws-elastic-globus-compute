@@ -43,10 +43,8 @@ def test_stop_and_resume(env: tuple[Clients, DeploymentSpec]) -> None:
 
 @pytest.mark.timeout(60)
 def test_hard_stop_kills_and_terminates_stragglers(env: tuple[Clients, DeploymentSpec]) -> None:
-    from tests.substrate_gaps import launch_on_substrate
 
     c = deployed(env)
-    launch_on_substrate(c.autoscaling, ASG)  # substrate#1497
     c.autoscaling.set_desired_capacity(AutoScalingGroupName=ASG, DesiredCapacity=1)
     r = control.stop(
         ssm=c.ssm, autoscaling=c.autoscaling, deployment="dev", hard=True, sleep=lambda _: None
@@ -152,7 +150,6 @@ def test_status_v2(env: tuple[Clients, DeploymentSpec], aws: Callable[[str], Any
 
     from aegc import naming, ops
     from tests.conftest import ACCOUNT, REGION
-    from tests.substrate_gaps import launch_on_substrate
 
     c, _ = env
     bucket = naming.bucket_name(ACCOUNT, REGION)
@@ -160,7 +157,6 @@ def test_status_v2(env: tuple[Clients, DeploymentSpec], aws: Callable[[str], Any
     s3.create_bucket(Bucket=bucket, CreateBucketConfiguration={"LocationConstraint": REGION})
     deployed(env)
     control.set_limits(ssm=c.ssm, autoscaling=c.autoscaling, deployment="dev", max_usd_day=2.0)
-    launch_on_substrate(c.autoscaling, ASG)  # substrate#1497
     c.autoscaling.set_desired_capacity(AutoScalingGroupName=ASG, DesiredCapacity=1)
     ledger.write(
         s3, bucket,

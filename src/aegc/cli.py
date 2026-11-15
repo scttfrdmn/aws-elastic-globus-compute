@@ -592,10 +592,11 @@ def build_parser() -> argparse.ArgumentParser:
     dp.add_argument(
         "--pool", action="append", required=True,
         help="env[:max_vcpus=N,min_vcpus=N,vcpu=LO-HI,mem=MiB,slots=N|auto,idle=S,disk=GiB,"
-        "throughput=MiBps,walltime=S,max_walltime=S,lifetime=S,on-demand]; repeatable. "
-        "max_vcpus caps the pool (default 8); vcpu is each worker's size range (default 2-16); "
-        "disk: root gp3 GiB (30-16384, default 30); throughput: its MiB/s (125-1000, default "
-        "125). On a redeploy, options not given keep their last values.",
+        "throughput=MiBps,walltime=S,max_walltime=S,lifetime=S,on-demand|spot]; repeatable. "
+        "max_vcpus caps the pool (default 8); vcpu is each worker's size range (default 2-8, "
+        "at most max_vcpus); disk: root gp3 GiB (30-16384, default 30); throughput: its MiB/s "
+        "(125-1000, default 125); lifetime: 3600-259200 s (default 86400). On a redeploy, "
+        "options not given keep their last values.",
     )  # fmt: skip
     _limit_args(dp)
     dp.add_argument(
