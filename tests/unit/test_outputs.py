@@ -20,6 +20,7 @@ TASK = "0b9b4f6e-8a1c-4a43-9d3f-2c5a1f7e9b10"
 
 
 def worker_env(monkeypatch: pytest.MonkeyPatch, grants: list[dict[str, str]]) -> None:
+    monkeypatch.setattr(outputs, "_grants_cache", None)
     cfg = {
         "deployment": "dev",
         "pool": "p",
@@ -57,7 +58,7 @@ def test_put_and_get_bytes_and_text(s3: Any) -> None:
     assert (
         s3.get_object(Bucket="lab", Key=f"out/{TASK}/blob.bin")["Body"].read() == b"\x00\x01binary"
     )
-    text = outputs.put("héllo")
+    text = outputs.put("héllo".encode())
     assert text.startswith(f"s3://lab/out/{TASK}/output-") and outputs.get(text) == "héllo".encode()
     assert outputs.put(b"2") != outputs.put(b"3")  # unnamed outputs don't collide
 

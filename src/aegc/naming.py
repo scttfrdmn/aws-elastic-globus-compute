@@ -126,7 +126,13 @@ def state_parameter(deployment: str) -> str:
 
 
 def image_parameter(env: str) -> str:
+    """The env's newest image, in the single-record form aegc 0.1 and 0.2 read."""
     return f"/{PREFIX}/images/{env}"
+
+
+def image_records_parameter(env: str) -> str:
+    """All of the env's images, one per Python minor (aegc 0.3+)."""
+    return f"/{PREFIX}/images/{env}/records"
 
 
 def worker_role(deployment: str, region: str) -> str:

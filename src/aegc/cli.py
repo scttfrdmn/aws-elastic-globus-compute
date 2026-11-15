@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from typing import Any
 
@@ -48,16 +49,23 @@ def _image_build(args: argparse.Namespace) -> int:
     if not region:
         print("aegc: no region; pass --region or configure one", file=sys.stderr)
         return 2
-    result = images.build(
-        spec,
-        account=awsutil.account_id(sess),
-        region=region,
-        ecr=awsutil.client(sess, "ecr"),
-        ssm=awsutil.client(sess, "ssm"),
-        project_dir=Path(args.project_dir),
-        push_image=not args.no_push,
-        through_cache=not args.direct,
-    )
+    try:
+        result = images.build(
+            spec,
+            account=awsutil.account_id(sess),
+            region=region,
+            ecr=awsutil.client(sess, "ecr"),
+            ssm=awsutil.client(sess, "ssm"),
+            project_dir=Path(args.project_dir),
+            push_image=not args.no_push,
+            through_cache=not args.direct,
+        )
+    except ValueError as e:
+        raise SystemExit(f"aegc: {e}") from None
+    except subprocess.CalledProcessError as e:
+        raise SystemExit(
+            f"aegc: `{' '.join(map(str, e.cmd))}` failed (exit {e.returncode})"
+        ) from None
     print(result if isinstance(result, str) else result.image)
     return 0
 
@@ -78,11 +86,34 @@ def _image_register(args: argparse.Namespace) -> int:
             region=region,
             ecr=awsutil.client(sess, "ecr"),
             ssm=awsutil.client(sess, "ssm"),
-            python=args.python,
         )
+    except subprocess.CalledProcessError as e:
+        raise SystemExit(
+            f"aegc: `{' '.join(map(str, e.cmd))}` failed (exit {e.returncode})"
+        ) from None
     except ValueError as e:
         raise SystemExit(f"aegc: {e}") from None
     print(rec.image)
+    return 0
+
+
+def _image_forget(args: argparse.Namespace) -> int:
+    from aegc import awsutil, images
+
+    ssm = awsutil.client(awsutil.session(args.profile, args.region), "ssm")
+    try:
+        left = images.forget(ssm, args.env, args.python)
+    except KeyError as e:
+        raise SystemExit(f"aegc: {e.args[0]}") from None
+    except Exception as e:
+        if not awsutil.is_not_found(e):
+            raise
+        raise SystemExit(f"aegc: no image recorded for env {args.env!r}") from None
+    print(
+        f"forgot {args.env} Python {args.python}; "
+        + (f"left: {', '.join(sorted(left))}" if left else "no images left")
+        + ". Deployed pools keep running until you redeploy or prune them."
+    )
     return 0
 
 
@@ -241,14 +272,20 @@ def _pool_spec(
     if _version(rec.aegc_version) < (0, 2) and not args.allow_old_image:
         raise SystemExit(
             f"aegc: the {env!r} image was built with aegc {rec.aegc_version}; its workers "
-            "ignore spend limits, stop and the lease, and write no cost ledger. Rebuild it: "
-            f"aegc image build --env {env} --base-tag ... (or pass --allow-old-image)"
+            "ignore spend limits, stop and the lease, and write no cost ledger. Rebuild it with "
+            "`aegc image build` (or `image register`) again, or pass --allow-old-image"
         )
     size = str(opts.pop("size_class", ""))
     try:
         cls = sizes.get(size) if size else None
     except ValueError as e:
         raise SystemExit(f"aegc: {e}") from None
+    if cls is not None and _version(rec.aegc_version) < (0, 3):
+        raise SystemExit(
+            f"aegc: size={size} needs a worker image built with aegc 0.3 or later (the {env!r} "
+            f"Python {rec.python_minor} image has {rec.aegc_version}, whose workers ignore sizes); "
+            "rebuild it with `aegc image build`"
+        )
     name = f"{env}-py{rec.python_minor.replace('.', '')}" + (f"-{size}" if size else "")
     base: dict[str, Any] = {}
     if name in prev_pools:  # a redeploy keeps the options it isn't given (#30)
@@ -275,6 +312,8 @@ def _pool_spec(
         if "vcpu_min" not in opts and int(kw.get("vcpu_min", 2)) < cls.task_cpus:
             kw["vcpu_min"] = cls.task_cpus  # workers big enough for one task
             kw["vcpu_max"] = max(int(kw.get("vcpu_max", 8)), cls.task_cpus)
+        if cls.name == "whole" and "vcpu_min" not in opts:
+            kw["vcpu_min"] = kw["vcpu_max"] = int(kw.get("vcpu_max", 8))  # one worker size
     # A small max_vcpus with the default size range: keep workers within the pool's cap.
     if "vcpu_max" not in opts and "max_vcpus" in kw:
         default_max = deployment.PoolSpec.__dataclass_fields__["vcpu_max"].default
@@ -320,13 +359,44 @@ def _deploy(args: argparse.Namespace) -> int:
             raise SystemExit(
                 f"aegc: no image recorded for env {env!r}; run `aegc image build --env {env} ...`"
             ) from None
+        size = str(parsed.get("size_class", ""))
+        deployed = {
+            str(p.get("python_minor"))
+            for p in prev_pools.values()
+            if p.get("env") == env and str(p.get("size_class", "")) == size
+        }
         if want:
             if want not in records:
                 raise SystemExit(
                     f"aegc: no {env!r} image for Python {want}; have {', '.join(sorted(records))}"
                 )
             records = {want: records[want]}
-        # One pool per recorded Python minor: each client minor routes to its own.
+        elif deployed:
+            # A redeploy updates the minors already deployed; a new one is added with python=.
+            new = sorted(set(records) - deployed)
+            if new:
+                print(
+                    f"note: {env} also has images for Python {', '.join(new)}; add a pool with "
+                    f"--pool {env}:python={new[0]}",
+                    file=sys.stderr,
+                )
+            records = {m: r for m, r in records.items() if m in deployed}
+        else:
+            # A first deploy makes one pool per recorded minor, skipping pre-0.2 images.
+            old = sorted(m for m, r in records.items() if _version(r.aegc_version) < (0, 2))
+            if old and not args.allow_old_image and len(old) < len(records):
+                print(
+                    f"warning: skipping {env} Python {', '.join(old)}: built with aegc < 0.2 "
+                    f"(rebuild, or `aegc image forget --env {env} --python {old[0]}`)",
+                    file=sys.stderr,
+                )
+                records = {m: r for m, r in records.items() if m not in old}
+        if len(records) > 1:
+            print(
+                f"note: {env}: one pool per Python minor ({', '.join(sorted(records))}); the "
+                "options given apply to each (min_vcpus and max_vcpus too)",
+                file=sys.stderr,
+            )
         for _minor, rec in sorted(records.items(), reverse=True):
             pools.append(_pool_spec(args, env, rec, dict(parsed), prev_pools))
     named = {p.name for p in pools}
@@ -710,8 +780,8 @@ def build_parser() -> argparse.ArgumentParser:
     base.add_argument("--base-tag", help="immutable aarchsci/aarchbio tag, e.g. 2026.10.17.115051")
     base.add_argument(
         "--base", metavar="REF",
-        help="any linux/arm64 image with Python >= 3.11, pinned: repo@sha256:... or an "
-        "immutable tag (e.g. python:3.13.9-slim)",
+        help="any linux/arm64 image with Python >= 3.11, e.g. python:3.13-slim@sha256:...; "
+        "not latest or untagged. aegc builds from the image the tag points to now",
     )  # fmt: skip
     b.add_argument("--source", default="aarchsci", choices=["aarchsci", "aarchbio"])
     b.add_argument(
@@ -730,8 +800,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     r.add_argument("--env", required=True, help="the environment's name")
     r.add_argument("--image", required=True, help="linux/arm64 image, pinned (repo@sha256:...)")
-    r.add_argument("--python", default="python3", help="its Python (default python3)")
     r.set_defaults(func=_image_register)
+    fg = img.add_parser("forget", help="drop an environment's image for one Python minor")
+    fg.add_argument("--env", required=True)
+    fg.add_argument("--python", required=True, metavar="3.NN")
+    fg.set_defaults(func=_image_forget)
     ls = img.add_parser("list", help="an environment's recorded images, one per Python minor")
     ls.add_argument("--env", required=True)
     ls.set_defaults(func=_image_list)
