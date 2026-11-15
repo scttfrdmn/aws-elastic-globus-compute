@@ -166,6 +166,13 @@ def operator_policy(*, deployment: str, region: str, account: str, bucket: str) 
                 ],
                 "Resource": "*",
             },
+            {
+                # `aegc status` finds result queues by name prefix. ListQueues has no resource.
+                "Sid": "FindResultQueues",
+                "Effect": "Allow",
+                "Action": "sqs:ListQueues",
+                "Resource": "*",
+            },
         ],
     }
 
@@ -266,9 +273,49 @@ def deployer_policy(*, region: str, account: str) -> dict[str, Any]:
                     "ec2:DescribeLaunchTemplateVersions",
                     "ec2:DescribeImages",
                     "ec2:DescribeInstanceTypes",
-                    "ec2:RunInstances",
                 ],
                 "Resource": "*",
+            },
+            {
+                # CreateAutoScalingGroup checks that the caller could launch from the template.
+                # Allow that only for aegc's own templates...
+                "Sid": "RunFromAegcTemplates",
+                "Effect": "Allow",
+                "Action": "ec2:RunInstances",
+                "Resource": f"arn:aws:ec2:{r}:{a}:launch-template/*",
+                "Condition": managed_res,
+            },
+            {
+                # ...and for the other resources in the launch, only through a launch template.
+                "Sid": "RunOnlyViaTemplates",
+                "Effect": "Allow",
+                "Action": "ec2:RunInstances",
+                "Resource": [
+                    f"arn:aws:ec2:{r}:{a}:{kind}/*"
+                    for kind in (
+                        "instance",
+                        "volume",
+                        "network-interface",
+                        "subnet",
+                        "security-group",
+                    )
+                ]
+                + [f"arn:aws:ec2:{r}::image/*"],
+                "Condition": {
+                    "ArnLike": {"ec2:LaunchTemplate": f"arn:aws:ec2:{r}:{a}:launch-template/*"}
+                },
+            },
+            {
+                # A fresh account has no Auto Scaling or Spot service-linked role yet.
+                "Sid": "ServiceLinkedRoles",
+                "Effect": "Allow",
+                "Action": "iam:CreateServiceLinkedRole",
+                "Resource": f"arn:aws:iam::{a}:role/aws-service-role/*",
+                "Condition": {
+                    "StringEquals": {
+                        "iam:AWSServiceName": ["autoscaling.amazonaws.com", "spot.amazonaws.com"]
+                    }
+                },
             },
             {
                 "Sid": "AutoScalingCreateTagged",
@@ -417,7 +464,61 @@ def deployer_policy(*, region: str, account: str) -> dict[str, Any]:
     }
 
 
-POLICIES = {"worker", "operator", "deployer"}
+def builder_policy(*, region: str, account: str) -> dict[str, Any]:
+    """What ``aegc image build`` needs: pull a base through the ECR cache, push ``aegc/<env>``
+    images, and record them under ``/aegc/images/``."""
+    p, a, r = naming.PREFIX, account, region
+    repos = f"arn:aws:ecr:{r}:{a}:repository/{p}/*"
+    cache = f"arn:aws:ecr:{r}:{a}:repository/{naming.pull_through_prefix()}/*"
+    pull = ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer", "ecr:BatchCheckLayerAvailability"]
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {"Sid": "EcrAuth", "Effect": "Allow", "Action": "ecr:GetAuthorizationToken",
+             "Resource": "*"},
+            {
+                # The first pull of a base creates its cache repository and imports the image.
+                "Sid": "PullBaseThroughCache",
+                "Effect": "Allow",
+                "Action": [*pull, "ecr:BatchImportUpstreamImage", "ecr:CreateRepository"],
+                "Resource": cache,
+            },
+            {
+                "Sid": "WorkerImageRepos",
+                "Effect": "Allow",
+                "Action": [
+                    *pull,
+                    "ecr:CreateRepository",
+                    "ecr:TagResource",
+                    "ecr:PutLifecyclePolicy",
+                    "ecr:DescribeRepositories",
+                    "ecr:DescribeImages",
+                    "ecr:ListTagsForResource",
+                    "ecr:InitiateLayerUpload",
+                    "ecr:UploadLayerPart",
+                    "ecr:CompleteLayerUpload",
+                    "ecr:PutImage",
+                ],
+                "Resource": repos,
+            },
+            {
+                "Sid": "ImageRecords",
+                "Effect": "Allow",
+                "Action": [
+                    "ssm:GetParameter",
+                    "ssm:PutParameter",
+                    "ssm:AddTagsToResource",
+                    "ssm:ListTagsForResource",
+                ],
+                "Resource": f"arn:aws:ssm:{r}:{a}:parameter/{p}/images/*",
+            },
+            {"Sid": "Identity", "Effect": "Allow", "Action": "sts:GetCallerIdentity",
+             "Resource": "*"},
+        ],
+    }  # fmt: skip
+
+
+POLICIES = {"worker", "operator", "deployer", "builder"}
 
 
 def policy(kind: str, *, deployment: str, region: str, account: str) -> dict[str, Any]:
@@ -428,4 +529,6 @@ def policy(kind: str, *, deployment: str, region: str, account: str) -> dict[str
         return operator_policy(deployment=deployment, region=region, account=account, bucket=bucket)
     if kind == "deployer":
         return deployer_policy(region=region, account=account)
+    if kind == "builder":
+        return builder_policy(region=region, account=account)
     raise ValueError(f"unknown policy {kind!r}; choose from {sorted(POLICIES)}")

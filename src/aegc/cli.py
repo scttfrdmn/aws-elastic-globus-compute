@@ -243,9 +243,9 @@ def build_parser() -> argparse.ArgumentParser:
         "iam-policy",
         help="print an IAM policy document for one of aegc's roles",
         description="worker: on worker instances. operator: the endpoint's credentials. "
-        "deployer: aegc bootstrap/deploy/destroy.",
+        "deployer: aegc bootstrap/deploy/destroy/reap. builder: aegc image build.",
     )
-    p.add_argument("kind", choices=["worker", "operator", "deployer"])
+    p.add_argument("kind", choices=["worker", "operator", "deployer", "builder"])
     p.add_argument("--deployment", default="default", help="deployment name (worker, operator)")
     p.add_argument("--account", help="AWS account id (default: the caller's)")
     p.set_defaults(func=_iam_policy)
@@ -321,7 +321,13 @@ def main(argv: list[str] | None = None) -> int:
     if not getattr(args, "func", None):
         parser.print_help()
         return 0
-    return int(args.func(args))
+    from aegc.infra import OwnershipError
+    from aegc.naming import NameError_
+
+    try:
+        return int(args.func(args))
+    except (NameError_, OwnershipError) as e:
+        raise SystemExit(f"aegc: {e}") from None
 
 
 if __name__ == "__main__":

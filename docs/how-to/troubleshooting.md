@@ -115,9 +115,9 @@ failed` meanwhile.
 - **`... exists but isn't tagged as ...'s`:** a resource with aegc's name exists but wasn't created
   by aegc for this deployment (or region). aegc won't adopt or delete it. Rename your deployment or
   remove the other resource yourself.
-- **`deployment name ... must be 1-20 chars`** (or pool name): names are lowercase letters, digits
-  and hyphens, start with a letter, and don't end in or contain double hyphens. Pool names are
-  `<env>-py<NNN>`, so envs longer than 14 characters can't be deployed in v0.1.
+- **`deployment name ... must be 1-20 chars`** (or `pool name ... 1-40`): names are lowercase
+  letters, digits and hyphens, start with a letter, and don't end in or contain double hyphens.
+  Pool names are `<env>-py<NNN>`, so envs can be up to 34 characters.
 - **`no image recorded for env 'x'`:** run `aegc image build --env x ...` first.
 - **`no default VPC in this region`:** aegc needs the region's default VPC.
 - **`tasks are queued or running: ...; use force`:** wait, or `aegc destroy <d> --yes --force`.

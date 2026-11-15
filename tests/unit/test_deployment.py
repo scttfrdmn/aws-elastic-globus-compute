@@ -5,6 +5,7 @@ from typing import Any
 import pytest
 
 from aegc import naming
+from aegc.awsutil import paginate
 from aegc.infra import OwnershipError, Report, deployment
 from aegc.infra.deployment import Clients, DeploymentSpec, PoolSpec
 from tests.conftest import ACCOUNT, REGION
@@ -350,3 +351,30 @@ def test_destroy_refuses_with_queued_tasks(env: tuple[Clients, DeploymentSpec]) 
         c, deployment="dev", region=REGION, dry_run=False, force=True, wait_s=30, poll_s=0.1
     )
     assert group(c) is None
+
+
+def test_destroy_finds_groups_past_the_first_page(env: tuple[Clients, DeploymentSpec]) -> None:
+    # Auto Scaling returns 50 groups per page. 55 unrelated groups that sort before ours push the
+    # deployment's group onto the second page; destroy must still find it (#26).
+    c, spec = env
+    deployment.deploy(c, spec)
+    lt = c.ec2.create_launch_template(
+        LaunchTemplateName="a-other", LaunchTemplateData={"ImageId": "ami-12345678"}
+    )["LaunchTemplate"]["LaunchTemplateId"]
+    for i in range(55):
+        c.autoscaling.create_auto_scaling_group(
+            AutoScalingGroupName=f"a-other-{i:02d}",
+            LaunchTemplate={"LaunchTemplateId": lt},
+            MinSize=0,
+            MaxSize=0,
+            AvailabilityZones=[f"{REGION}a"],
+        )
+    first = c.autoscaling.describe_auto_scaling_groups()["AutoScalingGroups"]
+    assert ASG not in [g["AutoScalingGroupName"] for g in first]  # really on a later page
+    done = outcomes(
+        deployment.destroy(c, deployment="dev", region=REGION, dry_run=False, wait_s=30, poll_s=0.1)
+    )
+    assert done[("auto scaling group", ASG)] == "deleted"
+    assert group(c) is None
+    left = list(paginate(c.autoscaling, "describe_auto_scaling_groups", "AutoScalingGroups"))
+    assert len(left) == 55  # the unrelated groups are untouched

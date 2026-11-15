@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import Any
 
 import boto3
@@ -22,6 +23,21 @@ def session(profile: str | None = None, region: str | None = None) -> boto3.Sess
 
 def client(sess: boto3.Session, service: str) -> Any:
     return sess.client(service, config=CLIENT_CONFIG)  # type: ignore[call-overload]
+
+
+def paginate(
+    client: Any, operation: str, key: str, *, page_size: int | None = None, **kwargs: Any
+) -> Iterator[Any]:
+    """Every item under ``key`` across all pages of ``operation``.
+
+    Use it for any listing that decides what aegc owns or deletes: a single call returns only the
+    first page, and resources on later pages would be missed. Some APIs page only when asked
+    (SQS ListQueues returns at most 1,000 URLs and no token unless MaxResults is set), so pass
+    ``page_size`` for those.
+    """
+    config = {"PageSize": page_size} if page_size else {}
+    for page in client.get_paginator(operation).paginate(PaginationConfig=config, **kwargs):
+        yield from page.get(key, [])
 
 
 def account_id(sess: boto3.Session) -> str:

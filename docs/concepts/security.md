@@ -23,7 +23,7 @@ aegc uses three IAM identities. `aegc iam-policy` prints each policy; the docume
 
 The endpoint container mounts `~/.aws` read-only and uses `AWS_PROFILE` if it's set. For anything
 beyond a trial, give it a profile with only the operator policy rather than an administrator
-profile. `aegc image build` needs ECR push rights that the deployer policy doesn't include.
+profile. `aegc image build` uses the separate [builder policy](../reference/iam.md#builder).
 
 ## Task code runs with the worker role
 

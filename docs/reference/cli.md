@@ -135,7 +135,7 @@ Delete the deployment's result queues that are empty and haven't been modified f
 ## aegc iam-policy
 
 ```
-aegc iam-policy {worker,operator,deployer} [--deployment DEPLOYMENT] [--account ACCOUNT]
+aegc iam-policy {worker,operator,deployer,builder} [--deployment DEPLOYMENT] [--account ACCOUNT]
 ```
 
 Print an IAM policy document as JSON. See [IAM policies](iam.md).
@@ -144,7 +144,8 @@ Print an IAM policy document as JSON. See [IAM policies](iam.md).
 |---|---|---|
 | `worker` | | For worker instances |
 | `operator` | | For the endpoint's credentials |
-| `deployer` | | For `aegc bootstrap`, `deploy` and `destroy` |
+| `deployer` | | For `aegc bootstrap`, `deploy`, `destroy` and `reap` |
+| `builder` | | For `aegc image build` |
 | `--deployment` | `default` | Deployment the policy is scoped to (worker, operator) |
 | `--account` | the caller's | AWS account id |
 

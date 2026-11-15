@@ -1,6 +1,6 @@
 # IAM policies
 
-aegc uses three policies, printed by `aegc iam-policy {worker,operator,deployer}`. Each is scoped
+aegc uses four policies, printed by `aegc iam-policy {worker,operator,deployer,builder}`. Each is scoped
 to one account and region, and the worker and operator policies to one deployment. The documents
 below were generated with:
 
@@ -17,6 +17,7 @@ IAM Access Analyzer reports no findings for them.
 | [worker](#worker) | Created by `aegc deploy` as the inline policy `aegc-worker` on the role `aegc-<d>-worker-<region>` | `aegc-worker` on worker instances |
 | [operator](#operator) | The credentials the endpoint container runs with | `AWSEngine` |
 | [deployer](#deployer) | The credentials you run `aegc bootstrap`, `deploy`, `destroy`, `status` and `reap` with | The `aegc` CLI |
+| [builder](#builder) | The credentials you run `aegc image build` with | The `aegc` CLI |
 
 ## worker
 
@@ -200,13 +201,19 @@ Auto Scaling groups.
         "autoscaling:DescribeScalingActivities"
       ],
       "Resource": "*"
+    },
+    {
+      "Sid": "FindResultQueues",
+      "Effect": "Allow",
+      "Action": "sqs:ListQueues",
+      "Resource": "*"
     }
   ]
 }
 ```
 
-The operator policy doesn't include `sqs:ListQueues`, which `aegc status` uses to find result
-queues; run `status` with deployer credentials.
+`sqs:ListQueues` has no resource-level scoping; `aegc status` uses it to find the deployment's
+result queues by name prefix.
 
 ## deployer
 
@@ -315,10 +322,52 @@ limited to the `/aegc/` path, and roles can be passed only to EC2 and ECR.
         "ec2:DescribeLaunchTemplates",
         "ec2:DescribeLaunchTemplateVersions",
         "ec2:DescribeImages",
-        "ec2:DescribeInstanceTypes",
-        "ec2:RunInstances"
+        "ec2:DescribeInstanceTypes"
       ],
       "Resource": "*"
+    },
+    {
+      "Sid": "RunFromAegcTemplates",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": "arn:aws:ec2:us-west-2:123456789012:launch-template/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/aegc:managed": "true"
+        }
+      }
+    },
+    {
+      "Sid": "RunOnlyViaTemplates",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": [
+        "arn:aws:ec2:us-west-2:123456789012:instance/*",
+        "arn:aws:ec2:us-west-2:123456789012:volume/*",
+        "arn:aws:ec2:us-west-2:123456789012:network-interface/*",
+        "arn:aws:ec2:us-west-2:123456789012:subnet/*",
+        "arn:aws:ec2:us-west-2:123456789012:security-group/*",
+        "arn:aws:ec2:us-west-2::image/*"
+      ],
+      "Condition": {
+        "ArnLike": {
+          "ec2:LaunchTemplate": "arn:aws:ec2:us-west-2:123456789012:launch-template/*"
+        }
+      }
+    },
+    {
+      "Sid": "ServiceLinkedRoles",
+      "Effect": "Allow",
+      "Action": "iam:CreateServiceLinkedRole",
+      "Resource": "arn:aws:iam::123456789012:role/aws-service-role/*",
+      "Condition": {
+        "StringEquals": {
+          "iam:AWSServiceName": [
+            "autoscaling.amazonaws.com",
+            "spot.amazonaws.com"
+          ]
+        }
+      }
     },
     {
       "Sid": "AutoScalingCreateTagged",
@@ -483,18 +532,82 @@ limited to the `/aegc/` path, and roles can be passed only to EC2 and ECR.
 
 Notes:
 
-- `ec2:RunInstances` is allowed on all resources (in the `Ec2Read` statement): creating an Auto
-  Scaling group from a launch template checks that the caller may launch instances.
-- `aegc image build` isn't covered. From the calls it makes, it also needs
-  `ecr:GetAuthorizationToken`; `ecr:CreateRepository`, `ecr:TagResource`, `ecr:PutLifecyclePolicy`,
-  `ecr:DescribeImages` and the push actions (`ecr:InitiateLayerUpload`, `ecr:UploadLayerPart`,
-  `ecr:CompleteLayerUpload`, `ecr:BatchCheckLayerAvailability`, `ecr:PutImage`) on `aegc/*`; and
-  pull access to the `aegc-quay/*` cache repositories (`ecr:BatchGetImage`,
-  `ecr:GetDownloadUrlForLayer`, and `ecr:BatchImportUpstreamImage` for the first pull of a base).
-  This list hasn't been checked with the policy simulator.
-- If the account has never used Auto Scaling, creating the first group also creates its
-  service-linked role, which needs `iam:CreateServiceLinkedRole`; the deployer policy doesn't
-  include it.
+- `ec2:RunInstances` is needed because creating an Auto Scaling group from a launch template checks
+  that the caller could launch from it. It's allowed only on launch templates tagged
+  `aegc:managed=true`, and on the other resources of a launch only when it comes from a launch
+  template.
+- `iam:CreateServiceLinkedRole` is limited to the Auto Scaling and Spot service-linked roles, which a
+  fresh account doesn't have until its first group or Spot request.
+- Image builds need the separate [builder](#builder) policy.
+
+## builder
+
+What `aegc image build` needs: pull a base image through the `aegc-quay` pull-through cache (the
+first pull of a base creates its cache repository), create and push to `aegc/<env>` repositories,
+and record images under `/aegc/images/`. The cache repositories are read-only to it.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "EcrAuth",
+      "Effect": "Allow",
+      "Action": "ecr:GetAuthorizationToken",
+      "Resource": "*"
+    },
+    {
+      "Sid": "PullBaseThroughCache",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchGetImage",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:BatchImportUpstreamImage",
+        "ecr:CreateRepository"
+      ],
+      "Resource": "arn:aws:ecr:us-west-2:123456789012:repository/aegc-quay/*"
+    },
+    {
+      "Sid": "WorkerImageRepos",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchGetImage",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:CreateRepository",
+        "ecr:TagResource",
+        "ecr:PutLifecyclePolicy",
+        "ecr:DescribeRepositories",
+        "ecr:DescribeImages",
+        "ecr:ListTagsForResource",
+        "ecr:InitiateLayerUpload",
+        "ecr:UploadLayerPart",
+        "ecr:CompleteLayerUpload",
+        "ecr:PutImage"
+      ],
+      "Resource": "arn:aws:ecr:us-west-2:123456789012:repository/aegc/*"
+    },
+    {
+      "Sid": "ImageRecords",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParameter",
+        "ssm:PutParameter",
+        "ssm:AddTagsToResource",
+        "ssm:ListTagsForResource"
+      ],
+      "Resource": "arn:aws:ssm:us-west-2:123456789012:parameter/aegc/images/*"
+    },
+    {
+      "Sid": "Identity",
+      "Effect": "Allow",
+      "Action": "sts:GetCallerIdentity",
+      "Resource": "*"
+    }
+  ]
+}
+```
 
 ## ECR creation template role
 

@@ -90,6 +90,20 @@ All notable changes to this project are documented here. The format follows
   tags, and the live performance results (#16).
 
 ### Fixed
+- **Long env names deploy.** Pool names (`<env>-py<NNN>`) may be up to 40 characters, which the
+  SQS name limit allows, so envs up to 34 characters work, including `earth-observation`.
+  Deployment names stay at 20. Name and ownership errors print as one line (#24).
+- **IAM policies cover what the commands do** (#25):
+  - the operator policy allows `sqs:ListQueues`, for `aegc status`;
+  - a new `builder` policy (`aegc iam-policy builder`) covers `aegc image build`;
+  - the deployer's `ec2:RunInstances` is limited to aegc's launch templates and launches through a
+    template;
+  - `iam:CreateServiceLinkedRole` is allowed for Auto Scaling and Spot only;
+  - checked with the IAM policy simulator, and every policy fits the 6,144-character managed-policy
+    limit.
+- **Listings that decide ownership follow every page** (#26). `destroy` could miss a deployment's
+  Auto Scaling group behind 50 others, and similarly for launch templates, security groups, log
+  groups, subnets, role policies, and SQS queues past 1,000.
 - **Rebalance recommendations no longer strand instances.** Workers used to drain and exit on one,
   leaving an instance with no worker in the group until the watchdog removed it 14 minutes later.
   Spot rebalance recommendations can arrive seconds after launch. Workers now keep working:

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from aegc import naming
-from aegc.awsutil import is_not_found
+from aegc.awsutil import is_not_found, paginate
 from aegc.infra import Outcome, Report
 from aegc.infra.deployment import read_manifest
 
@@ -100,7 +100,7 @@ def status(
 
 def _result_queues(sqs: Any, deployment: str) -> list[str]:
     prefix = f"{naming.PREFIX}-{deployment}-res-"
-    urls = sqs.list_queues(QueueNamePrefix=prefix).get("QueueUrls", [])
+    urls = paginate(sqs, "list_queues", "QueueUrls", page_size=1000, QueueNamePrefix=prefix)
     return [
         u
         for u in urls

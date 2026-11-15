@@ -52,8 +52,8 @@ services'.
 | Limit | Value |
 |---|---|
 | Deployment name | 1–20 characters of `[a-z0-9-]`; starts with a letter; no trailing `-`, no `--` |
-| Pool name | the same rules; derived as `<env>-py<NNN>` |
-| Env name usable in a deployment | at most 14 characters, so the pool name fits in 20 |
+| Pool name | the same rules, up to 40 characters; derived as `<env>-py<NNN>` |
+| Env name usable in a deployment | at most 34 characters, so the pool name fits in 40 |
 | Pools per env per deployment | 1 |
 | Recorded images per env | 1 (one Python version) |
 | Images kept per ECR repository | the 10 most recent; untagged images expire after a day |

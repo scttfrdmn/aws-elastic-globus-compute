@@ -16,7 +16,7 @@ import time
 from typing import Any
 
 from aegc import __version__, naming
-from aegc.awsutil import error_code, is_not_found
+from aegc.awsutil import error_code, is_not_found, paginate
 from aegc.infra import Outcome, OwnershipError, Report
 
 PAYLOAD_EXPIRY_DAYS = 15
@@ -399,7 +399,7 @@ def _delete_template_role(iam: Any, region: str, report: Report, *, dry_run: boo
         report.add("iam role", name, "kept", "not tagged as aegc's")
         return
     if not dry_run:
-        for policy in iam.list_role_policies(RoleName=name)["PolicyNames"]:
+        for policy in list(paginate(iam, "list_role_policies", "PolicyNames", RoleName=name)):
             iam.delete_role_policy(RoleName=name, PolicyName=policy)
         iam.delete_role(RoleName=name)
     report.add("iam role", name, "would-delete" if dry_run else "deleted")

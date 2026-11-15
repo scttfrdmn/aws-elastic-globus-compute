@@ -17,7 +17,7 @@ It creates AWS resources that cost money while workers run. Workers terminate th
   wheel with `uv build`.
 - **AWS credentials** for an account and region with a default VPC. aegc places workers in the
   default VPC's default subnets. The examples use `us-west-2`. The credentials need the
-  [deployer policy](reference/iam.md#deployer) plus ECR push rights for image builds; an
+  [deployer](reference/iam.md#deployer) and [builder](reference/iam.md#builder) policies; an
   administrator profile also works. Check your Spot vCPU quota for standard instances
   (`max` workers × vCPUs per worker must fit).
 - **A Globus account**, for `aegc endpoint login`.

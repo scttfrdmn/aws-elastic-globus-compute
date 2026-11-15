@@ -24,7 +24,12 @@ TAG_ENDPOINT = "aegc:endpoint-id"
 #: Deployment value used for region-wide resources created by ``aegc bootstrap``.
 BOOTSTRAP = "_bootstrap"
 
-_NAME = re.compile(r"^[a-z][a-z0-9-]{0,19}$")
+#: Deployment names stay short: they appear in every resource name, including the IAM role.
+MAX_DEPLOYMENT = 20
+#: Pool names are ``<env>-py<NNN>``. The longest name built from one is the dead-letter queue,
+#: ``aegc-<deployment>-<pool>-dlq``, and SQS allows 80 characters.
+MAX_POOL = 40
+_NAME = re.compile(r"^[a-z][a-z0-9-]*$")
 IAM_PATH = "/aegc/"
 
 
@@ -33,10 +38,11 @@ class NameError_(ValueError):
 
 
 def validate_name(kind: str, value: str) -> str:
-    """Deployment and pool names: lowercase, start with a letter, up to 20 chars of [a-z0-9-]."""
-    if not _NAME.match(value) or value.endswith("-") or "--" in value:
+    """Deployment (up to 20 chars) and pool (up to 40) names: lowercase [a-z0-9-], from a letter."""
+    limit = MAX_POOL if kind == "pool" else MAX_DEPLOYMENT
+    if len(value) > limit or not _NAME.match(value) or value.endswith("-") or "--" in value:
         raise NameError_(
-            f"{kind} name {value!r} must be 1-20 chars of [a-z0-9-], start with a letter, "
+            f"{kind} name {value!r} must be 1-{limit} chars of [a-z0-9-], start with a letter, "
             "and not end with '-' or contain '--'"
         )
     return value

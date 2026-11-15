@@ -22,7 +22,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from aegc import __version__, naming
-from aegc.awsutil import error_code, is_not_found
+from aegc.awsutil import error_code, is_not_found, paginate
 from aegc.infra import Outcome, OwnershipError, Report, iam, userdata
 
 AMI_PARAMETER = "/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id"
@@ -150,12 +150,15 @@ def default_subnets(ec2: Any) -> tuple[str, list[str]]:
     if not vpcs:
         raise RuntimeError("no default VPC in this region; pass subnet ids explicitly")
     vpc = vpcs[0]["VpcId"]
-    subnets = ec2.describe_subnets(
+    subnets = paginate(
+        ec2,
+        "describe_subnets",
+        "Subnets",
         Filters=[
             {"Name": "vpc-id", "Values": [vpc]},
             {"Name": "default-for-az", "Values": ["true"]},
-        ]
-    )["Subnets"]
+        ],
+    )
     return vpc, sorted(s["SubnetId"] for s in subnets)
 
 
@@ -181,9 +184,14 @@ def ensure_security_group(
     c: Clients, spec: DeploymentSpec, vpc: str, report: Report, *, dry_run: bool
 ) -> str:
     d, name = spec.deployment, naming.security_group(spec.deployment)
-    by_name = c.ec2.describe_security_groups(
-        Filters=[{"Name": "group-name", "Values": [name]}, {"Name": "vpc-id", "Values": [vpc]}]
-    )["SecurityGroups"]
+    by_name = list(
+        paginate(
+            c.ec2,
+            "describe_security_groups",
+            "SecurityGroups",
+            Filters=[{"Name": "group-name", "Values": [name]}, {"Name": "vpc-id", "Values": [vpc]}],
+        )
+    )
     if by_name:
         owned = c.ec2.describe_security_groups(
             Filters=[
@@ -215,7 +223,7 @@ def ensure_security_group(
 
 def ensure_log_group(c: Clients, spec: DeploymentSpec, report: Report, *, dry_run: bool) -> None:
     d, name = spec.deployment, naming.log_group(spec.deployment)
-    groups = c.logs.describe_log_groups(logGroupNamePrefix=name)["logGroups"]
+    groups = paginate(c.logs, "describe_log_groups", "logGroups", logGroupNamePrefix=name)
     match = [g for g in groups if g["logGroupName"] == name]
     if match:
         arn = match[0]["arn"].removesuffix(":*")
@@ -700,7 +708,7 @@ def destroy(
     # Queues first, to check for in-flight work before deleting anything.
     queues = [
         u
-        for u in c.sqs.list_queues(QueueNamePrefix=prefix).get("QueueUrls", [])
+        for u in paginate(c.sqs, "list_queues", "QueueUrls", page_size=1000, QueueNamePrefix=prefix)
         if naming.is_owned(u.rsplit("/", 1)[-1], _queue_tags(c, u), d)
     ]
     if not force:
@@ -724,7 +732,7 @@ def destroy(
 
     groups = [
         g
-        for g in c.autoscaling.describe_auto_scaling_groups()["AutoScalingGroups"]
+        for g in paginate(c.autoscaling, "describe_auto_scaling_groups", "AutoScalingGroups")
         if g["AutoScalingGroupName"].startswith(prefix)
     ]
     for g in groups:
@@ -737,7 +745,11 @@ def destroy(
             _wait_gone(c, name, wait_s=wait_s, poll_s=poll_s)
         report.add("auto scaling group", name, verb)
 
-    for lt in c.ec2.describe_launch_templates(Filters=_owned_ec2_filters(d))["LaunchTemplates"]:
+    for lt in list(
+        paginate(
+            c.ec2, "describe_launch_templates", "LaunchTemplates", Filters=_owned_ec2_filters(d)
+        )
+    ):
         name = lt["LaunchTemplateName"]
         if not name.startswith(prefix):
             continue
@@ -746,9 +758,14 @@ def destroy(
         report.add("launch template", name, verb)
 
     sg_name = naming.security_group(d)
-    for g in c.ec2.describe_security_groups(
-        Filters=[{"Name": "group-name", "Values": [sg_name]}, *_owned_ec2_filters(d)]
-    )["SecurityGroups"]:
+    for g in list(
+        paginate(
+            c.ec2,
+            "describe_security_groups",
+            "SecurityGroups",
+            Filters=[{"Name": "group-name", "Values": [sg_name]}, *_owned_ec2_filters(d)],
+        )
+    ):
         if not dry_run:
             # Network interfaces of terminated instances can take a minute to go away.
             def delete_group(gid: str = g["GroupId"]) -> Any:
@@ -770,7 +787,9 @@ def destroy(
     _destroy_worker_role(c, d, region, report, dry_run=dry_run)
 
     log_name = naming.log_group(d)
-    for g in c.logs.describe_log_groups(logGroupNamePrefix=log_name)["logGroups"]:
+    for g in list(
+        paginate(c.logs, "describe_log_groups", "logGroups", logGroupNamePrefix=log_name)
+    ):
         if g["logGroupName"] != log_name:
             continue
         tags = c.logs.list_tags_for_resource(resourceArn=g["arn"].removesuffix(":*"))["tags"]
@@ -834,7 +853,7 @@ def _destroy_worker_role(c: Clients, d: str, region: str, report: Report, *, dry
         role_tags = naming.tag_dict(c.iam.list_role_tags(RoleName=name)["Tags"])
         if naming.is_owned(name, role_tags, d):
             if not dry_run:
-                for p in c.iam.list_role_policies(RoleName=name)["PolicyNames"]:
+                for p in list(paginate(c.iam, "list_role_policies", "PolicyNames", RoleName=name)):
                     c.iam.delete_role_policy(RoleName=name, PolicyName=p)
                 c.iam.delete_role(RoleName=name)
             report.add("iam role", name, verb)

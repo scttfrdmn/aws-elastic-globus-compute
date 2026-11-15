@@ -66,8 +66,8 @@ but isn't deleted until `aegc destroy`. Restart the endpoint after a redeploy.
 
 - **One image per env.** `/aegc/images/<env>` holds one record, so one Python version per env at a
   time. Building another overwrites the record.
-- **Env names of at most 14 characters.** The pool name `<env>-py<NNN>` must fit in 20 characters,
-  so `aegc deploy` rejects longer envs (for example `earth-observation`).
+- **Env names of at most 34 characters.** The pool name `<env>-py<NNN>` must fit in 40 characters.
+  Every aarchsci env fits; the longest, `earth-observation`, gives `earth-observation-py314`.
 - **Python must match the clients.** The aarchsci images run Python 3.14. Clients on another
   version can't use them.
 - **Old images expire.** The repository keeps the 10 most recent images. A deployment that still

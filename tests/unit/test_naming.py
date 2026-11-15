@@ -14,6 +14,16 @@ def test_invalid_names(bad: str) -> None:
         naming.validate_name("deployment", bad)
 
 
+def test_pool_names_fit_long_envs() -> None:
+    # aarchsci's longest env: "earth-observation-py314" is 23 characters (#24).
+    assert naming.validate_name("pool", "earth-observation-py314")
+    assert naming.validate_name("pool", "p" * naming.MAX_POOL)
+    with pytest.raises(naming.NameError_, match="1-40"):
+        naming.validate_name("pool", "p" * (naming.MAX_POOL + 1))
+    with pytest.raises(naming.NameError_, match="1-20"):
+        naming.validate_name("deployment", "earth-observation-py314")
+
+
 def test_tags_and_reserved_prefix() -> None:
     t = naming.tags("dev", "task-queue", pool="sci", extra={"cost-center": "42"})
     assert t[naming.TAG_MANAGED] == "true"
@@ -64,4 +74,8 @@ def test_names() -> None:
     assert naming.worker_role("dev", "us-west-2") == "aegc-dev-worker-us-west-2"
     assert naming.deployment_manifest_parameter("dev") == "/aegc/dev/manifest"
     # SQS queue names are limited to 80 characters.
-    assert len(naming.dead_letter_queue("x" * 20, "y" * 20)) <= 80
+    d, p = "x" * naming.MAX_DEPLOYMENT, "y" * naming.MAX_POOL
+    for name in (naming.task_queue(d, p), naming.dead_letter_queue(d, p)):
+        assert len(name) <= 80
+    assert len(naming.launch_template(d, p)) <= 128
+    assert len(naming.auto_scaling_group(d, p)) <= 255

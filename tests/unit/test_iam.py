@@ -89,6 +89,7 @@ def test_operator_policy(aws: Callable[[str], Any]) -> None:
         assert decide(c, arn, action, res) != "allowed", (action, res)
     assert decide(c, arn, "autoscaling:SetDesiredCapacity", "*", **tag("dev")) == "allowed"
     assert decide(c, arn, "autoscaling:SetDesiredCapacity", "*", **tag("prod")) != "allowed"
+    assert decide(c, arn, "sqs:ListQueues", "*") == "allowed"  # aegc status (#25)
 
 
 def test_deployer_policy(aws: Callable[[str], Any]) -> None:
@@ -110,11 +111,50 @@ def test_deployer_policy(aws: Callable[[str], Any]) -> None:
     assert decide(c, arn, "sqs:DeleteQueue", f"{SQS}:aegc-dev-sci-py314-tasks") == "allowed"
     assert decide(c, arn, "sqs:DeleteQueue", f"{SQS}:someone-elses") != "allowed"
 
+    # RunInstances (#25): aegc's launch templates only, and other resources only via a template.
+    ec2 = f"arn:aws:ec2:{REGION}:{ACCOUNT}"
+    lt = {"ec2:LaunchTemplate": f"{ec2}:launch-template/lt-0123456789abcdef0"}
+    assert decide(c, arn, "ec2:RunInstances", f"{ec2}:launch-template/lt-1", **managed) == "allowed"
+    assert decide(c, arn, "ec2:RunInstances", f"{ec2}:launch-template/lt-1") != "allowed"
+    assert decide(c, arn, "ec2:RunInstances", f"{ec2}:instance/*", **lt) == "allowed"
+    assert decide(c, arn, "ec2:RunInstances", f"{ec2}:instance/*") != "allowed"
+    slr = f"arn:aws:iam::{ACCOUNT}:role/aws-service-role/autoscaling.amazonaws.com/x"
+    for svc, want in [("autoscaling.amazonaws.com", True), ("lambda.amazonaws.com", False)]:
+        got = decide(c, arn, "iam:CreateServiceLinkedRole", slr, **{"iam:AWSServiceName": svc})
+        assert (got == "allowed") is want, svc
+
+
+def test_builder_policy(aws: Callable[[str], Any]) -> None:
+    c, arn = principal(aws, iam.builder_policy(region=REGION, account=ACCOUNT))
+    repo = f"arn:aws:ecr:{REGION}:{ACCOUNT}:repository/aegc/geospatial"
+    cache = f"arn:aws:ecr:{REGION}:{ACCOUNT}:repository/aegc-quay/aarchsci/geospatial"
+    for action, res in [
+        ("ecr:GetAuthorizationToken", "*"),
+        ("ecr:CreateRepository", repo),
+        ("ecr:PutImage", repo),
+        ("ecr:CompleteLayerUpload", repo),
+        ("ecr:PutLifecyclePolicy", repo),
+        ("ecr:BatchImportUpstreamImage", cache),
+        ("ecr:BatchGetImage", cache),
+        ("ssm:PutParameter", f"arn:aws:ssm:{REGION}:{ACCOUNT}:parameter/aegc/images/geospatial"),
+    ]:
+        assert decide(c, arn, action, res) == "allowed", (action, res)
+    for action, res in [
+        ("ecr:PutImage", f"arn:aws:ecr:{REGION}:{ACCOUNT}:repository/other"),
+        ("ecr:PutImage", cache),  # the cache is read-only for builders
+        ("ecr:DeleteRepository", repo),
+        ("ssm:PutParameter", f"arn:aws:ssm:{REGION}:{ACCOUNT}:parameter/aegc/dev/manifest"),
+    ]:
+        assert decide(c, arn, action, res) != "allowed", (action, res)
+
 
 def test_policy_dispatch() -> None:
     for kind in iam.POLICIES:
         doc = iam.policy(kind, deployment="dev", region=REGION, account=ACCOUNT)
         assert doc["Version"] == "2012-10-17"
         assert len(json.dumps(doc)) < 10_240, "inline role policies are limited to 10,240 chars"
+        # Customer managed policies: 6,144 characters, whitespace not counted.
+        big = iam.policy(kind, deployment="d" * 20, region="ap-southeast-4", account=ACCOUNT)
+        assert len(json.dumps(big, separators=(",", ":"))) < 6_144, kind
     with pytest.raises(ValueError):
         iam.policy("admin", deployment="dev", region=REGION, account=ACCOUNT)
