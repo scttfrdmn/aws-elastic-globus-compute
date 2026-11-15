@@ -6,7 +6,15 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 Outcome = Literal[
-    "created", "exists", "updated", "deleted", "would-create", "would-delete", "kept", "remaining"
+    "created",
+    "exists",
+    "updated",
+    "deleted",
+    "would-create",
+    "would-update",
+    "would-delete",
+    "kept",
+    "remaining",
 ]
 
 

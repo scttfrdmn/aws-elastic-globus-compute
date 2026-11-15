@@ -61,4 +61,4 @@ def test_bash_syntax(tmp_path: object) -> None:
     watchdog = script.split("<<'WATCH'\n", 1)[1].split("\nWATCH\n", 1)[0]
     subprocess.run(["bash", "-n"], input=watchdog.encode(), check=True)
     # It also enforces the instance lifetime (lifetime + max walltime + 15 min by default).
-    assert f'-gt {24 * 3600 + 41_400 + 900} ]' in watchdog
+    assert f"-gt {24 * 3600 + 41_400 + 900} ]" in watchdog

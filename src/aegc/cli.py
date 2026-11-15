@@ -123,7 +123,7 @@ def _clients(sess: object) -> object:
     from aegc import awsutil
     from aegc.infra.deployment import Clients
 
-    services = ("iam", "ec2", "autoscaling", "sqs", "logs", "ssm", "ecr")
+    services = ("iam", "ec2", "autoscaling", "sqs", "logs", "ssm", "ecr", "scheduler")
     return Clients(**{s: awsutil.client(sess, s) for s in services})  # type: ignore[arg-type]
 
 
@@ -173,9 +173,10 @@ def parse_pool(text: str) -> dict[str, Any]:
 
 
 def _deploy(args: argparse.Namespace) -> int:
+    import time
     from dataclasses import asdict
 
-    from aegc import awsutil, images, naming, state
+    from aegc import awsutil, images, lease, naming, state
     from aegc.awsutil import is_not_found
     from aegc.infra import deployment
 
@@ -231,6 +232,17 @@ def _deploy(args: argparse.Namespace) -> int:
         max_instance_hours_day=args.max_instance_hours_day,
         on_cap=args.on_cap,
     )
+    prev_lease = prev.get("lease") or {}
+    lease_s = (
+        lease.parse_duration(args.lease)
+        if args.lease is not None
+        else int(prev_lease.get("lease_s", lease.DEFAULT_LEASE_S))
+    )
+    if args.ttl is not None:
+        ttl = lease.parse_duration(args.ttl)
+        ttl_at = time.time() + ttl if ttl else 0.0
+    else:
+        ttl_at = float(prev_lease.get("ttl_at") or 0.0)
     spec = deployment.DeploymentSpec(
         deployment=args.deployment,
         account=account,
@@ -238,6 +250,8 @@ def _deploy(args: argparse.Namespace) -> int:
         bucket=naming.bucket_name(account, region),
         pools=tuple(pools),
         limits=limits.to_dict(),
+        lease_s=lease_s,
+        ttl_at=ttl_at,
     )
     errors = _quota_preflight(sess, [asdict(p) for p in pools])
     if errors and not args.dry_run:
@@ -307,6 +321,7 @@ def _resume(args: argparse.Namespace) -> int:
             ssm=awsutil.client(sess, "ssm"),  # type: ignore[arg-type]
             autoscaling=awsutil.client(sess, "autoscaling"),  # type: ignore[arg-type]
             deployment=args.deployment,
+            scheduler=awsutil.client(sess, "scheduler"),  # type: ignore[arg-type]
         )
     )
     return 0
@@ -512,6 +527,15 @@ def build_parser() -> argparse.ArgumentParser:
         "125). On a redeploy, options not given keep their last values.",
     )  # fmt: skip
     _limit_args(dp)
+    dp.add_argument(
+        "--lease", metavar="DURATION",
+        help="freeze the deployment if no endpoint renews it for this long (default 48h; "
+        "'none' disables); running endpoints renew hourly",
+    )  # fmt: skip
+    dp.add_argument(
+        "--ttl", metavar="DURATION",
+        help="freeze the deployment this long from now, renewed or not (e.g. 7d; 'none' clears)",
+    )  # fmt: skip
     dp.add_argument("--prune", action="store_true", help="remove pools not listed (dry run first)")
     dp.add_argument("--force", action="store_true", help="--prune even with tasks queued")
     dp.add_argument("--dry-run", action="store_true")

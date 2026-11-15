@@ -104,6 +104,8 @@ class DeploymentSpec:
     subnet_ids: tuple[str, ...] = ()  # default: the default VPC's default subnets
     extra_tags: dict[str, str] = field(default_factory=dict)
     limits: dict[str, Any] = field(default_factory=dict)  # aegc.state.Limits.to_dict()
+    lease_s: int = 48 * 3600  # freeze the deployment if no endpoint renews it (0: no lease)
+    ttl_at: float = 0.0  # hard expiry, UTC epoch seconds (0: none)
 
     def __post_init__(self) -> None:
         naming.validate_name("deployment", self.deployment)
@@ -120,6 +122,7 @@ class Clients:
     logs: Any
     ssm: Any
     ecr: Any = None  # optional: without it, deploy and destroy leave ECR in-use tags alone
+    scheduler: Any = None  # optional: without it, deploy and destroy leave the lease alone
 
 
 def _retry(fn: Callable[[], Any], *, codes: set[str], attempts: int, delay_s: float) -> Any:
@@ -646,6 +649,7 @@ def manifest(
             for p in spec.pools
         },
         "limits": dict(spec.limits),
+        "lease": {"lease_s": spec.lease_s, "ttl_at": spec.ttl_at},
     }
     body["generation"] = manifest_generation(body)
     return body
@@ -820,6 +824,23 @@ def deploy(c: Clients, spec: DeploymentSpec, *, dry_run: bool = False) -> Report
         dry_run=dry_run,
     )
     ensure_state(c, spec, report, dry_run=dry_run)
+    if c.scheduler is not None:
+        from aegc import lease
+
+        lease.ensure_lease(
+            scheduler=c.scheduler,
+            iam=c.iam,
+            spec=lease.LeaseSpec(
+                deployment=spec.deployment,
+                region=spec.region,
+                account=spec.account,
+                groups={n: str(p["auto_scaling_group"]) for n, p in pools.items()},
+                lease_s=spec.lease_s,
+                ttl_at=spec.ttl_at,
+            ),
+            report=report,
+            dry_run=dry_run,
+        )
     if inuse is not None:
         for env, keep in inuse.items():
             images.release(c.ecr, env, spec.deployment, keep, report=report)
@@ -986,6 +1007,13 @@ def destroy(
             c.sqs.delete_queue(QueueUrl=u)
         report.add("sqs queue", u.rsplit("/", 1)[-1], verb)
 
+    if c.scheduler is not None:
+        from aegc import lease
+
+        lease.destroy_lease(
+            scheduler=c.scheduler, iam=c.iam, deployment=d, region=region, report=report,
+            dry_run=dry_run,
+        )  # fmt: skip
     _destroy_worker_role(c, d, region, report, dry_run=dry_run)
 
     log_name = naming.log_group(d)
@@ -1146,6 +1174,21 @@ def verify_destroyed(
         for repo, tags in images.inuse_tags(c.ecr, d).items():
             for t in tags:
                 report.add("ecr image tag", f"{repo}:{t}", "remaining")
+    if c.scheduler is not None:
+        from aegc import lease
+
+        try:
+            c.scheduler.get_schedule_group(Name=lease.group_name(d))
+            report.add("schedule group", lease.group_name(d), "remaining")
+        except Exception as e:
+            if not is_not_found(e):
+                raise
+        try:
+            c.iam.get_role(RoleName=lease.role_name(d, region))
+            report.add("iam role", lease.role_name(d, region), "remaining")
+        except Exception as e:
+            if not is_not_found(e):
+                raise
     return report
 
 

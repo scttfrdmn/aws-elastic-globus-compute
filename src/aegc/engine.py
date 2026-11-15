@@ -33,7 +33,7 @@ from typing import Any
 from globus_compute_common.messagepack.message_types import EPStatusReport
 from globus_compute_endpoint.engines.base import GlobusComputeEngineBase
 
-from aegc import __version__, awsutil, naming, payloads, protocol
+from aegc import __version__, awsutil, lease, naming, payloads, protocol
 from aegc.gcresult import failed_result
 from aegc.pricing import IPV4_HOUR, Prices, volume_hour
 from aegc.protocol import Call, ProtocolError, ResultMessage, TaskMessage
@@ -151,6 +151,7 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         self._state_read = -math.inf
         self._manifest_read = -math.inf
         self._spend: SpendGuard | None = None
+        self._lease_renewed = -math.inf
         self.run_dir = ""
         self._clients: dict[str, Any] = {}
 
@@ -170,7 +171,7 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         try:
             sess = awsutil.session(self.aws_profile, self.region)
             self.region = self.region or (sess.region_name or "")
-            for svc in ("sqs", "s3", "ssm", "autoscaling", "ec2"):
+            for svc in ("sqs", "s3", "ssm", "autoscaling", "ec2", "scheduler"):
                 if svc not in self._clients:  # tests inject clients before start()
                     self._clients[svc] = awsutil.client(sess, svc)
             if "pricing" not in self._clients:  # the Price List API lives in us-east-1
@@ -577,6 +578,7 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
                     self._ensure_result_queue()  # daily keep-alive for `aegc reap`
                 self.refresh_manifest()
                 self.refresh_state()
+                self.renew_lease()
                 self.scale_once()
             except Exception as e:
                 self._snapshot.last_aws_error = str(e)
@@ -634,6 +636,25 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
             sorted(fresh.get("pools", {})),
         )
         self._manifest = fresh
+        return True
+
+    def renew_lease(self, now: float | None = None) -> bool:
+        """Push the deployment's lease forward (hourly) while this engine runs and it's running."""
+        now = time.time() if now is None else now
+        if self._manifest is None or not self._state.running:
+            return False
+        lease_s = int((self._manifest.get("lease") or {}).get("lease_s") or 0)
+        if not lease_s or now - self._lease_renewed < lease.RENEW_EVERY_S:
+            return False
+        try:
+            n = lease.renew(self._clients["scheduler"], self.deployment, lease_s, now=now)
+        except Exception as e:
+            log.warning("couldn't renew the deployment lease: %s", e)
+            return False
+        self._lease_renewed = now
+        log.info(
+            "renewed the lease of %s (%d schedule(s)) for %d h", self.deployment, n, lease_s // 3600
+        )
         return True
 
     # --- failing what this process owns -------------------------------------------------

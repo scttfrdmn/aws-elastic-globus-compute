@@ -79,8 +79,11 @@ def stop(
     return report
 
 
-def resume(*, ssm: Any, autoscaling: Any, deployment: str) -> ControlReport:
-    """Back to running: clear the state and restore each group's minimum from the manifest."""
+def resume(
+    *, ssm: Any, autoscaling: Any, deployment: str, scheduler: Any | None = None
+) -> ControlReport:
+    """Back to running: clear the state, restore each group's minimum from the manifest, and
+    (given a scheduler client) push the lease forward."""
     report = ControlReport()
     m = read_manifest(ssm, deployment)
     before = read_state(ssm, deployment)
@@ -92,6 +95,12 @@ def resume(*, ssm: Any, autoscaling: Any, deployment: str) -> ControlReport:
             AutoScalingGroupName=pool["auto_scaling_group"], MinSize=minimum
         )
         report.add(f"  pool {name}: minimum {minimum} {unit}")
+    lease_s = int((m.get("lease") or {}).get("lease_s") or 0)
+    if scheduler is not None and lease_s:
+        from aegc import lease
+
+        n = lease.renew(scheduler, deployment, lease_s)
+        report.add(f"  lease: {n} schedule(s) pushed {lease_s // 3600} h ahead")
     return report
 
 

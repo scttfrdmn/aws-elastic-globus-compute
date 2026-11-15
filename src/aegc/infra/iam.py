@@ -239,6 +239,29 @@ def operator_policy(*, deployment: str, region: str, account: str, bucket: str) 
                 },
             },
             {
+                # Renew the deployment lease (EventBridge Scheduler) hourly.
+                "Sid": "RenewLease",
+                "Effect": "Allow",
+                "Action": ["scheduler:GetSchedule", "scheduler:UpdateSchedule"],
+                "Resource": f"arn:aws:scheduler:{region}:{account}:schedule/{naming.PREFIX}-{d}/*",
+            },
+            {
+                "Sid": "ListLease",
+                "Effect": "Allow",
+                "Action": "scheduler:ListSchedules",
+                "Resource": "*",
+            },
+            {
+                "Sid": "PassLeaseRole",
+                "Effect": "Allow",
+                "Action": "iam:PassRole",
+                "Resource": (
+                    f"arn:aws:iam::{account}:role{naming.IAM_PATH}"
+                    f"{naming.PREFIX}-{d}-scheduler-{region}"
+                ),
+                "Condition": {"StringEquals": {"iam:PassedToService": "scheduler.amazonaws.com"}},
+            },
+            {
                 # `aegc status` finds result queues by name prefix. ListQueues has no resource.
                 "Sid": "FindResultQueues",
                 "Effect": "Allow",
@@ -267,7 +290,10 @@ def deployer_policy(*, region: str, account: str) -> dict[str, Any]:
     keep = [st for st in doc["Statement"] if st["Sid"] not in BOOTSTRAP_ONLY]
     for st in keep:
         if st["Sid"] == "PassAegcRoles":
-            st["Condition"]["StringEquals"]["iam:PassedToService"] = ["ec2.amazonaws.com"]
+            st["Condition"]["StringEquals"]["iam:PassedToService"] = [
+                "ec2.amazonaws.com",
+                "scheduler.amazonaws.com",
+            ]
         if st["Sid"] == "Ec2Read":
             st["Action"] = [
                 *st["Action"],
@@ -281,6 +307,32 @@ def deployer_policy(*, region: str, account: str) -> dict[str, Any]:
             "Effect": "Allow",
             "Action": ["ecr:DescribeRepositories", "ecr:ListTagsForResource"],
             "Resource": f"arn:aws:ecr:{r}:{a}:repository/{naming.PREFIX}/*",
+        },
+        {
+            # The deployment lease: a tagged schedule group aegc-<d> and its schedules.
+            "Sid": "LeaseSchedules",
+            "Effect": "Allow",
+            "Action": [
+                "scheduler:CreateScheduleGroup",
+                "scheduler:GetScheduleGroup",
+                "scheduler:DeleteScheduleGroup",
+                "scheduler:CreateSchedule",
+                "scheduler:GetSchedule",
+                "scheduler:UpdateSchedule",
+                "scheduler:DeleteSchedule",
+                "scheduler:TagResource",
+                "scheduler:ListTagsForResource",
+            ],
+            "Resource": [
+                f"arn:aws:scheduler:{r}:{a}:schedule-group/{naming.PREFIX}-*",
+                f"arn:aws:scheduler:{r}:{a}:schedule/{naming.PREFIX}-*/*",
+            ],
+        },
+        {
+            "Sid": "ListSchedules",
+            "Effect": "Allow",
+            "Action": "scheduler:ListSchedules",
+            "Resource": "*",
         },
         {
             # aegc footprint (report only).

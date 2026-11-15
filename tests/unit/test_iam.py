@@ -122,6 +122,16 @@ def test_operator_policy(aws: Callable[[str], Any]) -> None:
     assert decide(c, arn, "sqs:ReceiveMessage", f"{SQS}:aegc-prod-geo-py314-tasks") != "allowed"
     assert decide(c, arn, "autoscaling:UpdateAutoScalingGroup", "*", **tag("dev")) == "allowed"
     assert decide(c, arn, "autoscaling:UpdateAutoScalingGroup", "*", **tag("prod")) != "allowed"
+    sched = f"arn:aws:scheduler:{REGION}:{ACCOUNT}:schedule"
+    assert decide(c, arn, "scheduler:UpdateSchedule", f"{sched}/aegc-dev/lease-state") == "allowed"
+    assert decide(c, arn, "scheduler:UpdateSchedule", f"{sched}/aegc-prod/lease-state") != "allowed"
+    assert decide(c, arn, "scheduler:DeleteSchedule", f"{sched}/aegc-dev/lease-state") != "allowed"
+    lease_role = f"arn:aws:iam::{ACCOUNT}:role/aegc/aegc-dev-scheduler-{REGION}"
+    passed = {"iam:PassedToService": "scheduler.amazonaws.com"}
+    assert decide(c, arn, "iam:PassRole", lease_role, **passed) == "allowed"
+    assert (
+        decide(c, arn, "iam:PassRole", lease_role.replace("-dev-", "-prod-"), **passed) != "allowed"
+    )
 
 
 def test_deployer_policy(aws: Callable[[str], Any]) -> None:
@@ -225,3 +235,9 @@ def test_bootstrap_and_deployer_split(aws: Callable[[str], Any]) -> None:
     assert decide(c, boot, "s3:CreateBucket", bucket) != "allowed"
     assert decide(c, boot, "tag:GetResources", "*") == "allowed"  # aegc footprint
     assert decide(c, boot, "ec2:DescribeNetworkInterfaces", "*") == "allowed"  # destroy --verify
+    group = f"arn:aws:scheduler:{REGION}:{ACCOUNT}:schedule-group/aegc-dev"
+    assert decide(c, boot, "scheduler:CreateScheduleGroup", group) == "allowed"
+    assert (
+        decide(c, boot, "scheduler:CreateScheduleGroup", group.replace("aegc-dev", "x"))
+        != "allowed"
+    )
