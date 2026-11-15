@@ -49,7 +49,7 @@ class PoolSpec:
     min_vcpus: int = 0
     max_vcpus: int = 8
     vcpu_min: int = 2
-    vcpu_max: int = 16
+    vcpu_max: int = 8  # <= max_vcpus: the largest worker Auto Scaling may pick
     memory_mib_min: int = 4096
     spot: bool = True
     slots: str = "auto"
@@ -65,6 +65,14 @@ class PoolSpec:
         naming.validate_name("pool", self.name)
         if not 0 <= self.min_vcpus <= self.max_vcpus:
             raise ValueError("need 0 <= min_vcpus <= max_vcpus")
+        if not 3600 <= self.max_lifetime_s <= 72 * 3600:
+            raise ValueError("lifetime= must be 3600-259200 s (1-72 h)")
+        if self.max_vcpus and self.vcpu_max > self.max_vcpus:
+            raise ValueError(
+                f"vcpu={self.vcpu_min}-{self.vcpu_max} allows workers larger than "
+                f"max_vcpus={self.max_vcpus}; Auto Scaling may launch one that size, so lower "
+                "the upper vcpu bound or raise max_vcpus"
+            )
         if self.max_vcpus and self.max_vcpus < self.vcpu_min:
             raise ValueError(
                 f"max_vcpus={self.max_vcpus} is smaller than one worker (vcpu={self.vcpu_min}-...)"
@@ -89,7 +97,8 @@ class PoolSpec:
         if "allowed_instance_types" in kw:
             kw["allowed_instance_types"] = tuple(kw["allowed_instance_types"])
         if "max_vcpus" not in entry and "max_workers" in entry:  # a v0.1 manifest
-            kw["max_vcpus"] = int(entry["max_workers"]) * int(entry.get("vcpu_min", 2))
+            # The same bound v0.1 had: that many workers, each up to the largest size.
+            kw["max_vcpus"] = int(entry["max_workers"]) * int(entry.get("vcpu_max", 16))
             kw["min_vcpus"] = int(entry.get("min_workers", 0)) * int(entry.get("vcpu_min", 2))
         return cls(**kw)
 
@@ -526,11 +535,18 @@ def ensure_launch_template(
 
 
 def _asg_request(
-    spec: DeploymentSpec, pool: PoolSpec, *, lt_name: str, subnets: list[str]
+    spec: DeploymentSpec,
+    pool: PoolSpec,
+    *,
+    lt_name: str,
+    subnets: list[str],
+    halted: bool = False,
 ) -> dict[str, Any]:
     d = spec.deployment
     return {
-        "MinSize": pool.min_vcpus,
+        # A stopped, capped or expired deployment keeps minimum 0 (resume restores it), or a
+        # redeploy would launch workers that can't take tasks and can't leave.
+        "MinSize": 0 if halted else pool.min_vcpus,
         "MaxSize": pool.max_vcpus,
         "DesiredCapacityType": "vcpu",
         "VPCZoneIdentifier": ",".join(subnets),
@@ -574,9 +590,10 @@ def ensure_auto_scaling_group(
     subnets: list[str],
     report: Report,
     dry_run: bool,
+    halted: bool = False,
 ) -> str:
     d, name = spec.deployment, naming.auto_scaling_group(spec.deployment, pool.name)
-    req = _asg_request(spec, pool, lt_name=lt_name, subnets=subnets)
+    req = _asg_request(spec, pool, lt_name=lt_name, subnets=subnets, halted=halted)
     tags = req.pop("_tags")
     groups = c.autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[name])[
         "AutoScalingGroups"
@@ -598,7 +615,7 @@ def ensure_auto_scaling_group(
             return name
         c.autoscaling.create_auto_scaling_group(
             AutoScalingGroupName=name,
-            DesiredCapacity=pool.min_vcpus,
+            DesiredCapacity=req["MinSize"],
             Tags=asg_tags,
             **req,
         )
@@ -704,6 +721,25 @@ def update_manifest(ssm: Any, deployment: str, body: dict[str, Any]) -> None:
     )
 
 
+def pool_tasks(c: Clients, entry: dict[str, Any]) -> int:
+    """Queued plus running tasks in a pool's task queue (0 if it's gone)."""
+    url = str(entry.get("task_queue_url", ""))
+    if not url:
+        return 0
+    try:
+        a = c.sqs.get_queue_attributes(
+            QueueUrl=url,
+            AttributeNames=["ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible"],
+        )["Attributes"]
+    except Exception as e:
+        if is_not_found(e):
+            return 0
+        raise
+    return int(a.get("ApproximateNumberOfMessages", 0)) + int(
+        a.get("ApproximateNumberOfMessagesNotVisible", 0)
+    )
+
+
 def prune_pool(
     c: Clients,
     deployment: str,
@@ -722,17 +758,8 @@ def prune_pool(
     """
     d = deployment
     verb: Outcome = "would-delete" if dry_run else "deleted"
-    url = str(entry.get("task_queue_url", ""))
-    if url and not force:
-        a = c.sqs.get_queue_attributes(
-            QueueUrl=url,
-            AttributeNames=["ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible"],
-        )["Attributes"]
-        n = int(a.get("ApproximateNumberOfMessages", 0)) + int(
-            a.get("ApproximateNumberOfMessagesNotVisible", 0)
-        )
-        if n:
-            raise RuntimeError(f"pool {name} has {n} queued or running task(s); use --force")
+    if not force and (n := pool_tasks(c, entry)):
+        raise RuntimeError(f"pool {name} has {n} queued or running task(s); use --force")
     group = str(entry.get("auto_scaling_group", ""))
     found = (
         c.autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[group])[
@@ -780,7 +807,17 @@ def read_manifest(ssm: Any, deployment: str) -> dict[str, Any]:
 
 def deploy(c: Clients, spec: DeploymentSpec, *, dry_run: bool = False) -> Report:
     """Create or reconcile a deployment and its pools. Safe to run repeatedly."""
+    from aegc import state
+
     report = Report()
+    halted = not state.read_state(c.ssm, spec.deployment).running
+    if halted:
+        report.add(
+            "ssm parameter",
+            naming.state_parameter(spec.deployment),
+            "kept",
+            "not running: group minimums stay 0 until `aegc resume`",
+        )
     inuse = _protect_images(c, spec, report, dry_run=dry_run)
     profile_arn = ensure_worker_role(c, spec, report, dry_run=dry_run)
     vpc, subnets = resolve_network(c.ec2, spec)
@@ -800,8 +837,9 @@ def deploy(c: Clients, spec: DeploymentSpec, *, dry_run: bool = False) -> Report
         # A new instance profile takes a few seconds to become usable by Auto Scaling.
         def make_group(pool: PoolSpec = pool, lt: str = lt) -> str:
             return ensure_auto_scaling_group(
-                c, spec, pool, lt_name=lt, subnets=subnets, report=report, dry_run=dry_run
-            )
+                c, spec, pool, lt_name=lt, subnets=subnets, report=report, dry_run=dry_run,
+                halted=halted,
+            )  # fmt: skip
 
         asg = _retry(
             make_group,

@@ -119,7 +119,7 @@ def test_pool_from_a_v01_manifest() -> None:
         {"env": "sci", "python_minor": "3.14", "image": POOL.image, "max_workers": 3,
          "min_workers": 1, "vcpu_min": 4, "vcpu_max": 16, "task_queue_url": "ignored"},
     )  # fmt: skip
-    assert (p.max_vcpus, p.min_vcpus) == (12, 4)
+    assert (p.max_vcpus, p.min_vcpus) == (48, 4)  # 3 workers of up to 16; 1 of at least 4
     again = PoolSpec.from_manifest("sci-py314", {**asdict(p)})
     assert again == p
 

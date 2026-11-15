@@ -99,7 +99,8 @@ class Agent:
         self._ctx = self.ctx or runner.context()
         self._scratch = Path(self.config.scratch)
         self._halt: State | None = None  # set when the deployment state isn't running
-        self._started_at = time.time()
+        self._state_checked = -1e18
+        self._started_at = _boot_time()
         self._started_mono = time.monotonic()
         self._busy_slot_s = 0.0
         self._ledger_written = 0.0
@@ -117,6 +118,8 @@ class Agent:
             threads.append(
                 threading.Thread(target=self._state_loop, name="aegc-state", daemon=True)
             )
+        if self.ssm is not None and self.config.state_parameter:
+            self.check_state()  # before the first claim: a new worker mustn't run into a halt
         for t in threads:
             t.start()
         self.write_ledger()
@@ -138,7 +141,7 @@ class Agent:
                         break
                     continue
                 if self._lifetime_over():
-                    if not self._busy() and self._leave_group():
+                    if not self._busy() and self._leave_group(replace_at_minimum=True):
                         self._drain("lifetime")
                     self._stop.wait(0.2)
                     cycles += 1
@@ -464,6 +467,7 @@ class Agent:
     def check_state(self) -> State | None:
         """Read the deployment state; on a non-running state, halt. Returns the halt state."""
         assert self.ssm is not None
+        self._state_checked = time.monotonic()
         try:
             st = read_state(self.ssm, self.config.deployment)
         except Exception as e:
@@ -508,6 +512,10 @@ class Agent:
 
     def fail_queued_once(self, st: State) -> int:
         """Receive queued tasks and fail each with a clear result. Returns how many."""
+        # Re-read before refusing anything: a resume shouldn't cost freshly queued tasks.
+        stale = self.ssm is not None and time.monotonic() - self._state_checked > 15
+        if stale and self.check_state() is None:
+            return 0
         resp = self.sqs.receive_message(
             QueueUrl=self.config.task_queue_url,
             MaxNumberOfMessages=10,
@@ -581,18 +589,33 @@ class Agent:
         self._drain_reason = self._drain_reason or reason
         self._draining.set()
 
-    def _leave_group(self) -> bool:
-        """Terminate this instance through Auto Scaling, decrementing desired capacity."""
+    def _leave_group(self, *, replace_at_minimum: bool = False) -> bool:
+        """Terminate this instance through Auto Scaling, decrementing desired capacity.
+
+        At the group's minimum the decrement is refused. An idle worker then stays up; one past
+        its lifetime (``replace_at_minimum``) is terminated without the decrement, so the group
+        replaces it with a fresh instance.
+        """
         if self.autoscaling is None or not self.config.instance_id:
             return True  # not on an Auto Scaling instance (local runs, tests)
         try:
             self.autoscaling.terminate_instance_in_auto_scaling_group(
                 InstanceId=self.config.instance_id, ShouldDecrementDesiredCapacity=True
             )
-            log.info("idle for %d s; leaving the group", self.config.idle_timeout_s)
+            log.info("leaving the group")
             return True
         except Exception as e:
             if error_code(e) == "ValidationError":
+                if replace_at_minimum:
+                    try:
+                        self.autoscaling.terminate_instance_in_auto_scaling_group(
+                            InstanceId=self.config.instance_id,
+                            ShouldDecrementDesiredCapacity=False,
+                        )
+                        log.info("at the group's minimum: terminating for a replacement")
+                        return True
+                    except Exception as e2:
+                        log.warning("couldn't terminate for a replacement: %s", e2)
                 # At the group's minimum size: stay up, and wait another idle period.
                 self._touch()
                 return False
@@ -624,3 +647,13 @@ class Agent:
             "availability_zone": self.config.availability_zone,
             "lifecycle": self.config.lifecycle,
         }
+
+
+def _boot_time() -> float:
+    """When this machine booted (so the cost ledger includes boot and image pull); now, if
+    unknown."""
+    try:
+        with open("/proc/uptime") as f:
+            return time.time() - float(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return time.time()

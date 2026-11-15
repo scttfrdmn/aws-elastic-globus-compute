@@ -441,7 +441,12 @@ def footprint(
 
     for u in paginate(sqs, "list_queues", "QueueUrls", page_size=1000, QueueNamePrefix=prefix):
         name = u.rsplit("/", 1)[-1]
-        tags = dict(sqs.list_queue_tags(QueueUrl=u).get("Tags", {}))
+        try:
+            tags = dict(sqs.list_queue_tags(QueueUrl=u).get("Tags", {}))
+        except Exception as e:  # listed but already deleted (ListQueues lags)
+            if is_not_found(e):
+                continue
+            raise
         out.add("sqs queue", name, name, owned=naming.is_owned(name, tags, d), found_by="name")
 
     for g in paginate(autoscaling, "describe_auto_scaling_groups", "AutoScalingGroups"):

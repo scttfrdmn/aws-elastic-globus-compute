@@ -42,7 +42,11 @@ def test_live_deploy_idempotent_destroy_leaves_nothing() -> None:
         account=account,
         region=region,
         bucket=naming.bucket_name(account, region),
-        pools=(PoolSpec(name="ci-py314", env="ci", python_minor="3.14", image=image, max_vcpus=2),),
+        pools=(
+            PoolSpec(
+                name="ci-py314", env="ci", python_minor="3.14", image=image, max_vcpus=2, vcpu_max=2
+            ),
+        ),
     )
     try:
         first = deployment.deploy(c, spec)

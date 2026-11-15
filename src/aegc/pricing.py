@@ -24,6 +24,8 @@ GP3_GB_MONTH = 0.08
 GP3_MIBPS_MONTH = 0.04  # per MiB/s above the included 125
 GP3_INCLUDED_MIBPS = 125
 IPV4_HOUR = 0.005
+RUNNING_SLACK_S = 1200
+FAILED_LOOKUP_TTL_S = 3600  # retry a failed price lookup at most hourly
 
 #: On-demand $/h, us-west-2, read 2026-11-14 (Price List API). Fallback only.
 STATIC_ON_DEMAND = {
@@ -120,8 +122,10 @@ class Prices:
     def on_demand(self, instance_type: str) -> tuple[float, str]:
         with self._lock:
             hit = self._od.get(instance_type)
-        if hit and self.clock() - hit[0] < self.on_demand_ttl_s and hit[1] is not None:
+        if hit and hit[1] is not None and self.clock() - hit[0] < self.on_demand_ttl_s:
             return hit[1], "on-demand"
+        if hit and hit[1] is None and self.clock() - hit[0] < FAILED_LOOKUP_TTL_S:
+            return scale_static(instance_type), "static"
         price = self._fetch_on_demand(instance_type)
         with self._lock:
             self._od[instance_type] = (self.clock(), price)
@@ -232,7 +236,8 @@ def accrue(records: Iterable[dict[str, Any]], start: float, end: float, prices: 
     for r in records:
         lo = max(start, float(r.get("launched_at", 0)))
         last = float(r.get("last_seen", lo))
-        running = not r.get("exit_reason") and end - last < 600
+        # Records are written every 5 min and read up to 5 min late: 20 min of slack.
+        running = not r.get("exit_reason") and end - last < RUNNING_SLACK_S
         hi = min(end, end if running else last)
         if hi <= lo:
             continue

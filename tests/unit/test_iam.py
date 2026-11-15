@@ -98,6 +98,9 @@ def test_operator_policy(aws: Callable[[str], Any]) -> None:
     # v0.2 spend safety: cap state, ledger, prices, own-task purge, minimum to 0.
     state_param = f"arn:aws:ssm:{REGION}:{ACCOUNT}:parameter/aegc/dev/state"
     assert decide(c, arn, "ssm:PutParameter", state_param) == "allowed"
+    # write_state's ownership check and create-with-tags (review finding #2):
+    assert decide(c, arn, "ssm:ListTagsForResource", state_param) == "allowed"
+    assert decide(c, arn, "ssm:AddTagsToResource", state_param) == "allowed"
     assert (
         decide(
             c,

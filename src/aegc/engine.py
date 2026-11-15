@@ -50,6 +50,8 @@ STALL_PAUSE_S = 10 * 60
 #: Re-read the deployment state and manifest this often (scaler thread).
 STATE_TTL_S = 30.0
 MANIFEST_TTL_S = 60.0
+#: Tasks waiting this long with no workers because the spend limits admit none are failed.
+BLOCKED_FAIL_S = 600.0
 
 
 class WorkerSystemFailure(RuntimeError):
@@ -147,6 +149,8 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         self._stalled_since: dict[str, float] = {}
         self._paused_until: dict[str, float] = {}
         self._starved_since: dict[str, float] = {}
+        self._blocked_since: dict[str, float] = {}
+        self._local_cap: State | None = None  # a cap this engine couldn't write to SSM
         self._state = State()
         self._state_read = -math.inf
         self._manifest_read = -math.inf
@@ -600,6 +604,10 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
             log.warning("couldn't read the deployment state: %s", e)
             return self._state
         self._state_read = now
+        lc = self._local_cap
+        if st.running and lc is not None and (not lc.until or now < lc.until):
+            return self._state  # keep the cap we couldn't share rather than flip-flop
+        self._local_cap = None
         self._set_state(st)
         return st
 
@@ -608,10 +616,27 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         if st.running:
             if not before.running:
                 log.info("deployment %s is running again", self.deployment)
+                if before.mode == "capped" and st.by == "reset":
+                    self._restore_minimums()
             return
         if before.running or before.mode != st.mode or (st.kill and not before.kill):
             log.warning("deployment %s is %s: %s", self.deployment, st.mode, st.reason)
             self.fail_owned(st.failure_code, st.explain(self.deployment), include_started=st.kill)
+
+    def _restore_minimums(self) -> None:
+        """After a cap's period ends, put back the minimums the trip lowered to 0."""
+        if self._manifest is None:
+            return
+        for name, pool in self._manifest.get("pools", {}).items():
+            minimum = int(pool.get("min_vcpus" if _vcpu_mode(pool) else "min_workers", 0))
+            if not minimum:
+                continue
+            try:
+                self._clients["autoscaling"].update_auto_scaling_group(
+                    AutoScalingGroupName=pool["auto_scaling_group"], MinSize=minimum
+                )
+            except Exception as e:
+                log.warning("pool %s: couldn't restore the minimum: %s", name, e)
 
     def refresh_manifest(self, now: float | None = None) -> bool:
         """Reload the manifest if a redeploy changed it (at most every MANIFEST_TTL_S)."""
@@ -639,12 +664,13 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         return True
 
     def renew_lease(self, now: float | None = None) -> bool:
-        """Push the deployment's lease forward (hourly) while this engine runs and it's running."""
+        """Push the deployment's lease forward while this engine runs (running or capped: a cap
+        ends by itself at the end of its period, so the deployment must not expire meanwhile)."""
         now = time.time() if now is None else now
-        if self._manifest is None or not self._state.running:
+        if self._manifest is None or self._state.mode not in ("running", "capped"):
             return False
         lease_s = int((self._manifest.get("lease") or {}).get("lease_s") or 0)
-        if not lease_s or now - self._lease_renewed < lease.RENEW_EVERY_S:
+        if not lease_s or now - self._lease_renewed < lease.renew_interval(lease_s):
             return False
         try:
             n = lease.renew(self._clients["scheduler"], self.deployment, lease_s, now=now)
@@ -684,39 +710,46 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         return len(doomed)
 
     def _purge(self, pool_name: str, uuids: set[str]) -> None:
-        """Delete this process's messages for ``uuids`` from a pool's task queue; leave others."""
+        """Delete this process's messages for ``uuids`` from a pool's task queue; leave others.
+
+        One sweep: other messages stay invisible until the sweep ends and are then released
+        together, so each is received at most once (every receive counts toward the DLQ).
+        """
         if self._manifest is None or pool_name not in self._manifest.get("pools", {}):
             return
         sqs, url = self._clients["sqs"], self._pool(pool_name)["task_queue_url"]
         remaining = set(uuids)
-        for _ in range(20):
-            if not remaining:
-                break
-            try:
+        foreign: list[str] = []
+        try:
+            for _ in range(20):
+                if not remaining:
+                    break
                 msgs = sqs.receive_message(
-                    QueueUrl=url, MaxNumberOfMessages=10, WaitTimeSeconds=0, VisibilityTimeout=30
+                    QueueUrl=url, MaxNumberOfMessages=10, WaitTimeSeconds=0, VisibilityTimeout=120
                 ).get("Messages", [])
-            except Exception as e:
-                log.warning("couldn't purge %s: %s", pool_name, e)
-                return
-            if not msgs:
-                break
-            for m in msgs:
-                try:
-                    tm = TaskMessage.decode(m["Body"])
-                    mine = tm.reply_to == self._result_queue_url and tm.task_uuid in remaining
-                except ProtocolError:
-                    mine = False
-                try:
+                if not msgs:
+                    break
+                for m in msgs:
+                    try:
+                        tm = TaskMessage.decode(m["Body"])
+                        mine = tm.reply_to == self._result_queue_url and tm.task_uuid in remaining
+                    except ProtocolError:
+                        mine = False
                     if mine:
                         sqs.delete_message(QueueUrl=url, ReceiptHandle=m["ReceiptHandle"])
                         remaining.discard(tm.task_uuid)
                     else:
-                        sqs.change_message_visibility(
-                            QueueUrl=url, ReceiptHandle=m["ReceiptHandle"], VisibilityTimeout=0
-                        )
+                        foreign.append(m["ReceiptHandle"])
+        except Exception as e:
+            log.warning("couldn't purge %s: %s", pool_name, e)
+        finally:
+            for receipt in foreign:
+                try:
+                    sqs.change_message_visibility(
+                        QueueUrl=url, ReceiptHandle=receipt, VisibilityTimeout=0
+                    )
                 except Exception as e:
-                    log.warning("purge %s: %s", pool_name, e)
+                    log.warning("purge %s: couldn't release a message: %s", pool_name, e)
 
     # --- scaling ---------------------------------------------------------------------------
 
@@ -791,24 +824,29 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
                 worker_cost = self._unit_cost(pool)
                 per_worker = int(pool.get("vcpu_min", 2)) if _vcpu_mode(pool) else 1
                 unit_cost = worker_cost / per_worker
+                # Whole workers: Auto Scaling launches a whole instance for any vCPU target, so a
+                # 1-vCPU demand is a 2-vCPU worker (and rounding it down to 0 would hang it).
+                want = math.ceil((target - m.desired) / per_worker) * per_worker
                 allowed = self._spend.admit(
                     limits,
                     now,
                     rate_now=rate_now,
                     instances_now=instances_now,
-                    want_units=target - m.desired,
+                    want_units=want,
                     unit_usd_per_hour=unit_cost,
                     unit_instances=1.0 / per_worker,
                 )
                 # Whole workers only: Auto Scaling rounds a vCPU target up to an instance.
                 allowed -= allowed % per_worker
                 m.admitted = allowed
-                if allowed < target - m.desired:
+                self._admission_blocked(name, m, limits, allowed, now)
+                if allowed < want:
                     log.warning(
-                        "pool %s: spend limits admit %d of %d more worker(s)",
+                        "pool %s: spend limits admit %d of %d more %s",
                         name,
                         allowed,
-                        target - m.desired,
+                        want,
+                        "vCPUs" if _vcpu_mode(pool) else "worker(s)",
                     )
                 target = m.desired + allowed
                 rate_now += allowed * unit_cost
@@ -876,6 +914,30 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
             + IPV4_HOUR
         )
 
+    def _admission_blocked(
+        self, name: str, m: _PoolMetrics, limits: Limits, allowed: int, now: float
+    ) -> None:
+        """Nothing admitted, nothing running: fail this process's waiting tasks after a while
+        rather than leave them hanging below a cap that may never trip."""
+        if allowed > 0 or m.in_service > 0 or m.desired > 0:
+            self._blocked_since.pop(name, None)
+            return
+        since = self._blocked_since.setdefault(name, now)
+        if now - since < BLOCKED_FAIL_S:
+            return
+        self._blocked_since.pop(name, None)
+        from aegc.control import describe_limits
+
+        self.fail_owned(
+            "AEGC_BUDGET_EXCEEDED",
+            (
+                f"pool {name!r}: the spend limits ({describe_limits(limits)}) leave no room for a "
+                f"worker, so tasks waited {BLOCKED_FAIL_S / 60:.0f} min without one. Raise a limit "
+                f"with `aegc limits {self.deployment} --max-usd-day N` (or --max-usd-month)."
+            ),
+            pool=name,
+        )
+
     def _trip(
         self,
         trip: Trip,
@@ -894,7 +956,12 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         try:
             write_state(self._clients["ssm"], self.deployment, st)
         except Exception as e:  # still stop this process's spending
-            log.error("couldn't write the capped state: %s", e)
+            log.error(
+                "couldn't write the capped state (workers won't see it; check the operator "
+                "policy): %s",
+                e,
+            )
+            self._local_cap = st
         log.error("deployment %s capped: %s", self.deployment, trip.reason)
         # Workers at the group's minimum can't leave it: drop the minimum to 0 too.
         for name, g in groups.items():

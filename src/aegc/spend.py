@@ -101,12 +101,14 @@ class SpendGuard:
         for kind, cap in (("day", limits.max_usd_day), ("month", limits.max_usd_month)):
             if cap is None:
                 continue
-            horizon_h = min(HORIZON_S, period_end(kind, now) - now) / 3600
+            # A full hour even near the end of a period: a shorter horizon would admit a burst
+            # whose rate carries into the next period.
+            horizon_h = HORIZON_S / 3600
             headroom = cap - self.accrued(kind, now).usd
             extra_rate = headroom / (horizon_h * HOLD) - rate_now
             allowed = min(allowed, _floor_units(extra_rate, unit_usd_per_hour))
         if limits.max_instance_hours_day is not None:
-            horizon_h = min(HORIZON_S, period_end("day", now) - now) / 3600
+            horizon_h = HORIZON_S / 3600
             headroom_h = limits.max_instance_hours_day - self.accrued("day", now).instance_hours
             extra_instances = headroom_h / (horizon_h * HOLD) - instances_now
             allowed = min(allowed, _floor_units(extra_instances, unit_instances))

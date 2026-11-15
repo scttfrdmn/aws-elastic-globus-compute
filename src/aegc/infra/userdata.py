@@ -104,8 +104,12 @@ if ! systemctl is-active --quiet aegc-worker || [ "$$stale" -gt ${watchdog_stale
     -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
   md() { curl -sf -H "X-aws-ec2-metadata-token: $$TOKEN" \
     "http://169.254.169.254/latest/meta-data/$$1"; }
-  aws autoscaling terminate-instance-in-auto-scaling-group --region "$$(md placement/region)" \
-    --instance-id "$$(md instance-id)" --should-decrement-desired-capacity
+  region=$$(md placement/region); iid=$$(md instance-id)
+  # At the group's minimum the decrement is refused: terminate for a replacement instead.
+  aws autoscaling terminate-instance-in-auto-scaling-group --region "$$region" \
+    --instance-id "$$iid" --should-decrement-desired-capacity \
+  || aws autoscaling terminate-instance-in-auto-scaling-group --region "$$region" \
+    --instance-id "$$iid" --no-should-decrement-desired-capacity
 fi
 WATCH
 chmod 755 /usr/local/bin/aegc-watchdog

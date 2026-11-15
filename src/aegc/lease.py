@@ -29,6 +29,14 @@ from aegc.state import State, write_state
 
 DEFAULT_LEASE_S = 48 * 3600
 RENEW_EVERY_S = 3600
+MIN_LEASE_S = 3 * 3600  # renewed at least three times per lease, with margin for outages
+
+
+def renew_interval(lease_s: int) -> float:
+    """How often engines renew: hourly, or a third of a short lease."""
+    return min(RENEW_EVERY_S, lease_s / 3)
+
+
 SSM_TARGET = "arn:aws:scheduler:::aws-sdk:ssm:putParameter"
 ASG_TARGET = "arn:aws:scheduler:::aws-sdk:autoscaling:updateAutoScalingGroup"
 POLICY = "aegc-lease"
@@ -59,6 +67,15 @@ def parse_duration(text: str) -> int:
     if text and text[-1] in units and text[:-1].isdigit():
         return int(text[:-1]) * units[text[-1]]
     raise ValueError(f"expected a duration like 48h or 7d, not {text!r}")
+
+
+def check_lease(lease_s: int) -> int:
+    if lease_s and lease_s < MIN_LEASE_S:
+        raise ValueError(
+            f"a lease shorter than {MIN_LEASE_S // 3600} h could expire between renewals; "
+            "use --lease 3h or more (or --ttl for a hard end)"
+        )
+    return lease_s
 
 
 @dataclass(frozen=True)
@@ -124,7 +141,7 @@ def schedules(spec: LeaseSpec, role_arn: str, *, now: float) -> dict[str, dict[s
             now + spec.lease_s,
             f"no endpoint renewed the lease for {spec.lease_s // 3600} h",
         )
-    if spec.ttl_at:
+    if spec.ttl_at and spec.ttl_at > now:  # a TTL that has passed already fired (or was resumed)
         kind("ttl", spec.ttl_at, f"TTL reached at {at(spec.ttl_at)[3:-1]} UTC")
     return out
 

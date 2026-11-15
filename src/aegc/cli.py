@@ -161,6 +161,8 @@ def parse_pool(text: str) -> dict[str, Any]:
             out["slots"] = value
         elif key == "on-demand":
             out["spot"] = False
+        elif key == "spot":
+            out["spot"] = True
         elif key == "idle":
             out["idle_timeout_s"] = int(value)
         elif key == "disk":
@@ -199,6 +201,12 @@ def _deploy(args: argparse.Namespace) -> int:
             raise SystemExit(
                 f"aegc: no image recorded for env {env!r}; run `aegc image build --env {env} ...`"
             ) from None
+        if _version(rec.aegc_version) < (0, 2) and not args.allow_old_image:
+            raise SystemExit(
+                f"aegc: the {env!r} image was built with aegc {rec.aegc_version}; its workers "
+                "ignore spend limits, stop and the lease, and write no cost ledger. Rebuild it: "
+                f"aegc image build --env {env} --base-tag ... (or pass --allow-old-image)"
+            )
         name = f"{env}-py{rec.python_minor.replace('.', '')}"
         base: dict[str, Any] = {}
         if name in prev_pools:  # a redeploy keeps the options it isn't given (#30)
@@ -215,16 +223,40 @@ def _deploy(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
         kw = {**base, **opts, "name": name, "env": env, "python_minor": rec.python_minor}
+        # A small max_vcpus with the default size range: keep workers within the pool's cap.
+        if "vcpu_max" not in opts and "max_vcpus" in kw:
+            default_max = deployment.PoolSpec.__dataclass_fields__["vcpu_max"].default
+            vmax = int(kw.get("vcpu_max", default_max))
+            if kw["max_vcpus"] and vmax > kw["max_vcpus"]:
+                kw["vcpu_max"] = max(int(kw["max_vcpus"]), int(kw.get("vcpu_min", 2)))
         kw["image"] = rec.image
         pools.append(deployment.PoolSpec(**kw))
     named = {p.name for p in pools}
     omitted = sorted(n for n in prev_pools if n not in named)
-    if omitted and not args.prune:
+    pruning = bool(omitted and args.prune and args.yes and not args.dry_run)
+    if omitted and args.prune and not pruning:
         print(
-            f"warning: keeping pool(s) not listed here: {', '.join(omitted)} "
-            "(pass --prune to remove them)",
+            f"note: --prune would remove pool(s) {', '.join(omitted)}; this is a dry run of "
+            "that part (add --yes to remove them)",
             file=sys.stderr,
         )
+    elif omitted and not args.prune:
+        print(
+            f"warning: keeping pool(s) not listed here: {', '.join(omitted)} "
+            "(pass --prune --yes to remove them)",
+            file=sys.stderr,
+        )
+    if omitted and args.prune and not args.force:
+        c0 = _clients(sess)
+        busy = {n: deployment.pool_tasks(c0, prev_pools[n]) for n in omitted}  # type: ignore[arg-type]
+        busy = {n: k for n, k in busy.items() if k}
+        if busy:  # before anything changes: a refused prune mustn't strand a pool
+            raise SystemExit(
+                "aegc: can't prune pools with queued or running tasks: "
+                + ", ".join(f"{n} ({k})" for n, k in busy.items())
+                + "; wait, or add --force"
+            )
+    if not pruning:  # kept pools stay in the manifest, the lease and stop/resume
         pools += [deployment.PoolSpec.from_manifest(n, prev_pools[n]) for n in omitted]
     limits = state.Limits.from_dict(prev.get("limits")).merged(
         max_usd_day=args.max_usd_day,
@@ -233,11 +265,14 @@ def _deploy(args: argparse.Namespace) -> int:
         on_cap=args.on_cap,
     )
     prev_lease = prev.get("lease") or {}
-    lease_s = (
-        lease.parse_duration(args.lease)
-        if args.lease is not None
-        else int(prev_lease.get("lease_s", lease.DEFAULT_LEASE_S))
-    )
+    try:
+        lease_s = lease.check_lease(
+            lease.parse_duration(args.lease)
+            if args.lease is not None
+            else int(prev_lease.get("lease_s", lease.DEFAULT_LEASE_S))
+        )
+    except ValueError as e:
+        raise SystemExit(f"aegc: {e}") from None
     if args.ttl is not None:
         ttl = lease.parse_duration(args.ttl)
         ttl_at = time.time() + ttl if ttl else 0.0
@@ -271,11 +306,20 @@ def _deploy(args: argparse.Namespace) -> int:
                 n,
                 prev_pools[n],
                 report,
-                dry_run=args.dry_run,
+                dry_run=not pruning,
                 force=args.force,
             )
     print(report)
     return 0
+
+
+def _version(text: str) -> tuple[int, ...]:
+    parts = []
+    for p in text.split("."):
+        if not p.isdigit():
+            break
+        parts.append(int(p))
+    return tuple(parts)
 
 
 def _limit_value(text: str) -> Any:
@@ -328,21 +372,36 @@ def _resume(args: argparse.Namespace) -> int:
 
 
 def _limits(args: argparse.Namespace) -> int:
-    from aegc import awsutil, control
+    from aegc import awsutil, control, naming, pricing
+    from aegc.spend import SpendGuard
 
-    sess, _, _ = _ctx(args)
-    print(
-        control.set_limits(
+    sess, region, account = _ctx(args)
+    spend = SpendGuard(
+        s3=awsutil.client(sess, "s3"),  # type: ignore[arg-type]
+        bucket=naming.bucket_name(account, region),
+        deployment=args.deployment,
+        prices=pricing.Prices(
+            region=region,
+            ec2=awsutil.client(sess, "ec2"),  # type: ignore[arg-type]
+            pricing=awsutil.client(awsutil.session(args.profile, "us-east-1"), "pricing"),
+        ),
+    )
+    try:
+        report = control.set_limits(
             ssm=awsutil.client(sess, "ssm"),  # type: ignore[arg-type]
             autoscaling=awsutil.client(sess, "autoscaling"),  # type: ignore[arg-type]
             deployment=args.deployment,
             resume_now=args.resume,
+            spend=spend if args.resume else None,
+            scheduler=awsutil.client(sess, "scheduler"),  # type: ignore[arg-type]
             max_usd_day=args.max_usd_day,
             max_usd_month=args.max_usd_month,
             max_instance_hours_day=args.max_instance_hours_day,
             on_cap=args.on_cap,
         )
-    )
+    except ValueError as e:
+        raise SystemExit(f"aegc: {e}") from None
+    print(report)
     return 0
 
 
@@ -548,8 +607,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--ttl", metavar="DURATION",
         help="freeze the deployment this long from now, renewed or not (e.g. 7d; 'none' clears)",
     )  # fmt: skip
-    dp.add_argument("--prune", action="store_true", help="remove pools not listed (dry run first)")
+    dp.add_argument(
+        "--prune", action="store_true",
+        help="remove pools not listed (a dry run of that part unless --yes)",
+    )  # fmt: skip
+    dp.add_argument("--yes", action="store_true", help="with --prune: actually remove them")
     dp.add_argument("--force", action="store_true", help="--prune even with tasks queued")
+    dp.add_argument(
+        "--allow-old-image", action="store_true",
+        help="deploy images built before aegc 0.2 (their workers ignore limits and stop)",
+    )  # fmt: skip
     dp.add_argument("--dry-run", action="store_true")
     dp.set_defaults(func=_deploy)
 

@@ -67,6 +67,11 @@ class State:
         if self.mode == "stopped":
             why = f" ({self.reason})" if self.reason else ""
             return f"deployment {d!r} is stopped{why}; resume it with `aegc resume {d}`."
+        if self.mode == "expired" and self.by == "ttl":
+            return (
+                f"deployment {d!r} reached its TTL ({self.reason}); resume it with "
+                f"`aegc resume {d}` (and redeploy with a later --ttl to move it)."
+            )
         if self.mode == "expired":
             return (
                 f"deployment {d!r}'s lease expired: no endpoint renewed it ({self.reason}); "

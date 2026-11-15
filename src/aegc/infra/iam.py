@@ -196,7 +196,9 @@ def operator_policy(*, deployment: str, region: str, account: str, bucket: str) 
                 # this endpoint's own queued tasks (purge them from the task queues).
                 "Sid": "CapState",
                 "Effect": "Allow",
-                "Action": "ssm:PutParameter",
+                # write_state checks ownership tags first, and tags the parameter if it creates it
+                # (deployments from v0.1 have none).
+                "Action": ["ssm:PutParameter", "ssm:ListTagsForResource", "ssm:AddTagsToResource"],
                 "Resource": f"arn:aws:ssm:{region}:{account}:parameter{naming.state_parameter(d)}",
             },
             {
@@ -215,7 +217,11 @@ def operator_policy(*, deployment: str, region: str, account: str, bucket: str) 
             {
                 "Sid": "Prices",
                 "Effect": "Allow",
-                "Action": ["ec2:DescribeSpotPriceHistory", "pricing:GetProducts"],
+                "Action": [
+                    "ec2:DescribeSpotPriceHistory",
+                    "pricing:GetProducts",
+                    "ce:GetCostAndUsage",  # aegc cost --actual
+                ],
                 "Resource": "*",
             },
             {

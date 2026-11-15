@@ -58,9 +58,14 @@ def write(s3: Any, bucket: str, rec: Record) -> None:
     )
 
 
+#: An instance lives at most lifetime (<= 72 h) + max walltime (11.5 h) + 15 min, so its record
+#: can overlap a period that starts up to 4 days after its launch date.
+LOOKBACK_DAYS = 4
+
+
 def days(start: float, end: float) -> list[str]:
-    """Launch dates whose records can overlap ``[start, end)``: from the day before ``start``."""
-    d = datetime.fromtimestamp(start, UTC).date() - timedelta(days=1)
+    """Launch dates whose records can overlap ``[start, end)``."""
+    d = datetime.fromtimestamp(start, UTC).date() - timedelta(days=LOOKBACK_DAYS)
     last = datetime.fromtimestamp(end, UTC).date()
     out = []
     while d <= last:

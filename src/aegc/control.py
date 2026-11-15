@@ -105,7 +105,14 @@ def resume(
 
 
 def set_limits(
-    *, ssm: Any, autoscaling: Any, deployment: str, resume_now: bool = False, **changes: Any
+    *,
+    ssm: Any,
+    autoscaling: Any,
+    deployment: str,
+    resume_now: bool = False,
+    spend: Any | None = None,
+    scheduler: Any | None = None,
+    **changes: Any,
 ) -> ControlReport:
     """Change a deployment's spend limits (``"none"`` removes one). Running engines pick the
     new limits up within a minute. ``resume_now`` also ends a ``capped`` state."""
@@ -120,7 +127,14 @@ def set_limits(
     if resume_now:
         st = read_state(ssm, deployment)
         if st.mode == "capped":
-            report.lines += resume(ssm=ssm, autoscaling=autoscaling, deployment=deployment).lines
+            trip = spend.check(limits, time.time()) if spend is not None else None
+            if trip is not None:  # it would only trip again within seconds
+                raise ValueError(
+                    f"still over a limit ({trip.reason}); raise it (e.g. --max-usd-day) to resume"
+                )
+            report.lines += resume(
+                ssm=ssm, autoscaling=autoscaling, deployment=deployment, scheduler=scheduler
+            ).lines
         else:
             report.add(f"  state is {st.mode}; nothing to resume")
     return report

@@ -14,7 +14,7 @@ from tests.substrate_gaps import launch_on_substrate, no_network_interfaces
 from tests.unit.test_images import push_fake, tags_of
 
 IMAGE = f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/aegc/geospatial@sha256:" + "b" * 64
-POOL = PoolSpec(name="sci-py314", env="geospatial", python_minor="3.14", image=IMAGE, max_vcpus=6)
+POOL = PoolSpec(name="sci-py314", env="geospatial", python_minor="3.14", image=IMAGE, max_vcpus=8)
 ASG = "aegc-dev-sci-py314"
 
 
@@ -152,8 +152,8 @@ def test_deploy_creates_everything(env: tuple[Clients, DeploymentSpec]) -> None:
     # Auto Scaling group: Spot, protected, rebalance suspended, tagged, in the default subnets.
     g = group(c)
     assert g is not None
-    # Capacity in vCPUs (#29): max_vcpus=6.
-    assert (g["MinSize"], g["DesiredCapacity"], g["MaxSize"]) == (0, 0, 6)
+    # Capacity in vCPUs (#29): max_vcpus=8.
+    assert (g["MinSize"], g["DesiredCapacity"], g["MaxSize"]) == (0, 0, 8)
     assert g["DesiredCapacityType"] == "vcpu"
     assert g["Instances"] == []
     assert g["NewInstancesProtectedFromScaleIn"] is True
@@ -165,7 +165,7 @@ def test_deploy_creates_everything(env: tuple[Clients, DeploymentSpec]) -> None:
     assert lt_spec["LaunchTemplateName"] == ASG and lt_spec["Version"] == "$Default"
     (override,) = mixed["LaunchTemplate"]["Overrides"]
     req = override["InstanceRequirements"]
-    assert req["VCpuCount"] == {"Min": 2, "Max": 16}
+    assert req["VCpuCount"] == {"Min": 2, "Max": 8}  # the default range fits max_vcpus=8
     assert req["MemoryMiB"] == {"Min": 4096}
     assert req["CpuManufacturers"] == ["amazon-web-services"]
     assert req["BurstablePerformance"] == "excluded"
