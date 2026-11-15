@@ -44,6 +44,9 @@ log = logging.getLogger("aegc.engine")
 
 #: resource_specification keys AWSEngine understands in v0.1.
 RESOURCE_KEYS = frozenset({"env", "pool", "walltime_s", "size", "cpus", "memory_gib"})
+#: The Globus Compute web service validates resource_specification as an MPI request: it
+#: requires ``num_nodes`` (HTTP 422 without it) and allows these. Tasks here run on one instance.
+MPI_KEYS = frozenset({"num_nodes", "ranks_per_node", "num_ranks", "launcher_options"})
 #: Keys people reach for that aegc spells differently.
 _DID_YOU_MEAN = {"vcpus": "cpus", "num_cores": "cpus", "cores": "cpus", "memory": "memory_gib",
                  "mem": "memory_gib", "mem_per_worker": "memory_gib"}  # fmt: skip
@@ -376,6 +379,9 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         """(pool, walltime_s, problem). A non-empty problem fails the task without retrying."""
         if self._config_error or self._manifest is None:
             return None, 0, self._config_error or "AWSEngine isn't configured"
+        spec, problem = _strip_mpi_keys(spec)
+        if problem:
+            return None, 0, problem
         unknown = set(spec) - RESOURCE_KEYS
         if unknown:
             hints = [f"{k} -> {_DID_YOU_MEAN[k]}" for k in sorted(unknown) if k in _DID_YOU_MEAN]
@@ -1096,6 +1102,23 @@ def _cheapest_guess(pool: dict[str, Any]) -> str:
 
 def _vcpu_mode(pool: dict[str, Any]) -> bool:
     return pool.get("capacity_type") == "vcpu"
+
+
+def _strip_mpi_keys(spec: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """``spec`` without the MPI keys the web service makes every request carry, or a problem if
+    they ask for more than one instance or an MPI launch."""
+    mpi = {k: spec[k] for k in MPI_KEYS & set(spec)}
+    rest = {k: v for k, v in spec.items() if k not in MPI_KEYS}
+    try:
+        nodes = int(mpi.get("num_nodes", 1))
+        ranks = max(int(mpi.get("ranks_per_node") or 1), int(mpi.get("num_ranks") or 1))
+    except (TypeError, ValueError):
+        return rest, "resource_specification num_nodes, ranks_per_node and num_ranks are numbers"
+    if nodes != 1:
+        return rest, f"AWSEngine runs each task on one instance; num_nodes must be 1, not {nodes}"
+    if ranks > 1 or mpi.get("launcher_options"):
+        return rest, "AWSEngine doesn't launch MPI ranks; use cpus= for a multi-core task"
+    return rest, ""
 
 
 def _pick_size(

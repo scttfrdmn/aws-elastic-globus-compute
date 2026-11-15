@@ -134,3 +134,28 @@ def test_bad_size_requests(env: Env, spec: dict[str, Any], expect: str) -> None:
         assert is_err and expect in text
     finally:
         e.shutdown()
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize(
+    ("spec", "expect"),
+    [
+        ({"num_nodes": 2, "size": "mem"}, "num_nodes must be 1"),
+        ({"num_nodes": 1, "num_ranks": 4}, "doesn't launch MPI ranks"),
+        ({"num_nodes": "x"}, "are numbers"),
+    ],
+)
+def test_mpi_keys_from_the_web_service(env: Env, spec: dict[str, Any], expect: str) -> None:
+    # Found live: the web service refuses a resource_specification without num_nodes (422).
+    e = env.engine()
+    try:
+        f = submit(e, triple, 1, spec=spec)
+        is_err, text = unpack_result(f.result(timeout=5))
+        assert is_err and expect in text
+    finally:
+        e.shutdown()
+
+
+def test_num_nodes_1_is_accepted() -> None:
+    assert engine._strip_mpi_keys({"num_nodes": 1, "size": "mem"}) == ({"size": "mem"}, "")
+    assert engine._strip_mpi_keys({"walltime_s": 60}) == ({"walltime_s": 60}, "")
