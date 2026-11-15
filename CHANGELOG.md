@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-15
+
+Run your own work: worker images from any arm64 base, several Python versions per environment,
+access to your own S3 data, results larger than Globus Compute's limit, and pools sized for
+memory-heavy tasks. Validated live; see the [performance page](docs/reference/performance.md).
+
 ### Added
 - **Bring your own worker image:** `aegc image build --env NAME --base REF` builds a worker image
   from any `linux/arm64` image with Python 3.11 or later and a shell, not only aarchsci and
@@ -333,6 +339,7 @@ Bugs found and fixed during validation:
 - the operator and deployer policies missed actions their commands use;
 - env names over 14 characters couldn't be deployed.
 
-[Unreleased]: https://github.com/scttfrdmn/aws-elastic-globus-compute/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/aws-elastic-globus-compute/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/scttfrdmn/aws-elastic-globus-compute/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/scttfrdmn/aws-elastic-globus-compute/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/scttfrdmn/aws-elastic-globus-compute/releases/tag/v0.1.0
