@@ -14,7 +14,7 @@ from tests.substrate_gaps import launch_on_substrate, no_network_interfaces
 from tests.unit.test_images import push_fake, tags_of
 
 IMAGE = f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/aegc/geospatial@sha256:" + "b" * 64
-POOL = PoolSpec(name="sci-py314", env="geospatial", python_minor="3.14", image=IMAGE, max_workers=3)
+POOL = PoolSpec(name="sci-py314", env="geospatial", python_minor="3.14", image=IMAGE, max_vcpus=6)
 ASG = "aegc-dev-sci-py314"
 
 
@@ -152,7 +152,9 @@ def test_deploy_creates_everything(env: tuple[Clients, DeploymentSpec]) -> None:
     # Auto Scaling group: Spot, protected, rebalance suspended, tagged, in the default subnets.
     g = group(c)
     assert g is not None
-    assert (g["MinSize"], g["DesiredCapacity"], g["MaxSize"]) == (0, 0, 3)
+    # Capacity in vCPUs (#29): max_vcpus=6.
+    assert (g["MinSize"], g["DesiredCapacity"], g["MaxSize"]) == (0, 0, 6)
+    assert g["DesiredCapacityType"] == "vcpu"
     assert g["Instances"] == []
     assert g["NewInstancesProtectedFromScaleIn"] is True
     assert g["CapacityRebalance"] is True

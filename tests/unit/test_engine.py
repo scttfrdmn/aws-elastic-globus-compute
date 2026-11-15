@@ -53,7 +53,7 @@ class Env:
             env="geospatial",
             python_minor=python,
             image=IMAGE,
-            max_workers=5,
+            max_vcpus=10,
             slots="2",
         )
         self.spec = DeploymentSpec(
@@ -350,15 +350,17 @@ def test_scaler_scales_out_only(env: Env) -> None:
         snap = e.scale_once()
         assert snap.pools["geo-py314"].visible == 7
         g = env.group()
-        assert g["DesiredCapacity"] == 4  # ceil(7 / 2 slots)
-        assert len(g["Instances"]) == 4  # Auto Scaling launched them
+        # vCPUs: 7 tasks at 2 slots per 2-vCPU worker = 4 workers = 8 vCPUs. (substrate launches
+        # one instance per unit, not per 2 vCPUs: substrate#1502.)
+        assert g["DesiredCapacity"] == 8
+        assert g["Instances"]  # Auto Scaling launched workers
         env.drain()
         assert e.scale_once().pools["geo-py314"].visible == 0
-        assert env.group()["DesiredCapacity"] == 4  # never scales in; workers leave themselves
+        assert env.group()["DesiredCapacity"] == 8  # never scales in; workers leave themselves
         env.demand(50)
         snap = e.scale_once()
         assert snap.pools["geo-py314"].visible == 50
-        assert snap.pools["geo-py314"].desired == env.group()["DesiredCapacity"] == 5  # max
+        assert snap.pools["geo-py314"].desired == env.group()["DesiredCapacity"] == 10  # max
         assert snap.pools["geo-py314"].last_scaling_error == ""
     finally:
         e.shutdown()
@@ -372,7 +374,7 @@ def test_scaler_counts_claimed_tasks(env: Env) -> None:
         env.sqs.receive_message(QueueUrl=env.task_queue, MaxNumberOfMessages=3, WaitTimeSeconds=0)
         m = e.scale_once().pools["geo-py314"]
         assert (m.visible, m.inflight) == (0, 3)
-        assert env.group()["DesiredCapacity"] == 2  # ceil(3 / 2)
+        assert env.group()["DesiredCapacity"] == 4  # ceil(3 / 2) workers x 2 vCPUs
     finally:
         e.shutdown()
 
@@ -386,7 +388,7 @@ def test_stall_breaker_pauses_scale_out(env: Env) -> None:
         env.demand(3)
         t0 = 1000.0
         snap = e.scale_once(now=t0)
-        assert snap.pools["geo-py314"].desired == env.group()["DesiredCapacity"] == 2
+        assert snap.pools["geo-py314"].desired == env.group()["DesiredCapacity"] == 4
         assert env.group()["Instances"] == []  # every launch failed
         activities = env.asg.describe_scaling_activities(AutoScalingGroupName=GROUP)["Activities"]
         assert activities and {a["StatusCode"] for a in activities} == {"Failed"}
@@ -397,17 +399,17 @@ def test_stall_breaker_pauses_scale_out(env: Env) -> None:
         assert snap.pools["geo-py314"].stalled and snap.pools["geo-py314"].in_service == 0
         # Paused: even more demand doesn't scale out while stalled.
         env.demand(6)
-        assert e.scale_once(now=t0 + 10 + STALL_AFTER_S + 60).pools["geo-py314"].desired == 2
-        assert env.group()["DesiredCapacity"] == 2
+        assert e.scale_once(now=t0 + 10 + STALL_AFTER_S + 60).pools["geo-py314"].desired == 4
+        assert env.group()["DesiredCapacity"] == 4
         assert e.get_status_report().global_state["pools"]["geo-py314"]["stalled"] is True
 
         # Capacity comes back: the group launches, and after the pause the scaler resumes.
         env.clear_launch_failure()
         snap = e.scale_once(now=t0 + 10 + STALL_AFTER_S + STALL_PAUSE_S + 1)
-        assert not snap.pools["geo-py314"].stalled and snap.pools["geo-py314"].in_service == 2
+        assert not snap.pools["geo-py314"].stalled and snap.pools["geo-py314"].in_service > 0
         g = env.group()
-        assert g["DesiredCapacity"] == 5  # ceil(9 / 2), capped at max
-        assert [i["LifecycleState"] for i in g["Instances"]] == ["InService"] * 5
+        assert g["DesiredCapacity"] == 10  # ceil(9 / 2) workers x 2 vCPUs, capped at max
+        assert {i["LifecycleState"] for i in g["Instances"]} == {"InService"}
     finally:
         e.shutdown()
 
@@ -536,12 +538,13 @@ def test_cap_trips_and_fails_queued_tasks(env: Env) -> None:
 def test_admission_scales_out_only_what_the_cap_allows(env: Env) -> None:
     e = env.engine()
     try:
-        # Static prices: one more worker is about $0.137/h (priciest allowed family at 2 vCPUs,
-        # plus volume and IPv4). $0.40/day with nothing spent admits floor(0.40/1.2/0.137) = 2.
+        # Static prices: one more 2-vCPU worker is about $0.137/h (priciest allowed family, plus
+        # volume and IPv4), $0.0686 per vCPU. $0.40/day with nothing spent: 0.40/1.2/0.0686 = 4.9
+        # vCPUs, rounded down to whole workers: 4 vCPUs (2 workers) of the 8 wanted.
         set_limits(env, e, max_usd_day=0.40)
-        env.demand(8)  # 8 tasks / 2 slots = 4 workers wanted
+        env.demand(8)  # 8 tasks / 2 slots = 4 workers = 8 vCPUs wanted
         m = e.scale_once(now=NOON).pools["geo-py314"]
-        assert m.admitted == 2 and env.group()["DesiredCapacity"] == 2
+        assert m.admitted == 4 and env.group()["DesiredCapacity"] == 4
         assert state.read_state(env.ssm, "dev", now=NOON).running
     finally:
         e.shutdown()
@@ -587,12 +590,26 @@ def test_running_engine_picks_up_a_redeploy(env: Env) -> None:
     try:
         assert not e.refresh_manifest(now=time.time() + 120)  # nothing changed
         m = deployment.read_manifest(env.ssm, "dev")
-        m["pools"]["geo-py314"]["max_workers"] = 9
+        m["pools"]["geo-py314"]["max_vcpus"] = 18
         m["generation"] = deployment.manifest_generation(m)
         env.ssm.put_parameter(
             Name="/aegc/dev/manifest", Value=json.dumps(m), Type="String", Overwrite=True
         )
         assert e.refresh_manifest(now=time.time() + 240)
-        assert e.scale_once().pools["geo-py314"].max == 9
+        assert e.scale_once().pools["geo-py314"].max == 18
+    finally:
+        e.shutdown()
+
+
+@pytest.mark.xfail(strict=True, reason="substrate#1502: DesiredCapacityType=vcpu isn't modelled")
+@pytest.mark.timeout(60)
+def test_vcpu_capacity_launches_workers_not_units(env: Env) -> None:
+    e = env.engine()
+    try:
+        env.demand(7)
+        e.scale_once()
+        g = env.group()
+        assert g["DesiredCapacity"] == 8  # vCPUs
+        assert len(g["Instances"]) == 4  # 2-vCPU workers (m5.large on substrate#1497's shim)
     finally:
         e.shutdown()

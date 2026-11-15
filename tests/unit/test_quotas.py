@@ -6,8 +6,8 @@ import pytest
 from aegc import quotas
 
 
-def pool(name: str, *, spot: bool = True, max_workers: int = 3, vmin: int = 2, vmax: int = 16):
-    return {"name": name, "spot": spot, "max_workers": max_workers, "vcpu_min": vmin,
+def pool(name: str, *, spot: bool = True, max_vcpus: int = 48, vmin: int = 2, vmax: int = 16):
+    return {"name": name, "spot": spot, "max_vcpus": max_vcpus, "vcpu_min": vmin,
             "vcpu_max": vmax}  # fmt: skip
 
 

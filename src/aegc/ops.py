@@ -26,7 +26,8 @@ class PoolStatus:
     dead_letters: int = 0
     desired: int = 0
     in_service: int = 0
-    max_workers: int = 0
+    max_capacity: int = 0
+    unit: str = "vCPUs"
     last_activity: str = ""
 
 
@@ -44,7 +45,7 @@ class DeploymentStatus:
             lines.append(
                 f"  pool {p.name}: env {p.env}, Python {p.python_minor} | tasks queued {p.queued}, "
                 f"running {p.running}, dead-lettered {p.dead_letters} | workers {p.in_service} "
-                f"in service, {p.desired} desired, max {p.max_workers}"
+                f"in service, {p.desired} {p.unit} desired, max {p.max_capacity}"
             )
             if p.last_activity:
                 lines.append(f"    last scaling activity: {p.last_activity}")
@@ -84,7 +85,8 @@ def status(
             name=name,
             env=str(pool.get("env")),
             python_minor=str(pool.get("python_minor")),
-            max_workers=int(pool.get("max_workers", 0)),
+            max_capacity=int(pool.get("max_vcpus", pool.get("max_workers", 0))),
+            unit="vCPUs" if pool.get("capacity_type") == "vcpu" else "workers",
         )
         ps.queued, ps.running = _counts(sqs, pool["task_queue_url"])
         ps.dead_letters, _ = _counts(sqs, pool["dlq_url"])

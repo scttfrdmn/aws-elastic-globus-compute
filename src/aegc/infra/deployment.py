@@ -18,7 +18,7 @@ import hashlib
 import json
 import time
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any
 
 from aegc import __version__, images, naming
@@ -44,8 +44,10 @@ class PoolSpec:
     env: str  # e.g. "geospatial"
     python_minor: str  # e.g. "3.14", read from the image at build time
     image: str  # <registry>/<repo>@sha256:<digest>
-    min_workers: int = 0
-    max_workers: int = 4
+    # Capacity is counted in vCPUs (Auto Scaling DesiredCapacityType=vcpu), so a pool's cost
+    # bound doesn't depend on which instance sizes price-capacity-optimized picks (#29).
+    min_vcpus: int = 0
+    max_vcpus: int = 8
     vcpu_min: int = 2
     vcpu_max: int = 16
     memory_mib_min: int = 4096
@@ -55,17 +57,41 @@ class PoolSpec:
     root_volume_gib: int = 30
     idle_timeout_s: int = 300
     throughput_mibps: int = 125  # gp3 root volume; 125 MiB/s is included in the GiB price
+    walltime_s: int = 0  # default per-task walltime (0: protocol.DEFAULT_WALLTIME_S)
+    max_walltime_s: int = 0  # ceiling for requests (0: protocol.MAX_WALLTIME_S)
+    max_lifetime_s: int = 24 * 3600  # a worker stops claiming after this
 
     def __post_init__(self) -> None:
         naming.validate_name("pool", self.name)
-        if not 0 <= self.min_workers <= self.max_workers:
-            raise ValueError("need 0 <= min_workers <= max_workers")
+        if not 0 <= self.min_vcpus <= self.max_vcpus:
+            raise ValueError("need 0 <= min_vcpus <= max_vcpus")
+        if self.max_vcpus and self.max_vcpus < self.vcpu_min:
+            raise ValueError(
+                f"max_vcpus={self.max_vcpus} is smaller than one worker (vcpu={self.vcpu_min}-...)"
+            )
+        if self.walltime_s < 0 or self.max_walltime_s < 0:
+            raise ValueError("walltime_s and max_walltime_s must be >= 0")
+        if self.walltime_s and self.max_walltime_s and self.walltime_s > self.max_walltime_s:
+            raise ValueError("walltime_s must not exceed max_walltime_s")
         lo, hi = ROOT_GIB_RANGE
         if not lo <= self.root_volume_gib <= hi:
             raise ValueError(f"root volume (disk=) must be {lo}-{hi} GiB")
         lo, hi = THROUGHPUT_RANGE
         if not lo <= self.throughput_mibps <= hi:
             raise ValueError(f"gp3 throughput (throughput=) must be {lo}-{hi} MiB/s")
+
+    @classmethod
+    def from_manifest(cls, name: str, entry: dict[str, Any]) -> PoolSpec:
+        """The PoolSpec a manifest pool entry was deployed from (for redeploy merges)."""
+        known = {f.name for f in fields(cls)}
+        kw = {k: v for k, v in entry.items() if k in known}
+        kw["name"] = name
+        if "allowed_instance_types" in kw:
+            kw["allowed_instance_types"] = tuple(kw["allowed_instance_types"])
+        if "max_vcpus" not in entry and "max_workers" in entry:  # a v0.1 manifest
+            kw["max_vcpus"] = int(entry["max_workers"]) * int(entry.get("vcpu_min", 2))
+            kw["min_vcpus"] = int(entry.get("min_workers", 0)) * int(entry.get("vcpu_min", 2))
+        return cls(**kw)
 
 
 @dataclass(frozen=True)
@@ -351,7 +377,8 @@ def worker_config(spec: DeploymentSpec, pool: PoolSpec, task_queue_url: str) -> 
         "aegc_version": __version__,
         "state_parameter": naming.state_parameter(spec.deployment),
         "root_volume_gib": pool.root_volume_gib,
-        "throughput_mibps": getattr(pool, "throughput_mibps", 500),
+        "throughput_mibps": pool.throughput_mibps,
+        "max_lifetime_s": pool.max_lifetime_s,
     }
 
 
@@ -492,8 +519,9 @@ def _asg_request(
 ) -> dict[str, Any]:
     d = spec.deployment
     return {
-        "MinSize": pool.min_workers,
-        "MaxSize": pool.max_workers,
+        "MinSize": pool.min_vcpus,
+        "MaxSize": pool.max_vcpus,
+        "DesiredCapacityType": "vcpu",
         "VPCZoneIdentifier": ",".join(subnets),
         "CapacityRebalance": pool.spot,
         "NewInstancesProtectedFromScaleIn": True,
@@ -559,7 +587,7 @@ def ensure_auto_scaling_group(
             return name
         c.autoscaling.create_auto_scaling_group(
             AutoScalingGroupName=name,
-            DesiredCapacity=pool.min_workers,
+            DesiredCapacity=pool.min_vcpus,
             Tags=asg_tags,
             **req,
         )
@@ -651,6 +679,83 @@ def write_manifest(
         report.add("ssm parameter", name, "created")
 
 
+def update_manifest(ssm: Any, deployment: str, body: dict[str, Any]) -> None:
+    """Overwrite an existing, aegc-owned manifest (e.g. new limits)."""
+    d, name = deployment, naming.deployment_manifest_parameter(deployment)
+    found = naming.tag_dict(
+        ssm.list_tags_for_resource(ResourceType="Parameter", ResourceId=name)["TagList"]
+    )
+    if not naming.is_owned(f"{naming.PREFIX}-{d}", found, d):
+        raise OwnershipError(f"SSM parameter {name} exists but isn't tagged as {d}'s")
+    ssm.put_parameter(
+        Name=name, Value=json.dumps(body, sort_keys=True), Type="String", Overwrite=True
+    )
+
+
+def prune_pool(
+    c: Clients,
+    deployment: str,
+    name: str,
+    entry: dict[str, Any],
+    report: Report,
+    *,
+    dry_run: bool,
+    force: bool = False,
+    wait_s: float = 600,
+    poll_s: float = 10,
+) -> None:
+    """Remove a pool a redeploy no longer lists: its group, launch template and queues.
+
+    Refuses while its task queue has queued or running tasks, unless ``force``.
+    """
+    d = deployment
+    verb: Outcome = "would-delete" if dry_run else "deleted"
+    url = str(entry.get("task_queue_url", ""))
+    if url and not force:
+        a = c.sqs.get_queue_attributes(
+            QueueUrl=url,
+            AttributeNames=["ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible"],
+        )["Attributes"]
+        n = int(a.get("ApproximateNumberOfMessages", 0)) + int(
+            a.get("ApproximateNumberOfMessagesNotVisible", 0)
+        )
+        if n:
+            raise RuntimeError(f"pool {name} has {n} queued or running task(s); use --force")
+    group = str(entry.get("auto_scaling_group", ""))
+    found = (
+        c.autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[group])[
+            "AutoScalingGroups"
+        ]
+        if group
+        else []
+    )
+    if found:
+        if not naming.is_owned(group, naming.tag_dict(found[0].get("Tags", [])), d):
+            report.add("auto scaling group", group, "kept", "not tagged as aegc's")
+        else:
+            if not dry_run:
+                c.autoscaling.delete_auto_scaling_group(
+                    AutoScalingGroupName=group, ForceDelete=True
+                )
+                _wait_gone(c, group, wait_s=wait_s, poll_s=poll_s)
+            report.add("auto scaling group", group, verb)
+    lt = str(entry.get("launch_template", ""))
+    if lt:
+        owned = c.ec2.describe_launch_templates(
+            Filters=[{"Name": "launch-template-name", "Values": [lt]}, *_owned_ec2_filters(d)]
+        )["LaunchTemplates"]
+        if owned:
+            if not dry_run:
+                c.ec2.delete_launch_template(LaunchTemplateName=lt)
+            report.add("launch template", lt, verb)
+    for key in ("task_queue_url", "dlq_url"):
+        q = str(entry.get(key, ""))
+        if q and naming.is_owned(q.rsplit("/", 1)[-1], _queue_tags(c, q), d):
+            if not dry_run:
+                c.sqs.delete_queue(QueueUrl=q)
+            report.add("sqs queue", q.rsplit("/", 1)[-1], verb)
+
+
 def read_manifest(ssm: Any, deployment: str) -> dict[str, Any]:
     value = ssm.get_parameter(Name=naming.deployment_manifest_parameter(deployment))["Parameter"][
         "Value"
@@ -697,6 +802,7 @@ def deploy(c: Clients, spec: DeploymentSpec, *, dry_run: bool = False) -> Report
             "dlq_url": dlq_url,
             "launch_template": lt,
             "auto_scaling_group": asg,
+            "capacity_type": "vcpu",
         }
     write_manifest(
         c,

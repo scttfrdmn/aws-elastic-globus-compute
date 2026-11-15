@@ -124,7 +124,7 @@ def vcpu_usage(cw: Any, usage_class: str, now: float | None = None) -> float:
 
 def check(pools: Iterable[Mapping[str, Any]], *, sq: Any, cw: Any) -> list[QuotaCheck]:
     """One check per kind of capacity the pools use. ``pools`` are PoolSpec dicts or manifest
-    entries (``name``, ``spot``, ``max_workers``, ``vcpu_min``, ``vcpu_max``)."""
+    entries (``name``, ``spot``, ``max_vcpus``, ``vcpu_min``)."""
     by_kind: dict[str, list[Mapping[str, Any]]] = {}
     for p in pools:
         by_kind.setdefault("spot" if p.get("spot", True) else "on-demand", []).append(p)
@@ -137,9 +137,16 @@ def check(pools: Iterable[Mapping[str, Any]], *, sq: Any, cw: Any) -> list[Quota
                 kind=kind,
                 quota=quota,
                 used=vcpu_usage(cw, usage_class),
-                worst_case=sum(int(p["max_workers"]) * int(p["vcpu_max"]) for p in ps),
+                worst_case=sum(_max_vcpus(p) for p in ps),
                 minimums={str(p["name"]): int(p["vcpu_min"]) for p in ps},
                 note=note,
             )
         )
     return out
+
+
+def _max_vcpus(p: Mapping[str, Any]) -> int:
+    """A pool's vCPU ceiling (v0.1 manifests count workers: each at its largest size)."""
+    if "max_vcpus" in p:
+        return int(p["max_vcpus"])
+    return int(p.get("max_workers", 0)) * int(p.get("vcpu_max", 16))

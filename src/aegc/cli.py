@@ -128,15 +128,29 @@ def _clients(sess: object) -> object:
 
 
 def parse_pool(text: str) -> dict[str, Any]:
-    """``env[:key=value,...]``, e.g. ``geospatial:max=8,vcpu=4-16,mem=8192,disk=50,on-demand``."""
+    """``env[:key=value,...]``, e.g. ``geospatial:max_vcpus=32,vcpu=4-16,mem=8192,on-demand``.
+
+    Only the options given are returned, so a redeploy keeps the rest from the last deploy.
+    ``max=``/``min=`` (workers) are the v0.1 spelling, converted to vCPUs by the caller.
+    """
     env, _, opts = text.partition(":")
     out: dict[str, Any] = {"env": env}
     for opt in filter(None, opts.split(",")):
         key, _, value = opt.partition("=")
-        if key == "max":
-            out["max_workers"] = int(value)
+        if key == "max_vcpus":
+            out["max_vcpus"] = int(value)
+        elif key == "min_vcpus":
+            out["min_vcpus"] = int(value)
+        elif key == "max":
+            out["_max_workers"] = int(value)
         elif key == "min":
-            out["min_workers"] = int(value)
+            out["_min_workers"] = int(value)
+        elif key == "walltime":
+            out["walltime_s"] = int(value)
+        elif key == "max_walltime":
+            out["max_walltime_s"] = int(value)
+        elif key == "lifetime":
+            out["max_lifetime_s"] = int(value)
         elif key == "vcpu":
             lo, _, hi = value.partition("-")
             out["vcpu_min"] = int(lo)
@@ -161,11 +175,19 @@ def parse_pool(text: str) -> dict[str, Any]:
 def _deploy(args: argparse.Namespace) -> int:
     from dataclasses import asdict
 
-    from aegc import awsutil, images, naming
+    from aegc import awsutil, images, naming, state
+    from aegc.awsutil import is_not_found
     from aegc.infra import deployment
 
     sess, region, account = _ctx(args)
     ssm = awsutil.client(sess, "ssm")  # type: ignore[arg-type]
+    try:
+        prev = deployment.read_manifest(ssm, args.deployment)
+    except Exception as e:
+        if not is_not_found(e):
+            raise
+        prev = {}
+    prev_pools: dict[str, dict[str, Any]] = prev.get("pools", {})
     pools = []
     for text in args.pool:
         opts = parse_pool(text)
@@ -177,22 +199,163 @@ def _deploy(args: argparse.Namespace) -> int:
                 f"aegc: no image recorded for env {env!r}; run `aegc image build --env {env} ...`"
             ) from None
         name = f"{env}-py{rec.python_minor.replace('.', '')}"
-        pools.append(
-            deployment.PoolSpec(
-                name=name, env=env, python_minor=rec.python_minor, image=rec.image, **opts
-            )
+        base: dict[str, Any] = {}
+        if name in prev_pools:  # a redeploy keeps the options it isn't given (#30)
+            base = asdict(deployment.PoolSpec.from_manifest(name, prev_pools[name]))
+        vcpu_min = int(opts.get("vcpu_min", base.get("vcpu_min", 2)))
+        for legacy, field_ in (("_max_workers", "max_vcpus"), ("_min_workers", "min_vcpus")):
+            if legacy in opts:
+                n = opts.pop(legacy)
+                opts.setdefault(field_, n * vcpu_min)
+                print(
+                    f"warning: {'max' if 'max' in legacy else 'min'}={n} counts workers; "
+                    f"pools are sized in vCPUs now: using {field_}={n * vcpu_min} "
+                    f"({n} x vcpu={vcpu_min})",
+                    file=sys.stderr,
+                )
+        kw = {**base, **opts, "name": name, "env": env, "python_minor": rec.python_minor}
+        kw["image"] = rec.image
+        pools.append(deployment.PoolSpec(**kw))
+    named = {p.name for p in pools}
+    omitted = sorted(n for n in prev_pools if n not in named)
+    if omitted and not args.prune:
+        print(
+            f"warning: keeping pool(s) not listed here: {', '.join(omitted)} "
+            "(pass --prune to remove them)",
+            file=sys.stderr,
         )
+        pools += [deployment.PoolSpec.from_manifest(n, prev_pools[n]) for n in omitted]
+    limits = state.Limits.from_dict(prev.get("limits")).merged(
+        max_usd_day=args.max_usd_day,
+        max_usd_month=args.max_usd_month,
+        max_instance_hours_day=args.max_instance_hours_day,
+        on_cap=args.on_cap,
+    )
     spec = deployment.DeploymentSpec(
         deployment=args.deployment,
         account=account,
         region=region,
         bucket=naming.bucket_name(account, region),
         pools=tuple(pools),
+        limits=limits.to_dict(),
     )
     errors = _quota_preflight(sess, [asdict(p) for p in pools])
     if errors and not args.dry_run:
         raise SystemExit("aegc: " + "\naegc: ".join(errors))
-    print(deployment.deploy(_clients(sess), spec, dry_run=args.dry_run))  # type: ignore[arg-type]
+    if not limits.any:
+        print(
+            "note: no spend limits; set one with --max-usd-day / --max-usd-month",
+            file=sys.stderr,
+        )
+    c = _clients(sess)
+    report = deployment.deploy(c, spec, dry_run=args.dry_run)  # type: ignore[arg-type]
+    if omitted and args.prune:
+        for n in omitted:
+            deployment.prune_pool(
+                c,  # type: ignore[arg-type]
+                args.deployment,
+                n,
+                prev_pools[n],
+                report,
+                dry_run=args.dry_run,
+                force=args.force,
+            )
+    print(report)
+    return 0
+
+
+def _limit_value(text: str) -> Any:
+    return "none" if text == "none" else float(text)
+
+
+def _limit_args(p: argparse.ArgumentParser) -> None:
+    for flag, what in (
+        ("--max-usd-day", "estimated $ per UTC day"),
+        ("--max-usd-month", "estimated $ per UTC month"),
+        ("--max-instance-hours-day", "instance-hours per UTC day"),
+    ):
+        p.add_argument(flag, type=_limit_value, metavar="N|none", help=f"cap on {what}")
+    p.add_argument(
+        "--on-cap", choices=["fail", "kill"],
+        help="when a cap trips, let running tasks finish (fail, the default) or fail them (kill)",
+    )  # fmt: skip
+
+
+def _stop(args: argparse.Namespace) -> int:
+    from aegc import awsutil, control
+
+    sess, _, _ = _ctx(args)
+    if args.hard and not args.yes:
+        raise SystemExit("aegc: --hard fails running tasks; add --yes to confirm")
+    print(
+        control.stop(
+            ssm=awsutil.client(sess, "ssm"),  # type: ignore[arg-type]
+            autoscaling=awsutil.client(sess, "autoscaling"),  # type: ignore[arg-type]
+            deployment=args.deployment,
+            hard=args.hard,
+        )
+    )
+    return 0
+
+
+def _resume(args: argparse.Namespace) -> int:
+    from aegc import awsutil, control
+
+    sess, _, _ = _ctx(args)
+    print(
+        control.resume(
+            ssm=awsutil.client(sess, "ssm"),  # type: ignore[arg-type]
+            autoscaling=awsutil.client(sess, "autoscaling"),  # type: ignore[arg-type]
+            deployment=args.deployment,
+        )
+    )
+    return 0
+
+
+def _limits(args: argparse.Namespace) -> int:
+    from aegc import awsutil, control
+
+    sess, _, _ = _ctx(args)
+    print(
+        control.set_limits(
+            ssm=awsutil.client(sess, "ssm"),  # type: ignore[arg-type]
+            autoscaling=awsutil.client(sess, "autoscaling"),  # type: ignore[arg-type]
+            deployment=args.deployment,
+            resume_now=args.resume,
+            max_usd_day=args.max_usd_day,
+            max_usd_month=args.max_usd_month,
+            max_instance_hours_day=args.max_instance_hours_day,
+            on_cap=args.on_cap,
+        )
+    )
+    return 0
+
+
+def _cost(args: argparse.Namespace) -> int:
+    from aegc import awsutil, control, naming, pricing
+
+    sess, region, account = _ctx(args)
+    prices = pricing.Prices(
+        region=region,
+        ec2=awsutil.client(sess, "ec2"),  # type: ignore[arg-type]
+        pricing=awsutil.client(awsutil.session(args.profile, "us-east-1"), "pricing"),
+    )
+    report = control.cost(
+        s3=awsutil.client(sess, "s3"),  # type: ignore[arg-type]
+        bucket=naming.bucket_name(account, region),
+        deployment=args.deployment,
+        prices=prices,
+        since=args.since,
+        by=args.by,
+    )
+    if args.actual:
+        report.actual = control.actual_cost(
+            awsutil.client(awsutil.session(args.profile, "us-east-1"), "ce"),
+            args.deployment,
+            report.start,
+            report.end,
+        )
+    print(report.render())
     return 0
 
 
@@ -342,12 +505,46 @@ def build_parser() -> argparse.ArgumentParser:
     dp.add_argument("deployment")
     dp.add_argument(
         "--pool", action="append", required=True,
-        help="env[:max=N,min=N,vcpu=LO-HI,mem=MiB,slots=N|auto,idle=S,disk=GiB,"
-        "throughput=MiBps,on-demand]; repeatable. disk: root gp3 GiB (30-16384, default 30); "
-        "throughput: its MiB/s (125-1000, default 125)",
+        help="env[:max_vcpus=N,min_vcpus=N,vcpu=LO-HI,mem=MiB,slots=N|auto,idle=S,disk=GiB,"
+        "throughput=MiBps,walltime=S,max_walltime=S,lifetime=S,on-demand]; repeatable. "
+        "max_vcpus caps the pool (default 8); vcpu is each worker's size range (default 2-16); "
+        "disk: root gp3 GiB (30-16384, default 30); throughput: its MiB/s (125-1000, default "
+        "125). On a redeploy, options not given keep their last values.",
     )  # fmt: skip
+    _limit_args(dp)
+    dp.add_argument("--prune", action="store_true", help="remove pools not listed (dry run first)")
+    dp.add_argument("--force", action="store_true", help="--prune even with tasks queued")
     dp.add_argument("--dry-run", action="store_true")
     dp.set_defaults(func=_deploy)
+
+    sp = sub.add_parser("stop", help="stop a deployment's spending now (kill switch)")
+    sp.add_argument("deployment")
+    sp.add_argument(
+        "--hard", action="store_true",
+        help="also fail running tasks and terminate workers after 2 minutes (needs --yes)",
+    )  # fmt: skip
+    sp.add_argument("--yes", action="store_true")
+    sp.set_defaults(func=_stop)
+
+    rs = sub.add_parser("resume", help="resume a stopped, capped or expired deployment")
+    rs.add_argument("deployment")
+    rs.set_defaults(func=_resume)
+
+    lm = sub.add_parser("limits", help="show or change a deployment's spend limits")
+    lm.add_argument("deployment")
+    _limit_args(lm)
+    lm.add_argument("--resume", action="store_true", help="also end a capped state now")
+    lm.set_defaults(func=_limits)
+
+    co = sub.add_parser("cost", help="estimated spend from the cost ledger")
+    co.add_argument("deployment")
+    co.add_argument("--since", default="today", help="today (default), month, or e.g. 24h, 7d")
+    co.add_argument("--by", choices=["pool", "type"], default="pool")
+    co.add_argument(
+        "--actual", action="store_true",
+        help="also ask Cost Explorer (costs $0.01; needs the aegc:deployment tag active)",
+    )  # fmt: skip
+    co.set_defaults(func=_cost)
 
     ds = sub.add_parser("destroy", help="delete a deployment (dry run by default)")
     ds.add_argument("deployment")

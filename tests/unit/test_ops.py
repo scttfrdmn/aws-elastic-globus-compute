@@ -14,11 +14,14 @@ from tests.unit.test_deployment import POOL
 def test_parse_pool() -> None:
     assert cli.parse_pool("geospatial") == {"env": "geospatial"}
     assert cli.parse_pool("climate:max=8,vcpu=4-16,mem=8192,slots=2,on-demand,idle=120") == {
-        "env": "climate", "max_workers": 8, "vcpu_min": 4, "vcpu_max": 16,
+        "env": "climate", "_max_workers": 8, "vcpu_min": 4, "vcpu_max": 16,
         "memory_mib_min": 8192, "slots": "2", "spot": False, "idle_timeout_s": 120,
     }  # fmt: skip
     assert cli.parse_pool("x:disk=50,throughput=250") == {
         "env": "x", "root_volume_gib": 50, "throughput_mibps": 250,
+    }  # fmt: skip
+    assert cli.parse_pool("x:max_vcpus=64,min_vcpus=4,walltime=600,max_walltime=3600") == {
+        "env": "x", "max_vcpus": 64, "min_vcpus": 4, "walltime_s": 600, "max_walltime_s": 3600,
     }  # fmt: skip
     with pytest.raises(SystemExit):
         cli.parse_pool("x:gpu=1")

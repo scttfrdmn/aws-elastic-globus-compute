@@ -711,9 +711,14 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         pools: dict[str, dict[str, Any]] = self._manifest.get("pools", {})
         groups: dict[str, dict[str, Any]] = {}
         for name, pool in pools.items():
-            m = _PoolMetrics(
-                min=int(pool.get("min_workers", 0)), max=int(pool.get("max_workers", 0))
-            )
+            if _vcpu_mode(pool):
+                m = _PoolMetrics(
+                    min=int(pool.get("min_vcpus", 0)), max=int(pool.get("max_vcpus", 0))
+                )
+            else:  # a v0.1 deployment: capacity in workers
+                m = _PoolMetrics(
+                    min=int(pool.get("min_workers", 0)), max=int(pool.get("max_workers", 0))
+                )
             m.slots = _slots(pool)
             a = sqs.get_queue_attributes(
                 QueueUrl=pool["task_queue_url"],
@@ -756,13 +761,15 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         for name, pool in pools.items():
             m = snap.pools[name]
             demand = max(outstanding.get(name, 0), m.visible + m.inflight)
-            target = min(max(math.ceil(demand / m.slots), m.min), m.max)
+            target = min(max(_capacity_for(pool, demand), m.min), m.max)
             m.stalled = self._stalled(name, m, demand, now)
             self._starvation(name, pool, m, demand, now, groups.get(name))
             if not self._state.running or target <= m.desired or m.stalled or name not in groups:
                 continue
             if limits.any and self._spend is not None:
-                unit_cost = self._unit_cost(pool)
+                worker_cost = self._unit_cost(pool)
+                per_worker = int(pool.get("vcpu_min", 2)) if _vcpu_mode(pool) else 1
+                unit_cost = worker_cost / per_worker
                 allowed = self._spend.admit(
                     limits,
                     now,
@@ -770,8 +777,10 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
                     instances_now=instances_now,
                     want_units=target - m.desired,
                     unit_usd_per_hour=unit_cost,
-                    unit_instances=1.0,
+                    unit_instances=1.0 / per_worker,
                 )
+                # Whole workers only: Auto Scaling rounds a vCPU target up to an instance.
+                allowed -= allowed % per_worker
                 m.admitted = allowed
                 if allowed < target - m.desired:
                     log.warning(
@@ -782,7 +791,7 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
                     )
                 target = m.desired + allowed
                 rate_now += allowed * unit_cost
-                instances_now += allowed
+                instances_now += allowed / per_worker
                 if target <= m.desired:
                     continue
             try:
@@ -974,6 +983,24 @@ def _families(pool: dict[str, Any]) -> list[str]:
 
 def _cheapest_guess(pool: dict[str, Any]) -> str:
     return f"{_families(pool)[0]}.large"
+
+
+def _vcpu_mode(pool: dict[str, Any]) -> bool:
+    return pool.get("capacity_type") == "vcpu"
+
+
+def _capacity_for(pool: dict[str, Any], demand: int) -> int:
+    """Capacity units (vCPUs, or workers for a v0.1 pool) that run ``demand`` tasks at once.
+
+    ``slots=auto`` runs one task per vCPU, so demand is vCPUs. Fixed ``slots=N`` runs N tasks per
+    worker of at least ``vcpu_min`` vCPUs.
+    """
+    if not _vcpu_mode(pool):
+        return math.ceil(demand / _slots(pool))
+    slots = str(pool.get("slots", "auto"))
+    if slots == "auto":
+        return demand
+    return math.ceil(demand / max(1, int(slots))) * int(pool.get("vcpu_min", 2))
 
 
 def _slots(pool: dict[str, Any]) -> int:
