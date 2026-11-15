@@ -51,6 +51,22 @@ class Imds:
                 return None
             raise
 
+    def identity(self) -> dict[str, str]:
+        """Instance type, AZ and lifecycle ("spot" or "on-demand") for the cost ledger."""
+        out = {}
+        for key, path in (
+            ("instance_type", "instance-type"),
+            ("availability_zone", "placement/availability-zone"),
+            ("lifecycle", "instance-life-cycle"),
+        ):
+            try:
+                v = self.get(path)
+            except Exception:
+                v = None
+            if v:
+                out[key] = v.strip()
+        return out
+
     def notice(self) -> Notice | None:
         if self.get("spot/instance-action") is not None:
             return "interruption"
@@ -64,6 +80,9 @@ class Imds:
 
 class NoMetadata:
     """For running outside EC2 (tests, local runs)."""
+
+    def identity(self) -> dict[str, str]:
+        return {}
 
     def notice(self) -> Notice | None:
         return None

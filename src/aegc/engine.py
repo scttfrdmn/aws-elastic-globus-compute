@@ -35,7 +35,10 @@ from globus_compute_endpoint.engines.base import GlobusComputeEngineBase
 
 from aegc import __version__, awsutil, naming, payloads, protocol
 from aegc.gcresult import failed_result
+from aegc.pricing import IPV4_HOUR, Prices, volume_hour
 from aegc.protocol import Call, ProtocolError, ResultMessage, TaskMessage
+from aegc.spend import SpendGuard, Trip
+from aegc.state import Limits, State, read_state, write_state
 
 log = logging.getLogger("aegc.engine")
 
@@ -44,6 +47,9 @@ RESOURCE_KEYS = frozenset({"env", "pool", "walltime_s"})
 COMPLETED_LRU = 10_000
 STALL_AFTER_S = 15 * 60
 STALL_PAUSE_S = 10 * 60
+#: Re-read the deployment state and manifest this often (scaler thread).
+STATE_TTL_S = 30.0
+MANIFEST_TTL_S = 60.0
 
 
 class WorkerSystemFailure(RuntimeError):
@@ -62,6 +68,7 @@ class _Inflight:
     pool: str
     submitted: float
     task_payload: protocol.Payload | None = None
+    started: bool = False  # a worker posted "started"
 
 
 @dataclass
@@ -76,6 +83,7 @@ class _PoolMetrics:
     slots: int = 1
     stalled: bool = False
     last_scaling_error: str = ""
+    admitted: int | None = None  # capped by spend admission this pass (None: not limited)
 
 
 @dataclass
@@ -83,6 +91,10 @@ class _Snapshot:
     at: float = 0.0
     pools: dict[str, _PoolMetrics] = field(default_factory=dict)
     last_aws_error: str = ""
+    state: str = "running"
+    usd_per_hour: float = 0.0
+    spend_today: float | None = None
+    spend_month: float | None = None
 
 
 class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
@@ -101,6 +113,7 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         inline_limit_bytes: int = protocol.DEFAULT_INLINE_LIMIT,
         label: str = "AWSEngine",
         max_retries_on_system_failure: int = 1,
+        stall_fail_s: float = 3600.0,
         **kwargs: Any,
     ) -> None:
         # Every argument is stored under its own name: RepresentationMixin requires it.
@@ -113,6 +126,7 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         self.result_wait_s = result_wait_s
         self.inline_limit_bytes = inline_limit_bytes
         self.label = label
+        self.stall_fail_s = stall_fail_s
         super().__init__(
             *args, max_retries_on_system_failure=max_retries_on_system_failure, **kwargs
         )
@@ -132,6 +146,11 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         self._result_queue_touched = 0.0
         self._stalled_since: dict[str, float] = {}
         self._paused_until: dict[str, float] = {}
+        self._starved_since: dict[str, float] = {}
+        self._state = State()
+        self._state_read = -math.inf
+        self._manifest_read = -math.inf
+        self._spend: SpendGuard | None = None
         self.run_dir = ""
         self._clients: dict[str, Any] = {}
 
@@ -151,12 +170,27 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         try:
             sess = awsutil.session(self.aws_profile, self.region)
             self.region = self.region or (sess.region_name or "")
-            for svc in ("sqs", "s3", "ssm", "autoscaling"):
+            for svc in ("sqs", "s3", "ssm", "autoscaling", "ec2"):
                 if svc not in self._clients:  # tests inject clients before start()
                     self._clients[svc] = awsutil.client(sess, svc)
+            if "pricing" not in self._clients:  # the Price List API lives in us-east-1
+                self._clients["pricing"] = awsutil.client(
+                    awsutil.session(self.aws_profile, "us-east-1"), "pricing"
+                )
             self._load_manifest()
             if self._manifest is not None:
                 self._ensure_result_queue()
+                self._spend = SpendGuard(
+                    s3=self._clients["s3"],
+                    bucket=str(self._manifest["bucket"]),
+                    deployment=self.deployment,
+                    prices=Prices(
+                        region=self.region,
+                        ec2=self._clients["ec2"],
+                        pricing=self._clients["pricing"],
+                    ),
+                )
+                self.refresh_state()
         except Exception as e:  # start must not raise; tasks report the problem instead
             self._config_error = f"AWS setup failed: {e}"
             log.exception("AWSEngine couldn't initialise")
@@ -222,6 +256,10 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
                 "metrics_age_s": round(time.time() - snap.at, 1) if snap.at else None,
                 "last_aws_error": snap.last_aws_error,
                 "config_error": self._config_error,
+                "deployment_state": self._state.mode,
+                "usd_per_hour": round(snap.usd_per_hour, 4),
+                "spend_today_usd": snap.spend_today,
+                "spend_month_usd": snap.spend_month,
             }
         except Exception as e:  # never let a status report take the endpoint down
             state = {"engine_type": "AWSEngine", "status_error": str(e)}
@@ -245,6 +283,11 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
             attempt = self._attempts[task_uuid]
         etid = protocol.executor_task_id(task_uuid, attempt)
 
+        st = self._state
+        if not st.running:
+            return _resolved(
+                etid, failed_result(task_uuid, st.failure_code, st.explain(self.deployment))
+            )
         pool, walltime, problem = self._resolve(resource_specification or {})
         if problem:
             return _resolved(etid, failed_result(task_uuid, "AEGC_CONFIGURATION", problem))
@@ -330,39 +373,39 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
                     f"AWSEngine accepts {sorted(RESOURCE_KEYS)}"
                 ),
             )
-        try:
-            walltime = int(spec.get("walltime_s", protocol.DEFAULT_WALLTIME_S))
-        except (TypeError, ValueError):
-            return None, 0, "walltime_s must be an integer number of seconds"
-        if not 1 <= walltime <= protocol.MAX_WALLTIME_S:
-            return None, 0, f"walltime_s must be between 1 and {protocol.MAX_WALLTIME_S}"
         pools: dict[str, dict[str, Any]] = self._manifest.get("pools", {})
         if "pool" in spec:
             name = str(spec["pool"])
             if name not in pools:
                 return None, 0, f"no pool {name!r} in deployment {self.deployment!r}"
-            return name, walltime, self._python_check(name, pools[name])
+            walltime, problem = _walltime(spec, pools[name])
+            return name, walltime, problem or self._python_check(name, pools[name])
+        picked, problem = self._pick_pool(spec, pools)
+        if picked is None:
+            return None, 0, problem
+        walltime, problem = _walltime(spec, pools[picked])
+        return (None, 0, problem) if problem else (picked, walltime, "")
+
+    def _pick_pool(
+        self, spec: dict[str, Any], pools: dict[str, dict[str, Any]]
+    ) -> tuple[str | None, str]:
         env = str(spec.get("env") or self.env)
         candidates = {n: p for n, p in pools.items() if not env or p.get("env") == env}
         if not candidates:
             have = sorted({str(p.get("env")) for p in pools.values()})
-            return None, 0, f"no pool for env {env!r} in {self.deployment!r}; envs: {have}"
+            return None, f"no pool for env {env!r} in {self.deployment!r}; envs: {have}"
         if self.python_minor:
             matching = [
                 n for n, p in candidates.items() if p.get("python_minor") == self.python_minor
             ]
             if not matching:
                 have = sorted(f"{p.get('python_minor')} ({n})" for n, p in candidates.items())
-                return (
-                    None,
-                    0,
-                    (
-                        f"no worker image for Python {self.python_minor} in env {env!r}; "
-                        f"available: {', '.join(have)}. Submit from a matching Python version."
-                    ),
+                return None, (
+                    f"no worker image for Python {self.python_minor} in env {env!r}; "
+                    f"available: {', '.join(have)}. Submit from a matching Python version."
                 )
-            return sorted(matching)[0], walltime, ""
-        return sorted(candidates)[0], walltime, ""
+            return sorted(matching)[0], ""
+        return sorted(candidates)[0], ""
 
     def _python_check(self, name: str, pool: dict[str, Any]) -> str:
         if self.python_minor and pool.get("python_minor") != self.python_minor:
@@ -440,6 +483,10 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
             return
         etid = msg.executor_task_id
         if msg.kind == "started":
+            with self._lock:
+                started = self._inflight.get(etid)
+                if started is not None:
+                    started.started = True
             self.set_tasks_placement(
                 [etid], block_id=msg.worker.get("pool"), job_id=msg.worker.get("instance_id")
             )
@@ -528,6 +575,8 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
             try:
                 if self._result_queue_url and time.time() - self._result_queue_touched > 86400:
                     self._ensure_result_queue()  # daily keep-alive for `aegc reap`
+                self.refresh_manifest()
+                self.refresh_state()
                 self.scale_once()
             except Exception as e:
                 self._snapshot.last_aws_error = str(e)
@@ -536,16 +585,132 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
             self._scale_now.wait(self.scale_interval_s)
             self._scale_now.clear()
 
+    # --- deployment state and manifest ------------------------------------------------------
+
+    def refresh_state(self, now: float | None = None, *, force: bool = False) -> State:
+        """Re-read ``/aegc/<d>/state`` (at most every STATE_TTL_S); act on a change."""
+        now = time.time() if now is None else now
+        if not force and now - self._state_read < STATE_TTL_S:
+            return self._state
+        try:
+            st = read_state(self._clients["ssm"], self.deployment, now=now)
+        except Exception as e:
+            log.warning("couldn't read the deployment state: %s", e)
+            return self._state
+        self._state_read = now
+        self._set_state(st)
+        return st
+
+    def _set_state(self, st: State) -> None:
+        before, self._state = self._state, st
+        if st.running:
+            if not before.running:
+                log.info("deployment %s is running again", self.deployment)
+            return
+        if before.running or before.mode != st.mode or (st.kill and not before.kill):
+            log.warning("deployment %s is %s: %s", self.deployment, st.mode, st.reason)
+            self.fail_owned(st.failure_code, st.explain(self.deployment), include_started=st.kill)
+
+    def refresh_manifest(self, now: float | None = None) -> bool:
+        """Reload the manifest if a redeploy changed it (at most every MANIFEST_TTL_S)."""
+        from aegc.infra.deployment import read_manifest
+
+        now = time.time() if now is None else now
+        if now - self._manifest_read < MANIFEST_TTL_S or self._manifest is None:
+            return False
+        self._manifest_read = now
+        try:
+            fresh = read_manifest(self._clients["ssm"], self.deployment)
+        except Exception as e:
+            log.warning("couldn't re-read the manifest: %s", e)
+            return False
+        if fresh.get("generation") == self._manifest.get("generation"):
+            return False
+        log.info(
+            "deployment %s redeployed (generation %s -> %s): pools %s",
+            self.deployment,
+            self._manifest.get("generation"),
+            fresh.get("generation"),
+            sorted(fresh.get("pools", {})),
+        )
+        self._manifest = fresh
+        return True
+
+    # --- failing what this process owns -------------------------------------------------
+
+    def fail_owned(
+        self, code: str, message: str, *, pool: str | None = None, include_started: bool = False
+    ) -> int:
+        """Fail this process's queued tasks (and running ones if ``include_started``) with a
+        clear, final result, and remove their messages from the task queues."""
+        with self._lock:
+            doomed = [
+                (etid, e)
+                for etid, e in self._inflight.items()
+                if (pool is None or e.pool == pool) and (include_started or not e.started)
+            ]
+            for etid, e in doomed:
+                self._inflight.pop(etid, None)
+                self._remember(e.task_uuid)
+        for _, e in doomed:
+            if not e.future.done():
+                e.future.set_result(failed_result(e.task_uuid, code, message))
+        if doomed:
+            log.warning("failed %d task(s): %s", len(doomed), code)
+            uuids = {e.task_uuid for _, e in doomed}
+            for name in sorted({e.pool for _, e in doomed}):
+                self._purge(name, uuids)
+        return len(doomed)
+
+    def _purge(self, pool_name: str, uuids: set[str]) -> None:
+        """Delete this process's messages for ``uuids`` from a pool's task queue; leave others."""
+        if self._manifest is None or pool_name not in self._manifest.get("pools", {}):
+            return
+        sqs, url = self._clients["sqs"], self._pool(pool_name)["task_queue_url"]
+        remaining = set(uuids)
+        for _ in range(20):
+            if not remaining:
+                break
+            try:
+                msgs = sqs.receive_message(
+                    QueueUrl=url, MaxNumberOfMessages=10, WaitTimeSeconds=0, VisibilityTimeout=30
+                ).get("Messages", [])
+            except Exception as e:
+                log.warning("couldn't purge %s: %s", pool_name, e)
+                return
+            if not msgs:
+                break
+            for m in msgs:
+                try:
+                    tm = TaskMessage.decode(m["Body"])
+                    mine = tm.reply_to == self._result_queue_url and tm.task_uuid in remaining
+                except ProtocolError:
+                    mine = False
+                try:
+                    if mine:
+                        sqs.delete_message(QueueUrl=url, ReceiptHandle=m["ReceiptHandle"])
+                        remaining.discard(tm.task_uuid)
+                    else:
+                        sqs.change_message_visibility(
+                            QueueUrl=url, ReceiptHandle=m["ReceiptHandle"], VisibilityTimeout=0
+                        )
+                except Exception as e:
+                    log.warning("purge %s: %s", pool_name, e)
+
+    # --- scaling ---------------------------------------------------------------------------
+
     def scale_once(self, now: float | None = None) -> _Snapshot:
-        """Refresh metrics and scale out each pool to its demand. Returns the new snapshot."""
+        """Refresh metrics and scale out each pool to its demand, within the spend limits."""
         now = time.time() if now is None else now
         if self._manifest is None:
             return self._snapshot
         with self._lock:
             outstanding = collections.Counter(e.pool for e in self._inflight.values())
         sqs, asg = self._clients["sqs"], self._clients["autoscaling"]
-        snap = _Snapshot(at=now)
-        for name, pool in self._manifest.get("pools", {}).items():
+        snap = _Snapshot(at=now, state=self._state.mode)
+        pools: dict[str, dict[str, Any]] = self._manifest.get("pools", {})
+        groups: dict[str, dict[str, Any]] = {}
+        for name, pool in pools.items():
             m = _PoolMetrics(
                 min=int(pool.get("min_workers", 0)), max=int(pool.get("max_workers", 0))
             )
@@ -559,35 +724,205 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
             )["Attributes"]
             m.visible = int(a.get("ApproximateNumberOfMessages", 0))
             m.inflight = int(a.get("ApproximateNumberOfMessagesNotVisible", 0))
-            groups = asg.describe_auto_scaling_groups(
+            found = asg.describe_auto_scaling_groups(
                 AutoScalingGroupNames=[pool["auto_scaling_group"]]
             )["AutoScalingGroups"]
-            if groups:
-                g = groups[0]
-                m.desired = int(g.get("DesiredCapacity", 0))
+            if found:
+                groups[name] = found[0]
+                m.desired = int(found[0].get("DesiredCapacity", 0))
                 m.in_service = sum(
-                    1 for i in g.get("Instances", []) if i.get("LifecycleState") == "InService"
+                    1
+                    for i in found[0].get("Instances", [])
+                    if i.get("LifecycleState") == "InService"
                 )
+            snap.pools[name] = m
+
+        limits = Limits.from_dict(self._manifest.get("limits"))
+        rate_now, instances_now = self._current_rate(pools, groups)
+        snap.usd_per_hour = rate_now
+        if limits.any and self._spend is not None and self._state.running:
+            try:
+                snap.spend_today = round(self._spend.accrued("day", now).usd, 4)
+                snap.spend_month = round(self._spend.accrued("month", now).usd, 4)
+                trip = self._spend.check(limits, now)
+            except Exception as e:
+                trip = None
+                snap.last_aws_error = f"spend check failed: {e}"
+                log.warning("spend check failed: %s", e)
+            if trip is not None:
+                self._trip(trip, pools, groups, limits)
+                snap.state = self._state.mode
+
+        for name, pool in pools.items():
+            m = snap.pools[name]
             demand = max(outstanding.get(name, 0), m.visible + m.inflight)
             target = min(max(math.ceil(demand / m.slots), m.min), m.max)
             m.stalled = self._stalled(name, m, demand, now)
-            if target > m.desired and not m.stalled and groups:
-                try:
-                    asg.set_desired_capacity(
-                        AutoScalingGroupName=pool["auto_scaling_group"],
-                        DesiredCapacity=target,
-                        HonorCooldown=False,
+            self._starvation(name, pool, m, demand, now, groups.get(name))
+            if not self._state.running or target <= m.desired or m.stalled or name not in groups:
+                continue
+            if limits.any and self._spend is not None:
+                unit_cost = self._unit_cost(pool)
+                allowed = self._spend.admit(
+                    limits,
+                    now,
+                    rate_now=rate_now,
+                    instances_now=instances_now,
+                    want_units=target - m.desired,
+                    unit_usd_per_hour=unit_cost,
+                    unit_instances=1.0,
+                )
+                m.admitted = allowed
+                if allowed < target - m.desired:
+                    log.warning(
+                        "pool %s: spend limits admit %d of %d more worker(s)",
+                        name,
+                        allowed,
+                        target - m.desired,
                     )
-                    log.info(
-                        "pool %s: scaling out %d -> %d (demand %d)", name, m.desired, target, demand
-                    )
-                    m.desired = target
-                except Exception as e:
-                    m.last_scaling_error = str(e)
-                    log.warning("pool %s: scale-out failed: %s", name, e)
-            snap.pools[name] = m
+                target = m.desired + allowed
+                rate_now += allowed * unit_cost
+                instances_now += allowed
+                if target <= m.desired:
+                    continue
+            try:
+                asg.set_desired_capacity(
+                    AutoScalingGroupName=pool["auto_scaling_group"],
+                    DesiredCapacity=target,
+                    HonorCooldown=False,
+                )
+                log.info(
+                    "pool %s: scaling out %d -> %d (demand %d)", name, m.desired, target, demand
+                )
+                m.desired = target
+            except Exception as e:
+                m.last_scaling_error = str(e)
+                log.warning("pool %s: scale-out failed: %s", name, e)
         self._snapshot = snap
         return snap
+
+    def _current_rate(
+        self, pools: dict[str, dict[str, Any]], groups: dict[str, dict[str, Any]]
+    ) -> tuple[float, float]:
+        """($/h, instances) of the deployment's running workers."""
+        if self._spend is None:
+            return 0.0, 0.0
+        rate = n = 0.0
+        for name, g in groups.items():
+            pool = pools[name]
+            for i in g.get("Instances", []):
+                if i.get("LifecycleState") not in ("InService", "Pending", "Pending:Wait"):
+                    continue
+                r = self._spend.prices.rate(
+                    str(i.get("InstanceType") or _cheapest_guess(pool)),
+                    str(i.get("AvailabilityZone", "")),
+                    "spot" if pool.get("spot", True) else "on-demand",
+                    root_gib=int(pool.get("root_volume_gib", 30)),
+                    throughput_mibps=int(pool.get("throughput_mibps", 125)),
+                )
+                rate += r.usd_per_hour
+                n += 1
+        return rate, n
+
+    def _unit_cost(self, pool: dict[str, Any]) -> float:
+        """$/h of one more worker, erring high: the priciest allowed family at the pool's
+        smallest size, plus volume and IPv4."""
+        assert self._spend is not None
+        families = _families(pool)
+        per_vcpu = self._spend.prices.max_spot_per_vcpu(
+            [f"{f}.large" for f in families] if pool.get("spot", True) else [],
+        )
+        if not pool.get("spot", True):
+            per_vcpu = max(
+                (self._spend.prices.on_demand(f"{f}.large")[0] / 2 for f in families),
+                default=per_vcpu,
+            )
+        vcpus = int(pool.get("vcpu_min", 2))
+        return (
+            per_vcpu * vcpus
+            + volume_hour(
+                int(pool.get("root_volume_gib", 30)), int(pool.get("throughput_mibps", 125))
+            )
+            + IPV4_HOUR
+        )
+
+    def _trip(
+        self,
+        trip: Trip,
+        pools: dict[str, dict[str, Any]],
+        groups: dict[str, dict[str, Any]],
+        limits: Limits,
+    ) -> None:
+        st = State(
+            mode="capped",
+            reason=trip.reason,
+            since=time.time(),
+            until=trip.until,
+            by="engine",
+            kill=limits.on_cap == "kill",
+        )
+        try:
+            write_state(self._clients["ssm"], self.deployment, st)
+        except Exception as e:  # still stop this process's spending
+            log.error("couldn't write the capped state: %s", e)
+        log.error("deployment %s capped: %s", self.deployment, trip.reason)
+        # Workers at the group's minimum can't leave it: drop the minimum to 0 too.
+        for name, g in groups.items():
+            if int(g.get("MinSize", 0)) > 0:
+                try:
+                    self._clients["autoscaling"].update_auto_scaling_group(
+                        AutoScalingGroupName=pools[name]["auto_scaling_group"], MinSize=0
+                    )
+                except Exception as e:
+                    log.warning("pool %s: couldn't lower the minimum: %s", name, e)
+        self._state_read = time.time()
+        self._set_state(st)
+
+    def _starvation(
+        self,
+        name: str,
+        pool: dict[str, Any],
+        m: _PoolMetrics,
+        demand: int,
+        now: float,
+        group: dict[str, Any] | None,
+    ) -> None:
+        """No capacity for ``stall_fail_s``: fail this process's queued tasks for the pool."""
+        if not (m.desired > 0 and m.in_service == 0 and demand > 0):
+            self._starved_since.pop(name, None)
+            return
+        since = self._starved_since.setdefault(name, now)
+        if m.desired > m.in_service and group is not None:
+            m.last_scaling_error = m.last_scaling_error or self._last_failure(group)
+        if now - since < self.stall_fail_s:
+            return
+        self._starved_since.pop(name, None)
+        why = m.last_scaling_error or "no instances launched"
+        self.fail_owned(
+            "AEGC_NO_CAPACITY",
+            (
+                f"pool {name!r} got no workers for {self.stall_fail_s / 60:.0f} min ({why}). "
+                "If it's the Spot vCPU quota, request more: aws service-quotas "
+                "request-service-quota-increase --service-code ec2 --quota-code L-34B43A08 "
+                "--desired-value N. Widening `vcpu=` or using `on-demand` can also help."
+            ),
+            pool=name,
+        )
+
+    def _last_failure(self, group: dict[str, Any]) -> str:
+        try:
+            acts = (
+                self._clients["autoscaling"]
+                .describe_scaling_activities(
+                    AutoScalingGroupName=group["AutoScalingGroupName"], MaxRecords=1
+                )
+                .get("Activities", [])
+            )
+        except Exception:
+            return ""
+        if acts and acts[0].get("StatusCode") in ("Failed", "Cancelled"):
+            return str(acts[0].get("StatusMessage") or acts[0].get("Description", ""))
+        return ""
 
     def _stalled(self, name: str, m: _PoolMetrics, demand: int, now: float) -> bool:
         """Circuit breaker: capacity asked for but none in service for a long time."""
@@ -610,6 +945,35 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         else:
             self._stalled_since.pop(name, None)
         return False
+
+
+def _walltime(spec: dict[str, Any], pool: dict[str, Any]) -> tuple[int, str]:
+    """(walltime_s, problem): the request's, else the pool's default; within the pool's max."""
+    default = int(pool.get("walltime_s") or protocol.DEFAULT_WALLTIME_S)
+    ceiling = min(
+        int(pool.get("max_walltime_s") or protocol.MAX_WALLTIME_S), protocol.MAX_WALLTIME_S
+    )
+    try:
+        walltime = int(spec.get("walltime_s", min(default, ceiling)))
+    except (TypeError, ValueError):
+        return 0, "walltime_s must be an integer number of seconds"
+    if not 1 <= walltime <= ceiling:
+        return 0, f"walltime_s must be between 1 and {ceiling}"
+    return walltime, ""
+
+
+def _families(pool: dict[str, Any]) -> list[str]:
+    """Instance families a pool allows (``c8g.*`` -> ``c8g``)."""
+    out = []
+    for t in pool.get("allowed_instance_types") or []:
+        fam = str(t).split(".")[0].rstrip("*")
+        if fam and fam not in out:
+            out.append(fam)
+    return out or ["m8g"]
+
+
+def _cheapest_guess(pool: dict[str, Any]) -> str:
+    return f"{_families(pool)[0]}.large"
 
 
 def _slots(pool: dict[str, Any]) -> int:

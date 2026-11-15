@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 from globus_compute_endpoint.engines.base import GCFuture
 
-from aegc import naming, protocol
+from aegc import ledger, naming, pricing, protocol, state
 from aegc.engine import STALL_AFTER_S, STALL_PAUSE_S, AWSEngine
 from aegc.infra import deployment
 from aegc.infra.deployment import Clients, DeploymentSpec, PoolSpec
@@ -93,6 +93,8 @@ class Env:
             "s3": self.s3,
             "ssm": self.ssm,
             "autoscaling": self.asg,
+            "ec2": self.aws("ec2"),
+            "pricing": self.aws("pricing"),
         }
         e.start(endpoint_id=EID, run_dir=str(self.tmp / "ep"))
         # Tests drive scale_once() with a fake clock; let the scaler's real-time first pass
@@ -426,3 +428,171 @@ def test_repr_and_ha() -> None:
     assert "deployment='dev'" in repr(e)
     with pytest.raises(ValueError, match="high-assurance"):
         e.assert_ha_compliant()
+
+
+# --- spend safety (v0.2) -------------------------------------------------------------------------
+
+NOON = 1_800_000_000 - 1_800_000_000 % 86400 + 12 * 3600  # a fixed UTC noon
+
+
+def code_of(f: GCFuture) -> str:
+    from globus_compute_common import messagepack
+
+    r = messagepack.unpack(f.result(timeout=5))
+    return str(r.error_details.code) if r.error_details else ""
+
+
+def set_limits(env: Env, e: AWSEngine, **limits: Any) -> None:
+    m = deployment.read_manifest(env.ssm, "dev")
+    m["limits"] = state.Limits(**limits).to_dict()
+    m["generation"] = deployment.manifest_generation(m)
+    env.ssm.put_parameter(
+        Name="/aegc/dev/manifest", Value=json.dumps(m), Type="String", Overwrite=True
+    )
+    e._manifest_read = -1e18
+    assert e.refresh_manifest()
+    assert e._spend is not None
+    e._spend.prices = pricing.Prices(region=REGION)  # static prices: deterministic
+
+
+def spend_record(env: Env, usd_hours: float, *, now: float = NOON) -> None:
+    """A finished c8g.large on-demand worker in today's ledger, lasting ``usd_hours`` hours."""
+    ledger.write(
+        env.s3,
+        BUCKET,
+        ledger.Record(
+            instance_id=f"i-{uuid.uuid4().hex[:8]}", deployment="dev", pool="geo-py314",
+            instance_type="c8g.large", availability_zone="us-west-2a", lifecycle="on-demand",
+            vcpus=2, launched_at=now - usd_hours * 3600, last_seen=now - 60, exit_reason="idle",
+        ),
+    )  # fmt: skip
+
+
+@pytest.mark.timeout(60)
+def test_deploy_creates_running_state(env: Env) -> None:
+    assert state.read_state(env.ssm, "dev").running
+    # A redeploy doesn't reset a non-running state.
+    state.write_state(env.ssm, "dev", state.State(mode="stopped", by="test"))
+    deployment.ensure_state(
+        Clients(iam=None, ec2=None, autoscaling=None, sqs=None, logs=None, ssm=env.ssm),
+        env.spec, deployment.Report(), dry_run=False,
+    )  # fmt: skip
+    assert state.read_state(env.ssm, "dev").mode == "stopped"
+
+
+@pytest.mark.timeout(60)
+def test_stopped_refuses_new_tasks(env: Env) -> None:
+    state.write_state(env.ssm, "dev", state.State(mode="stopped", reason="aegc stop"))
+    e = env.engine()
+    try:
+        f = submit(e, triple, 1)
+        assert code_of(f) == "AEGC_STOPPED"
+        assert "aegc resume dev" in unpack_result(f.result())[1]
+        assert queued(env) == []
+    finally:
+        e.shutdown()
+
+
+@pytest.mark.timeout(60)
+def test_halt_fails_own_queued_tasks_and_purges_only_them(env: Env) -> None:
+    e = env.engine()
+    try:
+        mine = [submit(e, triple, i) for i in range(3)]
+        env.sqs.send_message(QueueUrl=env.task_queue, MessageBody="not ours")
+        state.write_state(env.ssm, "dev", state.State(mode="expired", reason="lease"))
+        e.refresh_state(force=True)
+        assert {code_of(f) for f in mine} == {"AEGC_EXPIRED"}
+        left = env.sqs.receive_message(QueueUrl=env.task_queue, MaxNumberOfMessages=10)
+        assert [m["Body"] for m in left.get("Messages", [])] == ["not ours"]
+        # Back to running: new tasks are accepted again.
+        state.write_state(env.ssm, "dev", state.State())
+        e.refresh_state(force=True)
+        submit(e, triple, 9)
+        assert len(queued(env)) == 1
+    finally:
+        e.shutdown()
+
+
+@pytest.mark.timeout(60)
+def test_cap_trips_and_fails_queued_tasks(env: Env) -> None:
+    e = env.engine()
+    try:
+        set_limits(env, e, max_usd_day=0.05)
+        spend_record(env, 1.0)  # about $0.088 so far today
+        f = submit(e, triple, 3)
+        snap = e.scale_once(now=NOON)
+        st = state.read_state(env.ssm, "dev", now=NOON)
+        assert st.mode == "capped" and st.until == state.period_end("day", NOON)
+        assert snap.state == "capped" and env.group()["DesiredCapacity"] == 0
+        assert code_of(f) == "AEGC_BUDGET_EXCEEDED"
+        assert code_of(submit(e, triple, 4)) == "AEGC_BUDGET_EXCEEDED"
+        # The next day the cap resets.
+        assert state.read_state(env.ssm, "dev", now=NOON + 86400).running
+    finally:
+        e.shutdown()
+
+
+@pytest.mark.timeout(60)
+def test_admission_scales_out_only_what_the_cap_allows(env: Env) -> None:
+    e = env.engine()
+    try:
+        # Static prices: one more worker is about $0.137/h (priciest allowed family at 2 vCPUs,
+        # plus volume and IPv4). $0.40/day with nothing spent admits floor(0.40/1.2/0.137) = 2.
+        set_limits(env, e, max_usd_day=0.40)
+        env.demand(8)  # 8 tasks / 2 slots = 4 workers wanted
+        m = e.scale_once(now=NOON).pools["geo-py314"]
+        assert m.admitted == 2 and env.group()["DesiredCapacity"] == 2
+        assert state.read_state(env.ssm, "dev", now=NOON).running
+    finally:
+        e.shutdown()
+
+
+@pytest.mark.timeout(60)
+def test_no_capacity_fails_queued_tasks(env: Env) -> None:
+    env.seed_launch_failure("There is no Spot capacity available that matches your request.")
+    e = env.engine(stall_fail_s=600)
+    try:
+        f = submit(e, triple, 2)
+        e.scale_once(now=NOON)  # scales out to 1; no worker will come
+        e.scale_once(now=NOON + 1)  # starved from here (or earlier, if the real-time scaler ran)
+        e.scale_once(now=NOON + 602)
+        assert code_of(f) == "AEGC_NO_CAPACITY"
+        assert "L-34B43A08" in unpack_result(f.result())[1]
+        assert queued(env) == []
+    finally:
+        env.clear_launch_failure()
+        e.shutdown()
+
+
+@pytest.mark.timeout(60)
+def test_pool_walltime_default_and_ceiling(env: Env) -> None:
+    e = env.engine()
+    try:
+        assert e._manifest is not None
+        pool = e._manifest["pools"]["geo-py314"]
+        pool["walltime_s"], pool["max_walltime_s"] = 600, 1200
+        submit(e, triple, 1)
+        (msg,) = queued(env)
+        assert msg.walltime_s == 600
+        f = submit(e, triple, 1, spec={"walltime_s": 5000})
+        assert code_of(f) == "AEGC_CONFIGURATION"
+        assert "between 1 and 1200" in unpack_result(f.result())[1]
+    finally:
+        e.shutdown()
+
+
+@pytest.mark.timeout(60)
+def test_running_engine_picks_up_a_redeploy(env: Env) -> None:
+    e = env.engine()
+    try:
+        assert not e.refresh_manifest(now=time.time() + 120)  # nothing changed
+        m = deployment.read_manifest(env.ssm, "dev")
+        m["pools"]["geo-py314"]["max_workers"] = 9
+        m["generation"] = deployment.manifest_generation(m)
+        env.ssm.put_parameter(
+            Name="/aegc/dev/manifest", Value=json.dumps(m), Type="String", Overwrite=True
+        )
+        assert e.refresh_manifest(now=time.time() + 240)
+        assert e.scale_once().pools["geo-py314"].max == 9
+    finally:
+        e.shutdown()

@@ -65,6 +65,7 @@ class DeploymentSpec:
     pools: tuple[PoolSpec, ...]
     subnet_ids: tuple[str, ...] = ()  # default: the default VPC's default subnets
     extra_tags: dict[str, str] = field(default_factory=dict)
+    limits: dict[str, Any] = field(default_factory=dict)  # aegc.state.Limits.to_dict()
 
     def __post_init__(self) -> None:
         naming.validate_name("deployment", self.deployment)
@@ -335,6 +336,9 @@ def worker_config(spec: DeploymentSpec, pool: PoolSpec, task_queue_url: str) -> 
         "visibility_s": TASK_VISIBILITY_S,
         "max_deliveries": 4,
         "aegc_version": __version__,
+        "state_parameter": naming.state_parameter(spec.deployment),
+        "root_volume_gib": pool.root_volume_gib,
+        "throughput_mibps": getattr(pool, "throughput_mibps", 500),
     }
 
 
@@ -574,7 +578,7 @@ def manifest(
     sg: str,
     subnets: list[str],
 ) -> dict[str, Any]:
-    return {
+    body: dict[str, Any] = {
         "version": 1,
         "aegc_version": __version__,
         "deployment": spec.deployment,
@@ -592,7 +596,16 @@ def manifest(
             }
             for p in spec.pools
         },
+        "limits": dict(spec.limits),
     }
+    body["generation"] = manifest_generation(body)
+    return body
+
+
+def manifest_generation(body: dict[str, Any]) -> str:
+    """A short hash of the manifest's content: engines reload when it changes."""
+    content = {k: v for k, v in body.items() if k != "generation"}
+    return hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()[:12]
 
 
 def write_manifest(
@@ -678,7 +691,32 @@ def deploy(c: Clients, spec: DeploymentSpec, *, dry_run: bool = False) -> Report
         report,
         dry_run=dry_run,
     )
+    ensure_state(c, spec, report, dry_run=dry_run)
     return report
+
+
+def ensure_state(c: Clients, spec: DeploymentSpec, report: Report, *, dry_run: bool) -> None:
+    """Create the deployment state parameter as running. A redeploy never changes the state."""
+    from aegc import state
+
+    name = naming.state_parameter(spec.deployment)
+    try:
+        c.ssm.get_parameter(Name=name)
+        report.add("ssm parameter", name, "exists")
+        return
+    except Exception as e:
+        if not is_not_found(e):
+            raise
+    if dry_run:
+        report.add("ssm parameter", name, "would-create")
+        return
+    state.write_state(
+        c.ssm,
+        spec.deployment,
+        state.State(reason="deployed", since=time.time(), by="aegc deploy"),
+        extra_tags=spec.extra_tags,
+    )
+    report.add("ssm parameter", name, "created")
 
 
 # --- destroy -----------------------------------------------------------------------------------

@@ -121,6 +121,10 @@ def deployment_manifest_parameter(deployment: str) -> str:
     return f"/{PREFIX}/{deployment}/manifest"
 
 
+def state_parameter(deployment: str) -> str:
+    return f"/{PREFIX}/{deployment}/state"
+
+
 def image_parameter(env: str) -> str:
     return f"/{PREFIX}/images/{env}"
 

@@ -66,6 +66,12 @@ def test_worker_policy(aws: Callable[[str], Any]) -> None:
     term = "autoscaling:TerminateInstanceInAutoScalingGroup"
     assert decide(c, arn, term, "*", **tag("dev")) == "allowed"
     assert decide(c, arn, term, "*", **tag("prod")) != "allowed"
+    state_param = f"arn:aws:ssm:{REGION}:{ACCOUNT}:parameter/aegc/dev/state"
+    assert decide(c, arn, "ssm:GetParameter", state_param) == "allowed"
+    assert decide(c, arn, "ssm:PutParameter", state_param) != "allowed"  # workers only read it
+    ledger_key = f"arn:aws:s3:::{BUCKET}/ledger/dev/2026-11-15/i-1.json"
+    assert decide(c, arn, "s3:PutObject", ledger_key) == "allowed"
+    assert decide(c, arn, "s3:PutObject", ledger_key.replace("/dev/", "/prod/")) != "allowed"
 
 
 def test_operator_policy(aws: Callable[[str], Any]) -> None:
@@ -82,7 +88,6 @@ def test_operator_policy(aws: Callable[[str], Any]) -> None:
         assert decide(c, arn, action, res) == "allowed", (action, res)
     for action, res in [
         ("sqs:SendMessage", f"{SQS}:aegc-prod-sci-py314-tasks"),
-        ("sqs:ReceiveMessage", f"{SQS}:aegc-dev-sci-py314-tasks"),  # only workers consume tasks
         ("sqs:DeleteQueue", f"{SQS}:aegc-dev-res-1234567890ab"),
         ("ssm:GetParameter", f"arn:aws:ssm:{REGION}:{ACCOUNT}:parameter/aegc/prod/manifest"),
     ]:
@@ -90,6 +95,33 @@ def test_operator_policy(aws: Callable[[str], Any]) -> None:
     assert decide(c, arn, "autoscaling:SetDesiredCapacity", "*", **tag("dev")) == "allowed"
     assert decide(c, arn, "autoscaling:SetDesiredCapacity", "*", **tag("prod")) != "allowed"
     assert decide(c, arn, "sqs:ListQueues", "*") == "allowed"  # aegc status (#25)
+    # v0.2 spend safety: cap state, ledger, prices, own-task purge, minimum to 0.
+    state_param = f"arn:aws:ssm:{REGION}:{ACCOUNT}:parameter/aegc/dev/state"
+    assert decide(c, arn, "ssm:PutParameter", state_param) == "allowed"
+    assert (
+        decide(
+            c,
+            arn,
+            "ssm:PutParameter",
+            f"arn:aws:ssm:{REGION}:{ACCOUNT}:parameter/aegc/dev/manifest",
+        )
+        != "allowed"
+    )
+    assert (
+        decide(c, arn, "s3:GetObject", f"arn:aws:s3:::{BUCKET}/ledger/dev/2026-11-15/i-1.json")
+        == "allowed"
+    )
+    assert (
+        decide(c, arn, "s3:GetObject", f"arn:aws:s3:::{BUCKET}/ledger/prod/2026-11-15/i-1.json")
+        != "allowed"
+    )
+    assert decide(c, arn, "ec2:DescribeSpotPriceHistory", "*") == "allowed"
+    # Receiving from task queues is allowed since v0.2 so a capped or stopped endpoint can
+    # remove its own queued tasks (it deletes only messages whose reply_to is its own queue).
+    assert decide(c, arn, "sqs:ReceiveMessage", f"{SQS}:aegc-dev-geo-py314-tasks") == "allowed"
+    assert decide(c, arn, "sqs:ReceiveMessage", f"{SQS}:aegc-prod-geo-py314-tasks") != "allowed"
+    assert decide(c, arn, "autoscaling:UpdateAutoScalingGroup", "*", **tag("dev")) == "allowed"
+    assert decide(c, arn, "autoscaling:UpdateAutoScalingGroup", "*", **tag("prod")) != "allowed"
 
 
 def test_deployer_policy(aws: Callable[[str], Any]) -> None:

@@ -107,6 +107,19 @@ def worker_policy(*, deployment: str, region: str, account: str, bucket: str) ->
                 "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
                 "Resource": f"arn:aws:logs:{region}:{account}:log-group:{naming.log_group(d)}:*",
             },
+            {
+                # Stop claiming when the deployment is capped, stopped or expired.
+                "Sid": "ReadDeploymentState",
+                "Effect": "Allow",
+                "Action": "ssm:GetParameter",
+                "Resource": f"arn:aws:ssm:{region}:{account}:parameter{naming.state_parameter(d)}",
+            },
+            {
+                "Sid": "WriteCostLedger",
+                "Effect": "Allow",
+                "Action": "s3:PutObject",
+                "Resource": f"arn:aws:s3:::{bucket}/ledger/{d}/*",
+            },
         ],
     }
 
@@ -177,6 +190,53 @@ def operator_policy(*, deployment: str, region: str, account: str, bucket: str) 
                     "autoscaling:DescribeScalingActivities",
                 ],
                 "Resource": "*",
+            },
+            {
+                # Spend caps: write `capped`, read the cost ledger, price instances, and fail
+                # this endpoint's own queued tasks (purge them from the task queues).
+                "Sid": "CapState",
+                "Effect": "Allow",
+                "Action": "ssm:PutParameter",
+                "Resource": f"arn:aws:ssm:{region}:{account}:parameter{naming.state_parameter(d)}",
+            },
+            {
+                "Sid": "ReadCostLedger",
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "Resource": f"arn:aws:s3:::{bucket}/ledger/{d}/*",
+            },
+            {
+                "Sid": "ListCostLedger",
+                "Effect": "Allow",
+                "Action": "s3:ListBucket",
+                "Resource": f"arn:aws:s3:::{bucket}",
+                "Condition": {"StringLike": {"s3:prefix": f"ledger/{d}/*"}},
+            },
+            {
+                "Sid": "Prices",
+                "Effect": "Allow",
+                "Action": ["ec2:DescribeSpotPriceHistory", "pricing:GetProducts"],
+                "Resource": "*",
+            },
+            {
+                "Sid": "PurgeOwnTasks",
+                "Effect": "Allow",
+                "Action": [
+                    "sqs:ReceiveMessage",
+                    "sqs:DeleteMessage",
+                    "sqs:ChangeMessageVisibility",
+                ],
+                "Resource": f"{sqs}:{naming.PREFIX}-{d}-*-tasks",
+            },
+            {
+                # On a cap trip, drop a group's minimum to 0 so its workers can leave.
+                "Sid": "CapMinimum",
+                "Effect": "Allow",
+                "Action": "autoscaling:UpdateAutoScalingGroup",
+                "Resource": "*",
+                "Condition": {
+                    "StringEquals": {f"autoscaling:ResourceTag/{naming.TAG_DEPLOYMENT}": d}
+                },
             },
             {
                 # `aegc status` finds result queues by name prefix. ListQueues has no resource.
@@ -345,6 +405,7 @@ def deployer_policy(*, region: str, account: str) -> dict[str, Any]:
                     "autoscaling:DeleteAutoScalingGroup",
                     "autoscaling:SuspendProcesses",
                     "autoscaling:SetDesiredCapacity",
+                    "autoscaling:TerminateInstanceInAutoScalingGroup",
                 ],
                 "Resource": "*",
                 "Condition": {

@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from aegc import naming, payloads, protocol
+from aegc import ledger, naming, payloads, protocol, state
 from aegc.infra import deployment
 from aegc.protocol import Payload, ResultMessage, TaskMessage
 from aegc.worker.agent import Agent
@@ -376,3 +376,106 @@ def test_config_from_env() -> None:
     ).decode()
     cfg = WorkerConfig.from_env({"AEGC_WORKER_CONFIG_B64": raw, "AEGC_INSTANCE_ID": "i-9"})
     assert cfg.slot_count == 3 and cfg.instance_id == "i-9" and cfg.heartbeat_s == 100
+
+
+# --- deployment state, lifetime, ledger (v0.2) ---------------------------------------------------
+
+
+def result_code(m: ResultMessage, s3: Any) -> str:
+    from globus_compute_common import messagepack
+
+    assert m.kind == "result" and m.result is not None
+    r = messagepack.unpack(payloads.read_payload(m.result, s3=s3))
+    return str(r.error_details.code) if r.error_details else ""
+
+
+def stateful(rig: Rig) -> tuple[Agent, Any]:
+    ssm = rig.aws("ssm")
+    rig.cfg = WorkerConfig(**{**rig.cfg.__dict__, "state_parameter": "/aegc/dev/state"})
+    return rig.agent(ssm=ssm), ssm
+
+
+@pytest.mark.timeout(60)
+def test_running_state_claims_normally(rig: Rig) -> None:
+    a, ssm = stateful(rig)
+    state.write_state(ssm, "dev", state.State())
+    assert a.check_state() is None
+    tid = rig.submit(pow, 2, 5)
+    a.claim_once()
+    a.wait_idle()
+    assert value_of(rig.final(1)[tid], rig.s3) == (False, 32)
+
+
+@pytest.mark.timeout(60)
+def test_stopped_fails_queued_tasks_clearly(rig: Rig) -> None:
+    a, ssm = stateful(rig)
+    tids = [rig.submit(pow, 2, i) for i in range(3)]
+    state.write_state(ssm, "dev", state.State(mode="stopped", reason="aegc stop", by="test"))
+    st = a.check_state()
+    assert st is not None and st.mode == "stopped"
+    n = 0
+    while n < 3:
+        got = a.fail_queued_once(st)
+        assert got, "every queued task gets a refusal"
+        n += got
+    replies = rig.final(3)
+    assert set(replies) == set(tids)
+    # A final result (kind=result), not a system_failure: the engine won't retry it.
+    assert {result_code(m, rig.s3) for m in replies.values()} == {"AEGC_STOPPED"}
+    assert rig.task_queue_empty()
+
+
+@pytest.mark.timeout(60)
+def test_claim_racing_a_halt_is_refused(rig: Rig) -> None:
+    a, ssm = stateful(rig)
+    state.write_state(
+        ssm, "dev", state.State(mode="capped", reason="$0.02/day", until=time.time() + 3600)
+    )
+    a.check_state()
+    tid = rig.submit(pow, 2, 2)
+    a.claim_once()  # an ordinary claim while halted still doesn't run the task
+    assert result_code(rig.final(1)[tid], rig.s3) == "AEGC_BUDGET_EXCEEDED"
+
+
+@pytest.mark.timeout(120)
+def test_kill_fails_running_tasks(rig: Rig) -> None:
+    a, ssm = stateful(rig)
+    tid = rig.submit(sleeper, 30)
+    a.claim_once()
+    assert [m.kind for m in rig.replies(1)] == ["started"]
+    state.write_state(ssm, "dev", state.State(mode="stopped", kill=True, by="aegc stop --hard"))
+    a.check_state()
+    assert result_code(rig.final(1)[tid], rig.s3) == "AEGC_STOPPED"
+    assert not a._busy() and rig.task_queue_empty()
+
+
+@pytest.mark.timeout(60)
+def test_halted_worker_leaves_the_group(rig: Rig) -> None:
+    me = rig.join_group()
+    a, ssm = stateful(rig)
+    state.write_state(ssm, "dev", state.State(mode="expired", reason="lease", by="lease"))
+    a.check_state()
+    assert a.run(max_cycles=3) == "expired"
+    g = rig.group()
+    assert g["DesiredCapacity"] == 0 and me not in [i["InstanceId"] for i in g["Instances"]]
+
+
+@pytest.mark.timeout(60)
+def test_lifetime_drains(rig: Rig) -> None:
+    rig.cfg = WorkerConfig(**{**rig.cfg.__dict__, "max_lifetime_s": 0, "instance_id": ""})
+    assert rig.agent().run(max_cycles=5) == "lifetime"
+
+
+@pytest.mark.timeout(60)
+def test_ledger_records_the_instance(rig: Rig) -> None:
+    me = rig.join_group()
+    rig.cfg = WorkerConfig(
+        **{**rig.cfg.__dict__, "instance_type": "c8g.large", "availability_zone": "us-west-2a",
+           "lifecycle": "spot", "max_lifetime_s": 0}
+    )  # fmt: skip
+    a = rig.agent()
+    a.run(max_cycles=2)
+    (rec,) = ledger.read(rig.s3, BUCKET, "dev", time.time() - 60, time.time() + 60)
+    assert rec["instance_id"] == me and rec["instance_type"] == "c8g.large"
+    assert rec["lifecycle"] == "spot" and rec["exit_reason"] == "lifetime"
+    assert rec["last_seen"] >= rec["launched_at"]

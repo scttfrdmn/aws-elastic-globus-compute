@@ -13,19 +13,33 @@ from types import FrameType
 
 
 def _run(_: argparse.Namespace) -> int:
+    from dataclasses import replace
+
     from aegc import awsutil
     from aegc.worker.agent import Agent
     from aegc.worker.config import WorkerConfig
     from aegc.worker.imds import Imds
 
     cfg = WorkerConfig.from_env()
+    imds = Imds()
+    try:
+        ident = imds.identity()
+        cfg = replace(
+            cfg,
+            instance_type=ident.get("instance_type", ""),
+            availability_zone=ident.get("availability_zone", ""),
+            lifecycle=ident.get("lifecycle", ""),
+        )
+    except Exception as e:  # off EC2, or IMDS unreachable: the ledger records less
+        logging.getLogger("aegc").warning("couldn't read instance identity: %s", e)
     sess = awsutil.session(region=cfg.region)
     agent = Agent(
         config=cfg,
         sqs=awsutil.client(sess, "sqs"),
         s3=awsutil.client(sess, "s3"),
         autoscaling=awsutil.client(sess, "autoscaling"),
-        metadata=Imds(),
+        ssm=awsutil.client(sess, "ssm") if cfg.state_parameter else None,
+        metadata=imds,
     )
 
     def on_term(signum: int, _frame: FrameType | None) -> None:

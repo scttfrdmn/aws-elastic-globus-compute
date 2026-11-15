@@ -14,6 +14,12 @@ Semantics follow spore-host spawn's task pool:
   in-flight tasks). Draining here would leave an instance with no worker in the group.
 - **Idle drain:** with nothing to do for ``idle_timeout_s``, leave the Auto Scaling group with
   TerminateInstanceInAutoScalingGroup(ShouldDecrementDesiredCapacity=True).
+- **Deployment state:** every ``state_poll_s`` the worker reads ``/aegc/<d>/state``. When it isn't
+  running (capped, stopped, expired) the worker stops claiming, fails any task it still receives
+  with a clear, non-retried result (AEGC_BUDGET_EXCEEDED / AEGC_STOPPED / AEGC_EXPIRED), finishes
+  in-flight tasks (or fails them at once if the state says ``kill``), then leaves the group.
+- **Lifetime:** after ``max_lifetime_s`` the worker stops claiming and leaves the group once idle.
+- **Ledger:** the worker writes its cost-ledger record at start, every 5 minutes, and at exit.
 """
 
 from __future__ import annotations
@@ -28,9 +34,11 @@ from multiprocessing.context import BaseContext
 from pathlib import Path
 from typing import Any
 
-from aegc import __version__, payloads, protocol
+from aegc import __version__, ledger, payloads, protocol
 from aegc.awsutil import error_code
+from aegc.gcresult import failed_result
 from aegc.protocol import ErrorInfo, ProtocolError, ResultMessage, TaskMessage
+from aegc.state import State, read_state
 from aegc.worker import runner
 from aegc.worker.config import WorkerConfig
 from aegc.worker.imds import Metadata, NoMetadata, Notice
@@ -63,6 +71,7 @@ class Agent:
     sqs: Any
     s3: Any
     autoscaling: Any | None = None
+    ssm: Any | None = None  # reads the deployment state; None: don't watch it
     metadata: Metadata = field(default_factory=NoMetadata)
     ctx: BaseContext | None = None
     clock: Callable[[], float] = time.monotonic
@@ -89,6 +98,12 @@ class Agent:
         self._last_activity = self.clock()
         self._ctx = self.ctx or runner.context()
         self._scratch = Path(self.config.scratch)
+        self._halt: State | None = None  # set when the deployment state isn't running
+        self._started_at = time.time()
+        self._started_mono = time.monotonic()
+        self._busy_slot_s = 0.0
+        self._ledger_written = 0.0
+        self._exit_reason = ""
 
     # --- public -----------------------------------------------------------------------------
 
@@ -98,8 +113,13 @@ class Agent:
             threading.Thread(target=self._heartbeat_loop, name="aegc-heartbeat", daemon=True),
             threading.Thread(target=self._notice_loop, name="aegc-notices", daemon=True),
         ]
+        if self.ssm is not None and self.config.state_parameter:
+            threads.append(
+                threading.Thread(target=self._state_loop, name="aegc-state", daemon=True)
+            )
         for t in threads:
             t.start()
+        self.write_ledger()
         cycles = 0
         try:
             while not self._stop.is_set():
@@ -108,6 +128,22 @@ class Agent:
                     if not self._busy():
                         break
                     self._stop.wait(0.2)
+                    continue
+                if self._halt is not None:
+                    self.fail_queued_once(self._halt)
+                    if not self._busy() and self._leave_group():
+                        self._drain(self._halt.mode)
+                    cycles += 1
+                    if max_cycles is not None and cycles >= max_cycles:
+                        break
+                    continue
+                if self._lifetime_over():
+                    if not self._busy() and self._leave_group():
+                        self._drain("lifetime")
+                    self._stop.wait(0.2)
+                    cycles += 1
+                    if max_cycles is not None and cycles >= max_cycles:
+                        break
                     continue
                 self.claim_once()
                 cycles += 1
@@ -119,6 +155,8 @@ class Agent:
         finally:
             self._pool.shutdown(wait=not self._stop.is_set())
             self._stop.set()
+            self._exit_reason = self._drain_reason or "stopped"
+            self.write_ledger(final=True)
         return self._drain_reason or "stopped"
 
     def stop(self, reason: str = "stopped") -> None:
@@ -167,6 +205,10 @@ class Agent:
         self.stats.claimed += 1
         self._touch()
         log.info("claimed %s (delivery %d)", msg.executor_task_id, receive_count)
+        if self._halt is not None:
+            if self._post_refusal(msg, self._halt):
+                self._ack(receipt)
+            return
         if receive_count > self.config.max_deliveries:
             self.stats.poison += 1
             self._post_failure(
@@ -226,6 +268,7 @@ class Agent:
             log.exception("runner failed for %s", msg.executor_task_id)
             outcome = runner.RunOutcome("crashed", None, f"runner error: {e}")
         finished = time.time()
+        self._busy_slot_s += finished - started
         log.info("%s: %s in %.1f s", msg.executor_task_id, outcome.outcome, finished - started)
         try:
             if job.released or self._stop.is_set():
@@ -367,6 +410,8 @@ class Agent:
             if now >= next_file:
                 self._touch_heartbeat_file(hb, now)
                 next_file = now + self.heartbeat_file_s
+            if now - self._ledger_written >= ledger.WRITE_EVERY_S:
+                self.write_ledger()
 
     def _touch_heartbeat_file(self, hb: Path, now: float) -> bool:
         """Tell the host watchdog we're alive, but only if the claim loop is.
@@ -409,6 +454,126 @@ class Agent:
         else:
             log.warning("%s: releasing in-flight tasks and exiting", notice)
             self.stop(notice)
+
+    # --- deployment state ---------------------------------------------------------------
+
+    def _state_loop(self) -> None:
+        while not self._stop.wait(self.config.state_poll_s):
+            self.check_state()
+
+    def check_state(self) -> State | None:
+        """Read the deployment state; on a non-running state, halt. Returns the halt state."""
+        assert self.ssm is not None
+        try:
+            st = read_state(self.ssm, self.config.deployment)
+        except Exception as e:
+            log.warning("couldn't read the deployment state: %s", e)
+            return self._halt
+        if st.running:
+            if self._halt is not None:
+                log.info("deployment is running again")
+            self._halt = None
+            return None
+        if self._halt is None or self._halt.mode != st.mode or (st.kill and not self._halt.kill):
+            log.warning("deployment %s (%s): stop claiming", st.mode, st.reason)
+            if st.kill:
+                self._fail_inflight(st)
+        self._halt = st
+        return st
+
+    def _refusal(self, st: State) -> tuple[str, str]:
+        return st.failure_code or "AEGC_STOPPED", st.explain(self.config.deployment)
+
+    def _post_refusal(self, msg: TaskMessage, st: State) -> bool:
+        """Post a final failed Result (never retried) for ``msg``."""
+        code, text = self._refusal(st)
+        packed = failed_result(msg.task_uuid, code, text)
+        result = payloads.make_payload(
+            packed,
+            s3=self.s3,
+            bucket=self.config.bucket,
+            key=protocol.result_payload_key(self.config.deployment, msg.task_uuid, msg.attempt),
+        )
+        return self._post(
+            ResultMessage(
+                kind="result",
+                task_uuid=msg.task_uuid,
+                attempt=msg.attempt,
+                endpoint_id=msg.endpoint_id,
+                result=result,
+                worker=self._worker_info(),
+            ),
+            msg.reply_to,
+        )
+
+    def fail_queued_once(self, st: State) -> int:
+        """Receive queued tasks and fail each with a clear result. Returns how many."""
+        resp = self.sqs.receive_message(
+            QueueUrl=self.config.task_queue_url,
+            MaxNumberOfMessages=10,
+            WaitTimeSeconds=min(self.wait_s, 1),
+            VisibilityTimeout=self.config.visibility_s,
+        )
+        n = 0
+        for m in resp.get("Messages", []):
+            try:
+                msg = TaskMessage.decode(m["Body"])
+            except ProtocolError:
+                continue  # no reply_to: redelivery and the DLQ take it
+            if self._post_refusal(msg, st):
+                self._ack(m["ReceiptHandle"])
+                n += 1
+        if n:
+            log.info("failed %d queued task(s): deployment %s", n, st.mode)
+        return n
+
+    def _fail_inflight(self, st: State) -> None:
+        """Fail running tasks now (stop --hard, on_cap=kill); their results are discarded."""
+        with self._lock:
+            jobs = [j for j in self._inflight.values() if not j.released]
+            for j in jobs:
+                j.released = True
+        for j in jobs:
+            if self._post_refusal(j.msg, st):
+                self._ack(j.receipt)
+        if jobs:
+            log.warning("failed %d running task(s): deployment %s", len(jobs), st.mode)
+        # The children keep running until the instance goes; leaving the group ends them.
+        with self._lock:
+            for j in jobs:
+                self._inflight.pop(j.receipt, None)
+
+    def _lifetime_over(self) -> bool:
+        return time.monotonic() - self._started_mono >= self.config.max_lifetime_s
+
+    # --- cost ledger -------------------------------------------------------------------------
+
+    def ledger_record(self) -> ledger.Record:
+        return ledger.Record(
+            instance_id=self.config.instance_id or "local",
+            deployment=self.config.deployment,
+            pool=self.config.pool,
+            instance_type=self.config.instance_type,
+            availability_zone=self.config.availability_zone,
+            lifecycle=self.config.lifecycle or "spot",
+            vcpus=self.config.slot_count if self.config.slots == "auto" else 0,
+            launched_at=self._started_at,
+            last_seen=time.time(),
+            root_gib=self.config.root_volume_gib,
+            throughput_mibps=self.config.throughput_mibps,
+            tasks=self.stats.claimed,
+            busy_slot_s=round(self._busy_slot_s, 1),
+            exit_reason=self._exit_reason,
+        )
+
+    def write_ledger(self, *, final: bool = False) -> None:
+        if not self.config.ledger or not self.config.instance_id:
+            return
+        try:
+            ledger.write(self.s3, self.config.bucket, self.ledger_record())
+            self._ledger_written = time.monotonic()
+        except Exception as e:
+            log.warning("couldn't write the cost ledger%s: %s", " (final)" if final else "", e)
 
     # --- drain ------------------------------------------------------------------------------
 
@@ -455,4 +620,7 @@ class Agent:
             "instance_id": self.config.instance_id,
             "pool": self.config.pool,
             "agent_version": __version__,
+            "instance_type": self.config.instance_type,
+            "availability_zone": self.config.availability_zone,
+            "lifecycle": self.config.lifecycle,
         }

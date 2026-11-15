@@ -23,6 +23,15 @@ class WorkerConfig:
     scratch: str = "/scratch"
     instance_id: str = ""
     aegc_version: str = ""
+    state_parameter: str = ""  # /aegc/<d>/state; empty: don't watch the deployment state
+    state_poll_s: float = 60.0
+    max_lifetime_s: int = 24 * 3600  # stop claiming after this; the watchdog backs it up
+    ledger: bool = True  # write the per-instance cost ledger to s3://<bucket>/ledger/<d>/
+    instance_type: str = ""  # filled from IMDS at start
+    availability_zone: str = ""
+    lifecycle: str = ""  # "spot" or "on-demand", from IMDS
+    root_volume_gib: int = 30
+    throughput_mibps: int = 125
 
     @property
     def slot_count(self) -> int:
