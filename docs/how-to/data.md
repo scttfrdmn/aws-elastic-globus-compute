@@ -72,9 +72,9 @@ deployment's current ones:
 aws iam get-role-policy --role-name aegc-e2e-worker-us-west-2 --policy-name aegc-grants
 ```
 
-IAM changes reach running workers within seconds. The list of write grants that `aegc.outputs`
-uses is in the launch template, though, so after changing write grants, new workers see the new
-list and running ones keep the one they booted with until they drain.
+IAM changes reach running workers within seconds, and `aegc.outputs` reads the current grants
+from the deployment's manifest, at most a minute old, so a redeploy's grants reach running workers
+too. (If the manifest can't be read, it falls back to the grants the worker booted with.)
 
 ### What a grant can't be
 
@@ -86,19 +86,24 @@ list and running ones keep the one they booted with until they drain.
 - **aegc's own bucket**, `aegc-<account>-<region>`: workers already have exactly what they need
   there.
 - **Prefixes over 1,024 bytes**, S3's key length.
-- **More grants than fit.** All of a role's inline policies share 10,240 characters, and
-  `aegc-worker` uses about 1,900 of them. That leaves room for roughly a hundred grants or more,
-  depending on their length. The error says how many characters the grants need and how many are
-  left: `deployment e2e's 150 grants need a 8830-character IAM policy, but the worker role has room
-  for 8340 ...; use fewer, broader prefixes`.
+- **More than 32 grants**, because they also go into each worker's user data:
+  `deployment e2e has 40 grants; at most 32 (use fewer, broader prefixes)`. Long prefixes can
+  also run out of IAM's room first: all of a role's inline policies share 10,240 characters, and
+  `aegc-worker` uses about 1,970 of them.
 
 ### Buckets in another account, and KMS
 
-A grant adds permissions to the worker role in your account. A bucket in another account must
-also allow the role in its bucket policy: its ARN is
-`arn:aws:iam::<account>:role/aegc/aegc-<d>-worker-<region>`. A bucket encrypted with a customer
-managed KMS key needs `kms:Decrypt` (to read) or `kms:GenerateDataKey` (to write) on that key,
-which aegc doesn't grant.
+**Write grants only reach buckets in the deployment's own account.** The policy conditions them on
+`s3:ResourceAccount`, so a mistyped or squatted bucket name in someone else's account can't
+receive your outputs. Writing to another account's bucket is denied even if its bucket policy
+allows it.
+
+**Read grants may cross accounts**, as open and shared data often lives elsewhere. The other
+account's bucket policy must also allow the worker role, whose ARN is
+`arn:aws:iam::<account>:role/aegc/aegc-<d>-worker-<region>`.
+
+A bucket encrypted with a customer managed KMS key needs `kms:Decrypt` (to read) or
+`kms:GenerateDataKey` (to write) on that key, which aegc doesn't grant.
 
 ### Requester-pays buckets
 
@@ -198,17 +203,13 @@ copy. Workers set `AEGC_TASK_UUID` for each task; `outputs.task_uuid()` returns 
 
 | Function | What it does |
 |---|---|
-| `outputs.put(data, name=None, *, prefix=None)` | Upload `data` and return its `s3://` URI. `data` is bytes, a `str` (uploaded as UTF-8 text), or a `pathlib.Path` to a file; large files go up in parts. `name` defaults to the file's name, or `output-<n>`. `prefix="s3://bucket/some/prefix"` writes there instead, and must be inside a write grant. Only on a worker. |
+| `outputs.put(data, name=None, *, prefix=None)` | Upload `data` and return its `s3://` URI. `data` is bytes, or the path of a file (a `str` or a `pathlib.Path`); large files go up in parts. For text, pass `text.encode()`. A path that isn't a file raises `FileNotFoundError`. `name` defaults to the file's name, or `output-<n>`. `prefix="s3://bucket/some/prefix"` writes there instead, and must be inside a write grant. Only on a worker. |
 | `outputs.get(uri)` | The object's bytes |
 | `outputs.download(uri, path)` | Download the object to `path`, in parts if it's large; returns the path |
 | `outputs.uri_to_https(uri, *, expires_s=0, region=None)` | An `https://` URL for the object. With `expires_s`, a presigned GET URL that anyone can use until it expires; without, the plain virtual-hosted URL, which works only if the object is readable some other way |
 
 `get`, `download` and `uri_to_https` work anywhere with credentials that can read the object: in a
 task with a read grant on the prefix, or on your own machine.
-
-!!! warning "Pass a `Path`, not a string, for a file"
-    `outputs.put("/scratch/out.nc")` uploads the text `/scratch/out.nc`, not the file. Use
-    `outputs.put(Path("/scratch/out.nc"))`.
 
 If there's no write grant, or `prefix` is outside every write grant, `put` raises
 `PermissionError` before uploading anything, and says which `--grant` to add:

@@ -55,11 +55,14 @@ Not deleted by any aegc command.
 | Resource | Name | `aegc:role` |
 |---|---|---|
 | ECR repository (immutable tags, scan on push, keeps 10 images plus those tagged `inuse-`) | `aegc/<env>` | `image-repo` |
-| SSM parameter: `{"records": {<minor>: {env, python_minor, image, tag, base, gce_version, aegc_version, built_at, base_kind, python}}}`, one record per Python minor | `/aegc/images/<env>` | `image-record` |
+| SSM parameter: `{"records": {<minor>: {env, python_minor, image, tag, base, gce_version, aegc_version, built_at, base_kind, python}}}`, one record per Python minor | `/aegc/images/<env>/records` | `image-record` |
+| SSM parameter: the newest record, `{env, python_minor, image, tag, base, gce_version, aegc_version, built_at}`, in the shape aegc 0.1 and 0.2 read | `/aegc/images/<env>` | `image-record` |
 
-`base_kind` is `conda`, `pip` or `registered`, and `python` the interpreter the worker runs. A
-record written by aegc 0.2 or earlier (a single record, without `records`) still reads, and the
-next build or registration converts it. `aegc image register` pushes your image into the same
+`base_kind` is `conda`, `pip` or `registered`; `python` is the interpreter the worker runs; `base`
+is the base or registered reference with its short image id. Every build and registration writes
+both parameters, so 0.2 CLIs keep working. If one of them writes `/aegc/images/<env>`, the next
+read merges it in (the newer record for its minor wins). `aegc image forget` rewrites both, or
+deletes them with the last minor. `aegc image register` pushes your image into the same
 repository; the image you registered from is left where it was.
 
 ## Deployment: aegc deploy

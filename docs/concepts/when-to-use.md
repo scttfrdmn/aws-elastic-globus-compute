@@ -44,10 +44,12 @@ These are the current limits. Numbers come from the live run in
   [`aegc.outputs`](../how-to/data.md#return-large-outputs) and return the URI.
 - **Workers reach only what you grant.** The worker role allows aegc's queues, its payload prefix,
   its image repositories and its log group. Open data is read with **unsigned** requests; your own
-  buckets, requester-pays data and output buckets need a `--grant` per prefix. Grants are shared by
-  every task in the deployment; see [Security model](security.md#data-access).
-- **Images must be arm64 with Python 3.11 or later.** Any such image works as a base, or as a
-  registered image with aegc in it; see [Worker images](../how-to/images.md).
+  buckets, requester-pays data and output buckets need a `--grant` per prefix (at most 32, and
+  writes only to your own account's buckets). Grants are shared by every task in the deployment;
+  see [Security model](security.md#data-access).
+- **Images must be arm64 with Python 3.11 or later, and have a shell.** Any such image works as a
+  base, or as a registered image with aegc 0.3 or later in it; see
+  [Worker images](../how-to/images.md).
 - **Spend limits are estimates.** They count instance time, volumes and IPv4 addresses from the
   workers' own ledger, are checked only while an endpoint runs, and can be overshot by a few
   minutes of spend plus running tasks. See [Spend limits](cost.md#spend-limits).

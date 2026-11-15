@@ -17,7 +17,7 @@
 
 | Identity | Who uses it | Scope |
 |---|---|---|
-| **worker** role, `aegc-<d>-worker-<region>` | Worker instances, through an instance profile | The deployment's task queues (receive, delete, extend), its result queues (send), `payloads/<d>/tasks/*` (read) and `payloads/<d>/results/*` (write), pulls from `aegc/*` ECR repositories, its log group, terminating instances in groups tagged with the deployment, reading the deployment state, and writing `ledger/<d>/*`; plus, with grants, reading or writing under your granted S3 prefixes (`aegc-grants`) |
+| **worker** role, `aegc-<d>-worker-<region>` | Worker instances, through an instance profile | The deployment's task queues (receive, delete, extend), its result queues (send), `payloads/<d>/tasks/*` (read) and `payloads/<d>/results/*` (write), pulls from `aegc/*` ECR repositories, its log group, terminating instances in groups tagged with the deployment, reading the deployment's state and manifest, and writing `ledger/<d>/*`; plus, with grants, reading or writing under your granted S3 prefixes (`aegc-grants`) |
 | **operator** | The endpoint container's AWS credentials | Reading the deployment's parameters, sending tasks, creating and reading its own result queues, payloads, `SetDesiredCapacity` and `UpdateAutoScalingGroup` on groups tagged with the deployment, receiving and deleting on its task queues, writing its state, reading its ledger, prices and Cost Explorer, and renewing its lease |
 | **deployer** | Whoever runs `aegc deploy`, `destroy`, `stop`, `resume` | Creates conditioned on the `aegc:managed=true` request tag, changes and deletes on the resource tag where the service supports it; IAM limited to the `/aegc/` path; roles passed only to EC2 and EventBridge Scheduler |
 | **bootstrap** | Whoever runs `aegc bootstrap`, `unbootstrap` | The payload bucket, the pull-through cache and its template and role, `/aegc/bootstrap`; roles passed only to ECR |
@@ -72,8 +72,10 @@ Without grants, the worker role has no access to S3 beyond the deployment's payl
 - **Your own buckets, and requester-pays data, need a grant.**
   `aegc deploy <d> --grant read=s3://bucket/prefix` and `--grant write=s3://bucket/prefix` add the
   inline policy [`aegc-grants`](../reference/iam.md#aegc-grants) to the worker role. Read grants
-  allow getting and listing objects under the prefix; write grants allow putting them, multipart
-  included, but not reading or deleting. See [Read and write your data](../how-to/data.md).
+  allow getting and listing objects under the prefix, in any account whose bucket policy allows
+  it. Write grants allow putting them, multipart included, but not reading or deleting, and only
+  in buckets the deployment's own account owns (`s3:ResourceAccount`), so a mistyped or squatted
+  bucket name elsewhere can't receive outputs. See [Read and write your data](../how-to/data.md).
 - **Large outputs** go to a write grant with [`aegc.outputs`](../how-to/data.md#return-large-outputs),
   and only their `s3://` URI comes back through Globus Compute.
 
@@ -85,7 +87,8 @@ the job, keep data some submitters mustn't see in a separate deployment, and con
 Versioning on buckets you grant writes to.
 
 Grants are checked before anything changes: no wildcards or policy variables, valid general
-purpose bucket names, not aegc's own bucket, and no more than fit in the role's inline policies.
+purpose bucket names, not aegc's own bucket, at most 32, and no more than fit in the role's inline
+policies.
 aegc refers to granted buckets but never creates, changes or deletes them or their policies.
 
 aegc doesn't manage policies you add to the worker role yourself. `aegc deploy` rewrites
@@ -115,8 +118,11 @@ aegc doesn't manage policies you add to the worker role yourself. `aegc deploy` 
 - The conda build fails if installing `globus-compute-endpoint` changes any package already in the
   base image, except `click`. The pip build installs with the base's packages as constraints, so
   it fails rather than change them.
-- `aegc image register` checks that an image is arm64 and pinned, has aegc 0.2 or later, and
-  passes `aegc-worker selftest`. It doesn't inspect what else the image contains or does.
+- `aegc image register` runs the image the way workers do, with its own entrypoint and user, and
+  checks that it's arm64 and pinned, has aegc 0.3 or later, runs as root or uid 57439, and passes
+  `aegc-worker selftest`. It doesn't inspect what else the image contains or does.
+- Built and registered images are identified by image id, not tag, so a tag moved upstream gives a
+  new image rather than silently reusing an old one.
 
 ## Ownership: delete only what aegc created
 

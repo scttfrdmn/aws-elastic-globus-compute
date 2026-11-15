@@ -38,10 +38,11 @@ aegc deploy e2e --pool geospatial:max_vcpus=32,vcpu=4-8,mem=16384,slots=4
 vCPUs (N × the low end of `vcpu=`) and prints a warning: `max=3` with the default `vcpu=2-8`
 becomes `max_vcpus=6`.
 
-Each `--pool` makes one pool per Python minor the env has an image for, named `<env>-py<NNN>`
-from the env and the image's Python version, for example `geospatial-py314`. With `size=`, the
-class is added: `geospatial-py314-mem`. So a deployment can have several pools for one env, one for
-each minor and size class; `python=3.13` limits a `--pool` to one minor. See
+Pools are named `<env>-py<NNN>` from the env and the image's Python version, for example
+`geospatial-py314`. With `size=`, the class is added: `geospatial-py314-mem`. So a deployment can
+have several pools for one env, one for each minor and size class. The first deploy of an env
+makes a pool for each recorded minor, with the options given applying to each; a redeploy updates
+the minors already deployed, and `python=3.13` adds or picks one. See
 [Several Python minors per env](images.md#several-python-minors-per-env).
 
 Points to know:
@@ -97,19 +98,22 @@ deploys `geospatial-py314` (the default) and `geospatial-py314-mem` side by side
 vCPUs ÷ the class's vCPUs, and memory ÷ (the class's memory × 0.9), whichever is smaller, at
 least one. The 0.9 allows for memory the kernel, Docker and the worker keep. An `r8g.xlarge`
 (4 vCPUs, 32 GiB) runs two `mem` tasks, and an `m8g.2xlarge` (8 vCPUs, 32 GiB) one `large` task.
-`whole` always runs one. `slots=N` still sets the count yourself.
+`whole` always runs one. `size=` sets the slots itself, so it can't be combined with `slots=N`:
+`size=mem sets each worker's slots from its vCPUs and memory; drop slots=4`.
 
 **Worker sizes.** If `vcpu=` isn't given and its low end is less than the class's vCPUs, `deploy`
 raises it, so `size=large` gives `vcpu=8-8` by default. With the default `max_vcpus=8` that's one
 `large` task at a time; raise `max_vcpus` (for example `size=large,max_vcpus=32,vcpu=8-16`). A
 `vcpu=` range below the class fails:
 `size=large gives each task 8 vCPUs, so workers need at least that many: vcpu=4-8 is too small`.
-For `whole`, set `vcpu=` and `mem=` to the instance you want each task to have: what a task is
-sure to get is the low end of `vcpu=` and `mem=`.
+`size=whole` needs one worker size, so that Auto Scaling can't meet a few tasks' worth of vCPUs
+with many small instances. Without `vcpu=` it uses the top of the range, `vcpu=8-8` by default;
+give one number for another size (`size=whole,vcpu=16,max_vcpus=64`). A range fails:
+`size=whole needs one worker size, e.g. vcpu=16; not vcpu=4-16`. Set `mem=` too if tasks need
+more than the instances' minimum memory: a `whole` task is sure to get `vcpu=` vCPUs and `mem=`.
 
-**Scaling.** The scaler asks for the class's vCPUs per task (`whole`: the top of `vcpu=` per task,
-so each task gets an instance even if Auto Scaling picks the largest size). `max_vcpus` bounds the
-pool as before.
+**Scaling.** The scaler asks for the class's vCPUs per task (`whole`: the worker's vCPUs per
+task, one instance each). `max_vcpus` bounds the pool as before.
 
 **Choosing a size from the client.** Tasks ask for a class by name, or for what they need:
 
@@ -120,9 +124,10 @@ resource_specification={"cpus": 4, "memory_gib": 24}    # the cheapest pool that
 
 With `cpus` and `memory_gib` (positive numbers; either alone works), the engine takes the env's
 pools for the client's Python minor, keeps those whose tasks get at least that many vCPUs and GiB,
-and picks the one that holds the fewest vCPUs per task, then the least memory. `size` wins if both
-are given. Without either, the task goes to the cheapest pool, normally the one without a size
-class. A pool without `size=` counts as `small`. If nothing fits, the task fails at once:
+and picks the one that holds the fewest vCPUs per task, then a sized pool over a `whole` one, then
+the least memory. Without either, the task goes to the cheapest pool, normally the one without a
+size class. A pool without `size=` counts as `small`; with fixed `slots=N`, its tasks get the
+smallest worker's vCPUs and `mem=` divided by N. If nothing fits, the task fails at once:
 
 ```
 no pool for env 'geospatial' gives a task 4 vCPUs and 24 GiB; available: geospatial-py314 (small:
@@ -130,12 +135,16 @@ no pool for env 'geospatial' gives a task 4 vCPUs and 24 GiB; available: geospat
 --pool geospatial:size=...
 ```
 
-`resource_specification={"pool": ...}` names a pool directly and skips the size check.
+`size` and `pool` pick a pool by name, and `cpus`/`memory_gib` given with them must still fit
+it; if they don't, the task fails with
+`pool 'geospatial-py314-mem' gives a task 2 vCPUs and 16 GiB, less than the 4 vCPUs and 24 GiB
+asked for`.
 
 Points to know:
 
-- **Rebuild worker images.** Workers built before size classes ignore them and run one task per
-  vCPU. Rebuild the env's images with this release's code before you deploy a sized pool.
+- **Rebuild worker images.** `size=` needs an image built with aegc 0.3 or later, because older
+  workers ignore size classes. `deploy` refuses older ones with
+  `size=mem needs a worker image built with aegc 0.3 or later (...)`.
 - **Rebuild the endpoint image** (`aegc endpoint build`, then `stop` and `start`). An older engine
   fails tasks that pass `size`, `cpus` or `memory_gib` as unsupported keys.
 - **Env names get shorter.** The pool name must fit in 40 characters; with `size=medium`, env

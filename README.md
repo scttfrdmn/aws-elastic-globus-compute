@@ -5,10 +5,21 @@ ephemeral AWS capacity: an SQS work queue, and Graviton EC2 workers that run arm
 on stock AMIs. Capacity scales to zero when there's no work. No Parsl, no tunnels, no inbound ports,
 no CloudFormation.
 
-```
-endpoint (laptop container) ─ AWSEngine ─▶ SQS tasks ◀── Graviton workers (Spot, Auto Scaling, scale to 0)
-                                  ▲                          │ docker run aegc/<env>  →  execute_task
-                                  └──── SQS results ◀────────┘   payloads > 700 KB via S3
+```mermaid
+flowchart LR
+    ep["Endpoint in Docker<br/>on your laptop<br/><b>AWSEngine</b>"]
+    subgraph aws["Your AWS account"]
+        tasks[["SQS task queue"]]
+        results[["SQS result queue"]]
+        workers["Spot Graviton workers<br/>scale to zero<br/>run aegc/env images"]
+        s3[("S3<br/>payloads > 700 KB")]
+    end
+    ep -->|send task| tasks
+    workers -->|claim| tasks
+    workers -->|post result| results
+    results -->|long poll| ep
+    ep <-.-> s3
+    workers <-.-> s3
 ```
 
 - **Every connection is outbound.** The endpoint and the workers both talk to AWS APIs; nothing dials

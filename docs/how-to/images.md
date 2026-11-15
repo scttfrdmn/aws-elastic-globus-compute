@@ -64,9 +64,9 @@ you got with `aegc image list`.
 
 ## From any arm64 image
 
-`--base` takes any `linux/arm64` image with Python 3.11 or later, pinned by digest
-(`repo@sha256:...`) or by a tag that never moves. References without a tag, and `latest`, are
-refused.
+`--base` takes any `linux/arm64` image with Python 3.11 or later, for example
+`python:3.13-slim@sha256:...`. A digest is best; a tag works too, and aegc builds from the image it
+points to now. References without a tag, and `latest`, are refused.
 
 ```sh
 aegc image build --env myenv --base ghcr.io/my-lab/analysis@sha256:<digest>
@@ -74,21 +74,24 @@ aegc image build --env myenv --base ghcr.io/my-lab/analysis@sha256:<digest>
 
 aegc runs the base once to see what kind it is, then picks a Dockerfile:
 
-- **micromamba/conda bases**, with `/opt/conda/bin/python` and `micromamba` on `PATH`, get the
-  same build as aarchsci, from
-  [templates/worker/Dockerfile](../../src/aegc/templates/worker/Dockerfile). It expects the
-  `mambaorg/micromamba` layout: the user `mambauser` and `/usr/local/bin/_entrypoint.sh`.
+- **micromamba bases** in the `mambaorg/micromamba` layout (`/opt/conda/bin/python`,
+  `micromamba` on `PATH`, `/usr/local/bin/_entrypoint.sh` and the user `mambauser`) get the same
+  build as aarchsci, from [templates/worker/Dockerfile](../../src/aegc/templates/worker/Dockerfile).
 - **everything else** gets
   [templates/worker/Dockerfile.pip](../../src/aegc/templates/worker/Dockerfile.pip). It
   pip-installs `globus-compute-endpoint` and the aegc wheel into the base's Python, with every
   package the base already has as a constraint, so nothing you installed changes version. Then it
   runs `pip check`, puts `aegc-worker` on `PATH`, adds a user with uid 57439 (the owner of the
   host's `/scratch`) unless that uid exists, and runs as it. Debian and Ubuntu system Pythons work
-  too.
+  too. A Python without pip or `ensurepip` fails with
+  `aegc: <python> has no pip and no ensurepip; add pip to the base (e.g. apt-get install python3-pip)`.
 
 If the base has a package at a version `globus-compute-endpoint` can't use, pip can't resolve the
-install and the build fails with pip's conflict report. Change the base, or build the image yourself and
-[register it](#register-an-image-you-built).
+install and the build fails with pip's conflict report. Change the base, or build the image
+yourself and [register it](#register-an-image-you-built).
+
+The base needs a shell (`sh`): aegc runs one in it to see what kind it is, so distroless images
+are refused with `couldn't run a shell in <base>: a base image needs sh ...`.
 
 The pip build clears the base's `ENTRYPOINT`, because workers start with
 `docker run <image> aegc-worker run`. Settings made with `ENV` still apply; an entrypoint script
@@ -98,8 +101,9 @@ If the base's Python isn't `python3` on `PATH`, name it: `--python /opt/venv/bin
 bases always use `/opt/conda/bin/python`.
 
 The base is pulled from its own registry, not through the ECR cache, so `--direct` makes no
-difference; log in to that registry first if it's private. Workers only ever pull the
-`aegc/<env>` copy.
+difference. Log in to that registry first if it's private; for an image in this account's ECR in
+the same region, aegc logs in for you. A local image that isn't in any registry is used as it is.
+Workers only ever pull the `aegc/<env>` copy.
 
 ### Example: Python 3.13 and numpy
 
@@ -150,11 +154,9 @@ with Executor(
 
 A running endpoint picks up the new pool within a minute.
 
-!!! tip "Use a new reference for every change"
-    The tag aegc pushes is derived from the base reference, not from its contents. Rebuilding from
-    the same reference (say `numpy-base:2026.11.15` after you changed it) with the same aegc code
-    finds that tag in ECR and reuses the image pushed before. Give each change to a base a new
-    tag, or use digests.
+The tag aegc pushes includes the base's image id, not just its name, so rebuilding after
+`numpy-base:2026.11.15` (or `python:3.13-slim`) has moved builds a new image. With the same base
+image and the same aegc code, the build finds its tag in ECR and reuses the image pushed before.
 
 ## Register an image you built
 
@@ -181,7 +183,8 @@ ENTRYPOINT []
 CMD ["aegc-worker", "run"]
 ```
 
-Build it for arm64, push it to a registry you can pull from, and register it by digest:
+Build it for arm64 and register it. A pushed image is best registered by digest; a local image
+works too:
 
 ```sh
 docker buildx build --platform linux/arm64 -t ghcr.io/my-lab/analysis-aegc:2026.11.15 --push .
@@ -189,34 +192,35 @@ docker buildx imagetools inspect ghcr.io/my-lab/analysis-aegc:2026.11.15 | grep 
 aegc image register --env analysis --image ghcr.io/my-lab/analysis-aegc@sha256:<digest>
 ```
 
-`register` pulls the image for `linux/arm64` and checks that:
+`register` pulls the image for `linux/arm64` (or uses the local one) and runs it the way workers
+do, with its own entrypoint and user: `docker run <image> aegc-worker version`, then
+`docker run <image> aegc-worker selftest`. It checks that:
 
 - it's pinned: `repo@sha256:...`, or a tag other than `latest`;
 - it's arm64 (otherwise `<image> is amd64, not arm64: workers are Graviton`);
-- its Python (`python3`, or `--python PATH`) imports aegc 0.2 or later (otherwise
-  `<image> has aegc 0.1.0; workers need aegc 0.2 or later`);
-- `aegc-worker selftest` passes in it.
+- `aegc-worker version` runs, which means `aegc-worker` is on `PATH` and the entrypoint runs the
+  command it's given (empty, or `exec "$@"` as micromamba's is);
+- the aegc in it is 0.3 or later (otherwise `<image> has aegc 0.2.0; registered images need aegc
+  0.3 or later`): size classes, grants and `aegc.outputs` are worker features;
+- it runs as root or uid 57439 (otherwise `<image> runs as uid 1000; workers need root or uid
+  57439, which owns the host's /scratch (USER 57439 in your Dockerfile)`). The worker keeps its
+  heartbeat and task directories in `/scratch`;
+- `aegc-worker selftest` passes.
 
-Then it reads the Python minor, copies the image into `aegc/<env>` with the tag
-`py<M.m>-aegc<version>-r<hash of the reference>`, and records it as kind `registered`. It prints
-the pinned `aegc/<env>` image.
+Then it copies the image into `aegc/<env>` with the tag
+`py<M.m>-aegc<version>-r<first 12 hex digits of the image id>`, and records it as kind
+`registered`, with the Python minor, interpreter and `globus-compute-endpoint` version that
+`aegc-worker version` reported. It prints the pinned `aegc/<env>` image. Registering the same
+image again reuses the copy.
 
-`register` runs those checks with its own entrypoint, so some things a worker needs aren't
-checked. Workers run `docker run <image> aegc-worker run`, so:
-
-- **`aegc-worker` must be on `PATH`**, in the same Python environment as your packages.
-- **The entrypoint must be empty, or run its arguments** (`exec "$@"`), as micromamba's does.
-- **Run as uid 57439, or root.** The host's `/scratch` belongs to uid 57439, and the worker keeps
-  its heartbeat and task directories there. If it can't write them, its tasks fail and the host
-  watchdog terminates the instance.
-- **Use the aegc wheel from your current source tree**, as above. Size classes and `aegc.outputs`
-  are worker features, and an older wheel inside the image silently lacks them.
+Use the aegc wheel from your current source tree, as above, so the workers match the `aegc` you
+deploy with.
 
 ## Several Python minors per env
 
 Globus Compute needs the worker's Python minor version to equal the client's. An env can have an
-image for each minor you submit from: `/aegc/images/<env>` keeps one record per minor, and building
-or registering an image replaces only the record for its own minor.
+image for each minor you submit from: building or registering an image replaces only the record
+for its own minor.
 
 ```sh
 aegc image build --env numpy --base numpy-base:py313-2026.11.15   # FROM python:3.13-slim
@@ -225,21 +229,48 @@ aegc image list --env numpy
 ```
 
 ```
-3.13	pip	aegc 0.2.0	123456789012.dkr.ecr.us-west-2.amazonaws.com/aegc/numpy@sha256:...
-3.14	pip	aegc 0.2.0	123456789012.dkr.ecr.us-west-2.amazonaws.com/aegc/numpy@sha256:...
+3.13	pip	aegc 0.3.0.dev0	123456789012.dkr.ecr.us-west-2.amazonaws.com/aegc/numpy@sha256:...
+3.14	pip	aegc 0.3.0.dev0	123456789012.dkr.ecr.us-west-2.amazonaws.com/aegc/numpy@sha256:...
 ```
 
 The columns are the Python minor, the kind (`conda`, `pip` or `registered`), the aegc version in
 the image, and the pinned image.
 
-`aegc deploy --pool numpy` then makes one pool per recorded minor, `numpy-py313` and
-`numpy-py314`, each with the options given. Each submitter's tasks go to the pool for its own
-Python minor, automatically. To deploy just one, name it: `--pool numpy:python=3.13`. A minor
-without an image is refused: `aegc: no 'numpy' image for Python 3.12; have 3.13, 3.14`.
+**The first deploy** of an env makes one pool per recorded minor, `numpy-py313` and `numpy-py314`,
+and notes that the options given apply to each, `min_vcpus` and `max_vcpus` included. So two
+minors can run twice the vCPUs of one, and the Spot quota check counts both. If some of the
+env's images were built with aegc before 0.2, those minors are skipped, with a warning. Each submitter's tasks go to the pool
+for its own Python minor, automatically.
 
-Each pool has its own `max_vcpus`, so two minors can run twice the vCPUs of one, and the Spot quota
-check counts both. There's no command to drop a minor's record yet; use `python=` to deploy only
-the ones you want.
+**A redeploy** updates only the minors already deployed for that env and size class. If the env
+has images for other minors, `deploy` says so:
+
+```
+note: numpy also has images for Python 3.14; add a pool with --pool numpy:python=3.14
+```
+
+**`python=`** picks one minor, on a first deploy or to add one later: `--pool numpy:python=3.14`.
+A minor without an image is refused: `aegc: no 'numpy' image for Python 3.12; have 3.13, 3.14`.
+
+**`aegc image forget`** drops a minor's record:
+
+```sh
+aegc image forget --env numpy --python 3.13
+```
+
+```
+forgot numpy Python 3.13; left: 3.14. Deployed pools keep running until you redeploy or prune them.
+```
+
+The image stays in ECR, where the lifecycle policy expires it unless a deployment still uses it.
+A deployed `numpy-py313` pool keeps running its image; remove it with `deploy --prune --yes`.
+
+### Where records live
+
+`/aegc/images/<env>/records` holds the map of records, one per minor. `/aegc/images/<env>` keeps
+the newest one in the single-record form that aegc 0.1 and 0.2 read, so older CLIs keep working.
+If an older `aegc image build` writes that parameter, the next read merges it in (the newer
+record for a minor wins).
 
 ## Use a new image
 
@@ -254,9 +285,9 @@ aegc deploy e2e --pool geospatial
 The pool keeps its other options. New workers run the new image; running workers keep the old one
 until they drain. Running endpoints pick up the redeploy within a minute.
 
-An image for a Python minor the env didn't have adds a pool at the next deploy (for example
-`geospatial-py315`), next to the existing one. A pool you stop listing is kept, with a warning;
-pass `--prune --yes` to remove it.
+An image for a Python minor the env didn't have doesn't change the deployment by itself: the
+redeploy notes it, and `--pool geospatial:python=3.15` adds `geospatial-py315` next to the existing
+pool. A pool you stop listing is kept, with a warning; pass `--prune --yes` to remove it.
 
 ## Old images and in-use tags
 
@@ -273,8 +304,8 @@ new builds. An env's images for every Python minor share one repository, and so 
 ## Things to know
 
 - **Tags.** A build is tagged `py<M.m>-gce<v>-aegc<v>-b<base>-w<wheelhash>`, for example
-  `py3.14-gce4.21.0-aegc0.2.0-b2026.11.13.154112-w1a2b3c4d`. `<base>` is the aarchsci or aarchbio
-  tag, or the first 12 hex digits of the SHA-256 of a `--base` reference. The wheel hash is the
+  `py3.14-gce4.21.0-aegc0.3.0.dev0-b2026.11.13.154112-w1a2b3c4d`. `<base>` is the aarchsci or
+  aarchbio tag, or the first 12 hex digits of a `--base` image's id. The wheel hash is the
   first 8 hex digits of the SHA-256 of the aegc wheel, so a code change gets a new tag. If the tag
   already exists, the build reuses the pushed image instead of pushing again.
 - **Build options.** `--gce-version` sets the `globus-compute-endpoint` version (default 4.21.0;
@@ -291,8 +322,8 @@ new builds. An env's images for every Python minor share one repository, and so 
 - **Rebuild images from before aegc 0.2.** `aegc deploy` refuses them unless given
   `--allow-old-image`: their workers ignore spend limits, `aegc stop` and the lease.
 - **Rebuild for new worker features.** [Size classes](configuration.md#size-classes) and
-  [`aegc.outputs`](data.md#return-large-outputs) need workers built from this release's code. Older
-  workers run one task per vCPU whatever the size class, and have no `aegc.outputs`.
+  [`aegc.outputs`](data.md#return-large-outputs) need images built with aegc 0.3 or later.
+  `aegc deploy` refuses `size=` on an older image, and older workers have no `aegc.outputs`.
 - **Images are big.** Science images are often several GB, which shows in cold-start time and ECR
   storage. The pull-through cache keeps aarchsci and aarchbio pulls in-region.
 - **Native arm64 builds.** On Apple Silicon the build is native. Elsewhere buildx needs QEMU, and

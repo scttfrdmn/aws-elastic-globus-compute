@@ -47,7 +47,7 @@ Globus Compute limits are the services'.
 | `aegc destroy` wait per Auto Scaling group | 600 s |
 | User data size | 16 KiB (EC2 limit) |
 | Default pool | `max_vcpus` 8, `min_vcpus` 0, 2–8 vCPU per worker, at least 4096 MiB, Spot, one slot per vCPU |
-| Size classes | `small` 1 vCPU, 2 GiB; `medium` 2 vCPUs, 8 GiB; `mem` 2 vCPUs, 16 GiB; `large` 8 vCPUs, 32 GiB; `whole` one task per instance ([table](configuration.md#size-classes)) |
+| Size classes | `small` 1 vCPU, 2 GiB; `medium` 2 vCPUs, 8 GiB; `mem` 2 vCPUs, 16 GiB; `large` 8 vCPUs, 32 GiB; `whole` one task per instance, one worker size ([table](configuration.md#size-classes)); need images built with aegc ≥ 0.3 |
 | Slots with a size class | min(vCPUs ÷ task vCPUs, memory ÷ (task GiB × 0.9)), at least 1 |
 | Largest worker | at most `max_vcpus` vCPUs (the top of `vcpu=`) |
 | Pool capacity unit | vCPUs (`DesiredCapacityType=vcpu`); v0.1 pools count workers until redeployed |
@@ -88,18 +88,19 @@ Globus Compute limits are the services'.
 | Pools per env per deployment | one per recorded Python minor and size class |
 | Recorded images per env | one per Python minor |
 | Images kept per ECR repository | the 10 most recent, plus any with an `inuse-` tag; untagged images expire after a day; shared by all of an env's minors |
-| Worker image sources | aarchsci environments, aarchbio tools, any pinned `linux/arm64` image with Python ≥ 3.11 (`--base`), or an image you built with aegc ≥ 0.2 in it (`image register`) |
+| Worker image sources | aarchsci environments, aarchbio tools, any pinned `linux/arm64` image with Python ≥ 3.11 (`--base`), or an image you built with aegc ≥ 0.3 in it, running as root or uid 57439 (`image register`) |
 
 ## Grants and outputs
 
 | Limit | Value |
 |---|---|
-| Grants per deployment | as many as fit in the worker role's inline policies: 10,240 characters in all, about 1,900 used by `aegc-worker` |
+| Grants per deployment | at most 32, and no more than fit in the worker role's inline policies (10,240 characters in all, about 1,970 used by `aegc-worker`) |
 | Grant prefix | an S3 key prefix, at most 1,024 bytes; no `*`, `?` or `${` |
-| Grant buckets | general purpose bucket names; not aegc's own `aegc-<account>-<region>` |
+| Grant buckets | general purpose bucket names; not aegc's own `aegc-<account>-<region>`; write grants only in the deployment's account |
 | Read grant | `s3:GetObject`, `s3:GetObjectVersion`, and `s3:ListBucket` for keys under the prefix |
 | Write grant | `s3:PutObject` and multipart uploads; no reads or deletes |
 | `aegc.outputs` keys | `<grant prefix>/<task uuid>/<name>` |
+| Grants seen by `aegc.outputs` | the deployment's manifest, re-read at most every 60 s |
 | Presigned URL from a worker | valid until `expires_s`, or until the instance role's credentials expire (a few hours), whichever is first |
 
 ## Housekeeping

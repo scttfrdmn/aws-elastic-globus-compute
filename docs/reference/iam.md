@@ -18,7 +18,7 @@ the command makes no AWS calls. The tests check these documents with the IAM pol
 | [operator](#operator) | The credentials the endpoint container runs with | `AWSEngine`; also `aegc cost`, `aegc limits --resume` and the spend lines of `aegc status` |
 | [deployer](#deployer) | The credentials you run `aegc deploy`, `destroy`, `stop`, `resume`, `limits`, `status`, `reap` and `footprint` with | The `aegc` CLI |
 | [bootstrap](#bootstrap) | The credentials you run `aegc bootstrap` and `unbootstrap` with | The `aegc` CLI |
-| [builder](#builder) | The credentials you run `aegc image build`, `register` and `list` with | The `aegc` CLI |
+| [builder](#builder) | The credentials you run `aegc image build`, `register`, `list` and `forget` with | The `aegc` CLI |
 
 With [grants](../how-to/data.md), `aegc deploy` adds a second inline policy to the worker role,
 [`aegc-grants`](#aegc-grants), for your own S3 prefixes. It also creates two roles of its own,
@@ -38,11 +38,11 @@ Sizes of the documents below, without whitespace:
 
 | Policy | Characters | Limit |
 |---|---|---|
-| worker | 1,900 | 10,240 for all of the role's inline policies, `aegc-grants` included |
+| worker | 1,967 | 10,240 for all of the role's inline policies, `aegc-grants` included |
 | operator | 3,059 | 6,144 |
 | deployer | 5,767 | 6,144 |
 | bootstrap | 2,311 | 6,144 |
-| builder | 1,120 | 6,144 |
+| builder | 1,142 | 6,144 |
 
 The deployer is the closest to the limit; longer region names make it a little longer.
 
@@ -51,7 +51,8 @@ The deployer is the closest to the limit; longer region names make it a little l
 What a worker may do: consume the deployment's task queues, post to its result queues, read task
 payloads and write result payloads under `payloads/<d>/`, pull `aegc/*` images, write to its log
 group, terminate itself in an Auto Scaling group tagged with the deployment, read the deployment's
-state, and write its cost ledger record under `ledger/<d>/`. Nothing else; in particular no S3
+state and manifest (for [`aegc.outputs`](../how-to/data.md#return-large-outputs)' current
+grants), and write its cost ledger record under `ledger/<d>/`. Nothing else; in particular no S3
 access outside those prefixes, so tasks read open data unsigned, and reach your own buckets only
 through [grants](#aegc-grants).
 
@@ -155,7 +156,10 @@ capacity, up to its `max_vcpus` (see [Security model](../concepts/security.md)).
       "Sid": "ReadDeploymentState",
       "Effect": "Allow",
       "Action": "ssm:GetParameter",
-      "Resource": "arn:aws:ssm:us-west-2:123456789012:parameter/aegc/e2e/state"
+      "Resource": [
+        "arn:aws:ssm:us-west-2:123456789012:parameter/aegc/e2e/state",
+        "arn:aws:ssm:us-west-2:123456789012:parameter/aegc/e2e/manifest"
+      ]
     },
     {
       "Sid": "WriteCostLedger",
@@ -240,7 +244,12 @@ it is:
       ],
       "Resource": [
         "arn:aws:s3:::my-lab-results/runs/*"
-      ]
+      ],
+      "Condition": {
+        "StringEquals": {
+          "s3:ResourceAccount": "123456789012"
+        }
+      }
     }
   ]
 }
@@ -249,14 +258,17 @@ it is:
 - All read grants share one `GrantRead` statement, and all write grants one `GrantWrite`. Each
   bucket with read grants gets a `GrantList<n>` statement, conditioned on its prefixes; a
   whole-bucket grant (`s3://bucket/`) drops the condition.
-- Write grants don't allow `GetObject`, `DeleteObject` or listing.
+- Write grants don't allow `GetObject`, `DeleteObject` or listing, and only reach buckets owned
+  by the deployment's account (`s3:ResourceAccount`), so a mistyped or squatted bucket name in
+  another account can't receive task outputs. Read grants may cross accounts.
+- At most 32 grants: they also go into each worker's user data.
 - Grants can't contain `*`, `?` or `${`, so the only wildcard is the `*` aegc appends to each
   prefix.
 - IAM counts all of a role's inline policies against 10,240 characters, without whitespace.
-  `aegc-worker` takes about 1,900, and `deploy` refuses grants that don't fit in the rest, before
-  it changes anything. The policy above is 497 characters.
-- Requester-pays buckets need nothing more. Buckets in another account must also allow the worker
-  role in their bucket policy, and buckets encrypted with a customer managed KMS key need
+  `aegc-worker` takes about 1,970, and `deploy` refuses grants that don't fit in the rest, before
+  it changes anything. The policy above is 564 characters.
+- Requester-pays buckets need nothing more. Buckets in another account (read grants only) must
+  also allow the worker role in their bucket policy, and buckets encrypted with a customer managed KMS key need
   `kms:Decrypt` or `kms:GenerateDataKey` on the key, which aegc doesn't add.
 
 The [deployer](#deployer) policy already allows `iam:PutRolePolicy` and `iam:DeleteRolePolicy` on roles
@@ -956,11 +968,12 @@ repositories, and `/aegc/bootstrap`. Roles can be passed only to ECR.
 
 ## builder
 
-What `aegc image build`, `aegc image register` and `aegc image list` need: pull a base image
-through the `aegc-quay` pull-through cache (the first pull of a base creates its cache repository),
-create and push to `aegc/<env>` repositories, and read and record images under `/aegc/images/`.
-The cache repositories are read-only to it. A `--base` or `register` image from another registry
-is pulled with your own Docker login there, not with this policy.
+What `aegc image build`, `register`, `list` and `forget` need: pull a base image through the
+`aegc-quay` pull-through cache (the first pull of a base creates its cache repository), create and
+push to `aegc/<env>` repositories, and read, write and delete image records under
+`/aegc/images/`. The cache repositories are read-only to it. A `--base` or `register` image from
+another registry is pulled with your own Docker login there; one in this account's ECR gets an ECR
+login from aegc, and needs pull access to that repository.
 
 ```json
 {
@@ -1010,6 +1023,7 @@ is pulled with your own Docker login there, not with this policy.
       "Action": [
         "ssm:GetParameter",
         "ssm:PutParameter",
+        "ssm:DeleteParameter",
         "ssm:AddTagsToResource",
         "ssm:ListTagsForResource"
       ],

@@ -71,9 +71,9 @@ fails a task with any other:
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `env` | string | the engine's `env` | Run on the pool for this env |
-| `pool` | string | | Run on this exact pool (e.g. `geospatial-py314`); overrides `env`, `size`, `cpus` and `memory_gib` |
+| `pool` | string | | Run on this exact pool (e.g. `geospatial-py314`); overrides `env` and `size`. `cpus` and `memory_gib`, if given, must fit it |
 | `walltime_s` | integer, 1 to the pool's `max_walltime` (at most 41,400) | the pool's `walltime`, else 39,600 | Kill the task after this many seconds |
-| `size` | `small`, `medium`, `mem`, `large` or `whole` | | Run on a pool of this [size class](#size-classes); a pool without one counts as `small`. Overrides `cpus` and `memory_gib` |
+| `size` | `small`, `medium`, `mem`, `large` or `whole` | | Run on a pool of this [size class](#size-classes); a pool without one counts as `small`. `cpus` and `memory_gib`, if given too, must fit it |
 | `cpus` | positive number | | vCPUs the task needs: run on the cheapest pool whose tasks get at least this many |
 | `memory_gib` | positive number | | GiB the task needs: run on the cheapest pool whose tasks get at least this much |
 
@@ -92,10 +92,14 @@ For each task the engine:
 4. otherwise takes the pools whose env is `resource_specification["env"]`, else the engine's `env`
    (all pools if both are empty), and keeps those whose image's Python minor matches the submitter
    (if known);
-5. from those, with `size`, picks the first by name of that class; otherwise keeps the pools whose
-   tasks get at least `cpus` vCPUs and `memory_gib` GiB (both 0 if not given) and picks the
-   cheapest: the fewest vCPUs held per task (for `whole`, the top of `vcpu=`), then the least
-   memory per task, then the name;
+5. from those, with `size`, picks the first by name of that class, and checks that its tasks get
+   at least `cpus` and `memory_gib`; otherwise keeps the pools whose tasks get at least `cpus`
+   vCPUs and `memory_gib` GiB (both 0 if not given) and picks the cheapest: the fewest vCPUs held
+   per task (for `whole`, the worker's vCPUs), then a sized pool over a `whole` one, then the
+   least memory per task, then the name. With `pool`, it checks `cpus` and `memory_gib` against
+   that pool. What a task gets: its class's vCPUs and GiB; for `whole`, `vcpu=` and `mem=`; for a
+   pool without a class and with fixed `slots=N`, the low end of `vcpu=` and `mem=` divided by N;
+   otherwise 1 vCPU and 2 GiB;
 6. checks `walltime_s` against the chosen pool's `max_walltime`, or applies its default `walltime`;
 7. fails the task with an `AEGC_CONFIGURATION` error if any of this fails.
 
@@ -114,13 +118,15 @@ How to use them is in [Size classes](../how-to/configuration.md#size-classes).
 | `whole` | the instance's | the instance's | not set | 1 |
 
 `GiB` is the memory the worker sees, a little under the instance's nominal size; the divisor is
-the class's memory × 0.9. Slots are always at least 1. `slots=N` overrides the count.
+the class's memory × 0.9. Slots are always at least 1. A sized pool can't also set `slots=N`.
+`size=` needs an image built with aegc 0.3 or later.
 
 For a sized pool, `deploy` sets the pool's `size_class`, `task_cpus`, `task_memory_gib` and
 `memory_gib_per_vcpu_min` in the manifest, adds `MemoryGiBPerVCpu` to the group's instance
 requirements (when the class sets one), and raises the low end of `vcpu=` to the class's vCPUs if
-`vcpu=` isn't given. For pool selection, a task in a `whole` pool is sure to get the low end of
-`vcpu=` and `mem=`. The scaler asks for the class's vCPUs per task (`whole`: the top of `vcpu=`).
+`vcpu=` isn't given. A `whole` pool has one worker size (`vcpu=N`; without `vcpu=`, the top of
+the range, 8 by default), and its tasks are sure to get that many vCPUs and `mem=`. The scaler
+asks for the class's vCPUs per task (`whole`: the worker's vCPUs).
 Pools without `size=` keep their launch template and user data unchanged.
 
 ## Pool settings
@@ -149,7 +155,7 @@ The launch template passes this to `aegc-worker run` as base64 JSON in `AEGC_WOR
 | `deployment`, `pool`, `region`, `task_queue_url`, `bucket` | From the deployment |
 | `slots` | The pool's `slots` (`auto` = the instance's CPU count, or what the size class fits) |
 | `size_class`, `task_cpus`, `task_memory_gib` | The pool's [size class](#size-classes); only for sized pools |
-| `grants` | The deployment's [grants](../how-to/data.md), `{access, bucket, prefix}` each; only when there are any. `aegc.outputs` reads the write grants from here |
+| `grants` | The deployment's [grants](../how-to/data.md), `{access, bucket, prefix}` each; only when there are any. `aegc.outputs` falls back to these if it can't read the manifest's current grants |
 | `idle_timeout_s` | The pool's `idle` (300) |
 | `visibility_s` | 300; the heartbeat runs every `visibility_s / 3` = 100 s |
 | `max_deliveries` | 4 |

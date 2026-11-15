@@ -8,45 +8,61 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 - **Bring your own worker image:** `aegc image build --env NAME --base REF` builds a worker image
-  from any pinned `linux/arm64` image with Python 3.11 or later, not only aarchsci and aarchbio.
-  micromamba/conda bases use `templates/worker/Dockerfile`; others use the new
-  `templates/worker/Dockerfile.pip`, which pip-installs `globus-compute-endpoint` and aegc with
-  the base's packages as constraints, puts `aegc-worker` on `PATH`, and runs as uid 57439.
-  `--python PATH` names the base's Python. `aegc image register --env NAME --image REF@sha256:...`
-  records an image you built yourself, after checking that it's arm64 and pinned, has aegc 0.2 or
-  later, and passes `aegc-worker selftest`; it's copied into `aegc/<env>`. `aegc image list --env
-  NAME` shows an env's images (#67).
-- **Several Python minors per env:** `/aegc/images/<env>` keeps one record per Python minor, and a
-  build or registration replaces only its own. `aegc deploy --pool env` makes one pool per minor
-  (`<env>-py313`, `<env>-py314`) and each client's tasks go to the pool for its Python;
-  `python=3.13` deploys just one. Records written by 0.2 still read (#58).
+  from any `linux/arm64` image with Python 3.11 or later and a shell, not only aarchsci and
+  aarchbio (for example `python:3.13-slim@sha256:...`; `latest` and untagged references are
+  refused). Bases in the `mambaorg/micromamba` layout use `templates/worker/Dockerfile`; others
+  use the new `templates/worker/Dockerfile.pip`, which pip-installs `globus-compute-endpoint` and
+  aegc with the base's packages as constraints, puts `aegc-worker` on `PATH`, and runs as uid
+  57439. `--python PATH` names the base's Python. Builds are identified by the base's image id,
+  so a moved tag builds anew. Local images and images in this account's ECR work as bases (#67).
+- **`aegc image register --env NAME --image REF@sha256:...`** records an image you built yourself.
+  It runs the image the way workers do, through its own entrypoint and user, and checks that it's
+  arm64 and pinned, that `aegc-worker version` reports aegc 0.3 or later and uid 0 or 57439, and
+  that `aegc-worker selftest` passes; then it copies the image into `aegc/<env>`. New
+  `aegc-worker version` prints what it checks as JSON (#67).
+- **Several Python minors per env:** `/aegc/images/<env>/records` keeps one record per Python
+  minor, and a build or registration replaces only its own; `/aegc/images/<env>` keeps the newest
+  in the 0.2 shape, so 0.2 CLIs keep working, and a record they write is merged in.
+  `aegc image list --env NAME` shows an env's images and `aegc image forget --env NAME --python
+  3.NN` drops one (the builder policy gains `ssm:DeleteParameter`). The first `aegc deploy --pool
+  env` makes one pool per recorded minor (`<env>-py313`, `<env>-py314`), skipping images built
+  before aegc 0.2, and notes that the options apply to each; a redeploy updates only the minors
+  already deployed and notes new ones, and `python=3.NN` picks or adds one. Each client's tasks go
+  to the pool for its Python (#58).
 - **Size classes:** the pool option `size=small|medium|mem|large|whole` gives each task 1 vCPU and
   2 GiB, 2 and 8, 2 and 16, 8 and 32, or a whole instance. It names the pool
   `<env>-py<NNN>-<size>`, sets `MemoryGiBPerVCpu` for instance selection, raises the low end of
-  `vcpu=` to fit a task, and sets the workers' slots from both vCPUs and memory. Tasks choose with
+  `vcpu=` to fit a task, and sets the workers' slots from both vCPUs and memory, so it can't be
+  combined with `slots=N`. `size=whole` needs one worker size (`vcpu=N`, 8 by default) and counts
+  that many vCPUs per task. `size=` needs an image built with aegc 0.3 or later. Tasks choose with
   `resource_specification={"size": ...}`, or `{"cpus": N, "memory_gib": M}` for the cheapest pool
-  that fits; `vcpus`, `memory` and similar get a "did you mean" hint. Pools without `size=` keep
-  their name, launch template and user data. Sized pools need worker images, and the size keys
-  an endpoint image, built from this release. Workers record the host's vCPUs in the cost ledger,
+  that fits (a sized pool before a `whole` one on a tie); with `size` or `pool`, `cpus` and
+  `memory_gib` are checked against the chosen pool. Unsized pools with fixed `slots=N` offer each
+  task their smallest worker divided by N. `vcpus`, `memory` and similar get a "did you mean"
+  hint. Pools without `size=` keep their name, launch template and user data. The size keys need
+  an endpoint image built from this release. Workers record the host's vCPUs in the cost ledger,
   not their slot count (#18).
-- Docs: a how-to for bringing your own image and for several Python minors, a how-to for grants
-  and `aegc.outputs`, size classes in the configuration guide and reference, and the
-  `aegc-grants` policy in the IAM reference.
 - **Worker data-access grants:** `aegc deploy <d> --grant read=s3://bucket/prefix --grant
-  write=s3://bucket/prefix` (repeatable) lets every task in the deployment read or write under
-  your own S3 prefixes, through the worker role's inline policy `aegc-grants`. Read grants allow
-  `GetObject`, `GetObjectVersion` and `ListBucket` for keys under the prefix; write grants allow
-  `PutObject` and multipart uploads. `s3://bucket/` (with the slash) means the whole bucket.
+  write=s3://bucket/prefix` (repeatable, at most 32) lets every task in the deployment read or
+  write under your own S3 prefixes, through the worker role's inline policy `aegc-grants`. Read
+  grants allow `GetObject`, `GetObjectVersion` and `ListBucket` for keys under the prefix, in any
+  account; write grants allow `PutObject` and multipart uploads, only in buckets the deployment's
+  account owns (`s3:ResourceAccount`). `s3://bucket/` (with the slash) means the whole bucket.
   Wildcards, invalid bucket names and aegc's own bucket are refused, and so are more grants than
   fit in IAM's 10,240 inline-policy characters. The grants are kept in the manifest and across
   redeploys; `--grant` replaces them and `--grant none` removes them. Requester-pays buckets need
   no extra IAM: pass `RequestPayer='requester'` (#53).
 - **`aegc.outputs`**, for results larger than Globus Compute's ~10 MB limit: inside a task,
-  `outputs.put(data_or_path, name=None, prefix=None)` uploads to
-  `<write grant prefix>/<task uuid>/<name>` (multipart for large files) and returns the `s3://`
-  URI; `outputs.get`, `outputs.download` and `outputs.uri_to_https` (plain or presigned) read it
-  back. Without a write grant it raises `PermissionError`, naming the `--grant` to add. Workers
-  export `AEGC_TASK_UUID` to each task (#54).
+  `outputs.put(data, name=None, *, prefix=None)` uploads bytes, or a file given by path (`str` or
+  `Path`; a missing file raises `FileNotFoundError`), to `<write grant prefix>/<task uuid>/<name>`
+  (multipart for large files) and returns the `s3://` URI; `outputs.get`, `outputs.download` and
+  `outputs.uri_to_https` (plain or presigned) read it back. It reads the deployment's current
+  grants from the manifest (cached 60 s), so a redeploy's grants reach running workers; the worker
+  policy may now read the manifest. Without a write grant it raises `PermissionError`, naming the
+  `--grant` to add. Workers export `AEGC_TASK_UUID` to each task (#54).
+- Docs: a how-to for bringing your own image and for several Python minors, a how-to for grants
+  and `aegc.outputs`, size classes in the configuration guide and reference, the `aegc-grants`
+  policy in the IAM reference, and a Mermaid diagram in the README.
 
 ## [0.2.0] - 2026-11-15
 

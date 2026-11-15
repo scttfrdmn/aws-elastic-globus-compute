@@ -207,7 +207,7 @@ refuses a `vcpu=` range that does, and narrows the default range to fit a small 
 example `max_vcpus=4` gives `vcpu=2-4`).
 
 The scaler asks for the vCPUs that the pool's demand needs (queued plus running tasks): with
-`slots=auto`, one vCPU per task, or the size class's vCPUs per task (`whole`: the top of `vcpu=`); with `slots=N`, one worker of the pool's smallest size per N tasks.
+`slots=auto`, one vCPU per task, or the size class's vCPUs per task (`whole`: the worker's vCPUs); with `slots=N`, one worker of the pool's smallest size per N tasks.
 Under spend limits, the scaler asks in whole workers of the smallest size (a 1-vCPU demand becomes
 a 2-vCPU worker) and admits whole workers. Auto Scaling can launch an instance larger than the
 vCPUs it still needs, so a group can end up somewhat above its desired capacity; a narrow `vcpu=`
@@ -222,8 +222,9 @@ converted with the smallest size, with a warning.
 
 Globus Compute serializes functions with the submitter's Python, so the worker must run the same
 Python minor version. `aegc image build` and `aegc image register` read the Python version from
-the image, and the env's record keeps one image per minor. `aegc deploy` makes a pool for each,
-and the pool name records it (`-py314`, `-py313`). The engine routes each task to the pool whose
+the image, and the env's record keeps one image per minor. The first `aegc deploy` of an env makes
+a pool for each (a redeploy updates those, and `python=` adds another), and the pool name records
+the minor (`-py314`, `-py313`). The engine routes each task to the pool whose
 image matches the submitter. If there is none, the task fails with:
 
 ```

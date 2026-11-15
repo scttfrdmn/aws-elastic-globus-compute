@@ -207,22 +207,24 @@ requests to other buckets are denied, even public ones.
   `AWS_REQUEST_PAYER=requester` (GDAL). Without it, S3 denies the request.
 - **Reading back what tasks wrote:** a write grant doesn't allow reads; add a read grant on the
   same prefix.
-- **Another account's bucket, or a KMS key:** the bucket policy must allow the worker role, and a
-  customer managed key must allow `kms:Decrypt`.
+- **Another account's bucket, or a KMS key:** for reads, the bucket policy must allow the worker
+  role, and a customer managed key must allow `kms:Decrypt`. Writes to another account's bucket
+  are always denied.
 
 See [Read and write your data](data.md).
 
 ## aegc.outputs fails
 
-- **`PermissionError: no write grant: deploy with ...`:** the deployment has no write grant, or the
-  worker booted before you added it (workers read their grants at boot). Add
-  `--grant write=s3://bucket/prefix/`; new workers pick it up.
+- **`PermissionError: no write grant: deploy with ...`:** the deployment has no write grant. Add
+  `--grant write=s3://bucket/prefix/`; running workers see it within a minute.
 - **`PermissionError: s3://... isn't inside a write grant (...)`:** `prefix=` points outside every
   write grant. Use one of the grants listed, or add one.
 - **`ModuleNotFoundError: No module named 'aegc.outputs'`:** the worker image was built with an
   older aegc. Rebuild it from the current source tree.
-- **An object containing a path, not the file:** `outputs.put("/scratch/x")` uploads the string.
-  Pass a `pathlib.Path`.
+- **`FileNotFoundError: no file '...' to upload`:** `put` takes bytes or the path of a file that
+  exists. To upload text, pass `text.encode()`.
+- **`AccessDenied` on a write:** the bucket isn't in the deployment's account; write grants only
+  reach your own account's buckets.
 
 ## Credentials in the endpoint
 
@@ -258,13 +260,24 @@ failed` meanwhile.
 - **`unknown size class 'huge'; one of: ...`:** use `small`, `medium`, `mem`, `large` or `whole`.
 - **`size=large gives each task 8 vCPUs, so workers need at least that many: vcpu=4-8 is too
   small`:** raise the low end of `vcpu=`, or leave `vcpu=` out and `deploy` picks it.
+- **`size=whole needs one worker size, e.g. vcpu=16; not vcpu=4-16`:** give one number,
+  `vcpu=16`.
+- **`size=mem sets each worker's slots from its vCPUs and memory; drop slots=4`:** remove `slots=`
+  from a sized pool.
+- **`size=mem needs a worker image built with aegc 0.3 or later ...`:** rebuild the env's image
+  with `aegc image build` (or register a newer one) and deploy again.
+- **`note: x also has images for Python 3.14; add a pool with --pool x:python=3.14`:** a redeploy
+  updates only the minors already deployed. Add the new one with `python=`.
+- **`warning: skipping x Python 3.12: built with aegc < 0.2`:** rebuild that minor's image, or
+  `aegc image forget --env x --python 3.12`.
 - **`pool name ... must be 1-40 chars ... (with size=medium, env names can be at most 27
   characters)`:** use a shorter env name for sized pools.
 - **Grant errors:** `a grant is read=s3://bucket/prefix or write=s3://...`, `s3://x has no prefix:
   give s3://x/PREFIX, or s3://x/ to grant the whole bucket`, `grants can't use wildcards`,
   `not a valid general purpose S3 bucket name`, `... is aegc's own bucket`, `--grant none clears
   the grants; don't combine it with others`, and `deployment d's N grants need a ...-character IAM
-  policy, but the worker role has room for ...`: fix the `--grant` values; nothing was changed.
+  policy, but the worker role has room for ...`, and `deployment d has N grants; at most 32`: fix
+  the `--grant` values; nothing was changed.
 - **`no default VPC in this region`:** aegc needs the region's default VPC.
 - **`max_vcpus=N is smaller than one worker`** or **`vcpu=LO-HI allows workers larger than
   max_vcpus=N`:** no worker may be larger than the pool; lower the top of `vcpu=` or raise
@@ -293,26 +306,33 @@ failed` meanwhile.
 
 ## Building or registering images
 
+Docker failures during `image build` and `image register` are reported as
+``aegc: `<command>` failed (exit N)``, with Docker's own output above it.
+
 - **`give either --base REF or --base-tag TAG (with --source)`**, or argparse's `one of the
   arguments --base-tag --base is required`: give exactly one.
 - **`pin the base image (...): use repo@sha256:... or an immutable tag, not latest or no tag`**
-  (or `pin the image` from `register`): use a digest or a dated tag.
+  (or `pin the image` from `register`): add a digest or a tag.
+- **`can't pull <ref>: ...`:** the image isn't local and can't be pulled. Log in to its registry
+  (aegc logs in to this account's ECR itself), or check the name.
+- **`<ref> is amd64, not arm64: workers are Graviton`:** build with `--platform linux/arm64`.
+- **`couldn't run a shell in <base>: a base image needs sh`:** distroless bases can't be built
+  over. Use a base with a shell, or build the image yourself.
 - **`aegc workers need Python >= 3.11`** during a `--base` build: the base's Python is too old, or
   `--python` names the wrong one.
-- **pip can't resolve the install** during a `--base` build: the base pins a package at a version
+- **`aegc: <python> has no pip and no ensurepip; add pip to the base`:** install pip in the base
+  (`apt-get install python3-pip` on Debian and Ubuntu).
+- **pip can't resolve the install** during a `--base` build: the base has a package at a version
   `globus-compute-endpoint` can't use. Change the base, or build the image yourself and register it.
 - **`base env modified outside allowlist: ...`** during a conda build: installing
   `globus-compute-endpoint` would change a package in the base.
-- **`<image> is amd64, not arm64: workers are Graviton`** from `register`: build with
-  `--platform linux/arm64`.
-- **`<image> has aegc 0.1.0; workers need aegc 0.2 or later`** from `register`: install the
-  current aegc wheel in the image.
-- **`register` fails with a Docker error** (a failed `docker pull`, or `selftest` failing): the
-  output above the traceback says which step. Check that you're logged in to the image's
-  registry, and that `aegc-worker selftest` passes in `docker run --rm <image> aegc-worker selftest`.
-- **Workers of a registered image never run tasks**, and the instances are replaced: check that
-  the image runs as uid 57439 (or root) and that its entrypoint runs its arguments; see
-  [Register an image you built](images.md#register-an-image-you-built).
-- **A rebuild changed nothing** (`... already exists (same aegc code and base); reusing it`): the
-  base reference and the aegc code are unchanged. If the base's contents changed under the same
-  tag, give it a new tag.
+- **`` `docker run <image> aegc-worker version` failed ``** from `register`: the image has no
+  `aegc-worker` on `PATH`, an aegc older than 0.3, or an entrypoint that doesn't run the command
+  it's given. Try `docker run --rm <image> aegc-worker version` yourself.
+- **`<image> has aegc 0.2.0; registered images need aegc 0.3 or later`:** install the current aegc
+  wheel in the image.
+- **`<image> runs as uid 1000; workers need root or uid 57439`:** add `USER 57439` (after creating
+  the user) to your Dockerfile.
+- **`` aegc: `docker run --rm <image> aegc-worker selftest` failed ``:** the probe task didn't run
+  in the image; its output above says why, often a missing or broken `globus-compute-endpoint`.
+- **`no 'x' image for Python 3.12; have ...`** from `image forget`: check `aegc image list --env x`.
