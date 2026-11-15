@@ -144,3 +144,40 @@ def test_prune_pool(env: tuple[Clients, DeploymentSpec]) -> None:
     assert not c.autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[ASG])[
         "AutoScalingGroups"
     ]
+
+
+@pytest.mark.timeout(60)
+def test_status_v2(env: tuple[Clients, DeploymentSpec], aws: Callable[[str], Any]) -> None:
+    import json
+
+    from aegc import naming, ops
+    from tests.conftest import ACCOUNT, REGION
+    from tests.substrate_gaps import launch_on_substrate
+
+    c, _ = env
+    bucket = naming.bucket_name(ACCOUNT, REGION)
+    s3 = aws("s3")
+    s3.create_bucket(Bucket=bucket, CreateBucketConfiguration={"LocationConstraint": REGION})
+    deployed(env)
+    control.set_limits(ssm=c.ssm, autoscaling=c.autoscaling, deployment="dev", max_usd_day=2.0)
+    launch_on_substrate(c.autoscaling, ASG)  # substrate#1497
+    c.autoscaling.set_desired_capacity(AutoScalingGroupName=ASG, DesiredCapacity=1)
+    ledger.write(
+        s3, bucket,
+        ledger.Record(
+            instance_id="i-x", deployment="dev", pool=POOL.name, instance_type="c8g.large",
+            availability_zone="us-west-2a", lifecycle="on-demand", vcpus=2,
+            launched_at=NOON - 3600, last_seen=NOON - 1, exit_reason="idle",
+        ),
+    )  # fmt: skip
+    state.write_state(c.ssm, "dev", state.State(mode="stopped", reason="aegc stop"))
+    st = ops.status(
+        ssm=c.ssm, sqs=c.sqs, autoscaling=c.autoscaling, deployment="dev", region=REGION,
+        s3=s3, prices=pricing.Prices(region=REGION), now=NOON,
+    )  # fmt: skip
+    text = st.render()
+    assert st.state == "stopped" and "aegc resume dev" in text
+    assert "$2/day" in text and st.spend_today is not None and st.spend_today > 0.08
+    (p,) = st.pools
+    assert sum(p.workers.values()) == 1 and p.usd_per_hour > 0 and st.usd_per_hour > 0
+    assert json.loads(json.dumps(st.to_dict()))["state"] == "stopped"

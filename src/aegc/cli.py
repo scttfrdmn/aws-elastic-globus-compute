@@ -451,6 +451,8 @@ def _status(args: argparse.Namespace) -> int:
     from aegc import awsutil, ops
 
     sess, region, _ = _ctx(args)
+    from aegc import pricing
+
     st = ops.status(
         ssm=awsutil.client(sess, "ssm"),  # type: ignore[arg-type]
         sqs=awsutil.client(sess, "sqs"),  # type: ignore[arg-type]
@@ -459,8 +461,18 @@ def _status(args: argparse.Namespace) -> int:
         region=region,
         sq=awsutil.client(sess, "service-quotas"),  # type: ignore[arg-type]
         cw=awsutil.client(sess, "cloudwatch"),  # type: ignore[arg-type]
+        s3=awsutil.client(sess, "s3"),  # type: ignore[arg-type]
+        prices=pricing.Prices(
+            region=region,
+            ec2=awsutil.client(sess, "ec2"),  # type: ignore[arg-type]
+            pricing=awsutil.client(awsutil.session(args.profile, "us-east-1"), "pricing"),
+        ),
+        scheduler=awsutil.client(sess, "scheduler"),  # type: ignore[arg-type]
     )
-    print(st.render())
+    if args.json:
+        print(json.dumps(st.to_dict(), indent=2, sort_keys=True))
+    else:
+        print(st.render())
     return 0
 
 
@@ -590,8 +602,11 @@ def build_parser() -> argparse.ArgumentParser:
     fp.add_argument("deployment")
     fp.set_defaults(func=_footprint)
 
-    st = sub.add_parser("status", help="pools, queues, workers and waiting results")
+    st = sub.add_parser(
+        "status", help="state, spend, limits, lease, pools, queues, workers and waiting results"
+    )
     st.add_argument("deployment")
+    st.add_argument("--json", action="store_true", help="machine-readable output")
     st.set_defaults(func=_status)
 
     rp = sub.add_parser("reap", help="delete idle result queues of finished endpoint processes")
