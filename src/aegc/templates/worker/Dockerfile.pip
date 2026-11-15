@@ -1,0 +1,36 @@
+# syntax=docker/dockerfile:1
+# aegc worker image over ANY arm64 base with a Python >= 3.11 (no conda needed): installs
+# globus-compute-endpoint and aegc-worker into that Python with pip, without changing the
+# packages the base already has. Rendered and built by `aegc image build --base REF`.
+ARG BASE
+FROM ${BASE}
+ARG GCE_VERSION
+ARG PYTHON=python3
+ARG AEGC_UID=57439
+USER root
+COPY dist/ /opt/aegc/dist/
+# 1. The base's own packages become constraints, so installing aegc can't change them.
+# 2. globus-compute-endpoint and the aegc wheel, then `pip check`.
+# 3. aegc-worker on PATH, and a non-root user with the uid the host's /scratch belongs to.
+RUN set -e; \
+    PY="$(command -v "${PYTHON}" || echo "${PYTHON}")"; \
+    "$PY" -c 'import sys; assert sys.version_info >= (3, 11), "aegc workers need Python >= 3.11, not " + sys.version'; \
+    "$PY" -m pip --version >/dev/null 2>&1 || "$PY" -m ensurepip --upgrade; \
+    "$PY" -m pip list --format=freeze > /opt/aegc/constraints.txt; \
+    PIP_BREAK_SYSTEM_PACKAGES=1 PIP_ROOT_USER_ACTION=ignore "$PY" -m pip install --no-cache-dir -c /opt/aegc/constraints.txt \
+        "globus-compute-endpoint==${GCE_VERSION}" /opt/aegc/dist/*.whl; \
+    "$PY" -m pip check; \
+    rm -rf /opt/aegc/dist; \
+    BIN="$("$PY" -c 'import shutil; print(shutil.which("aegc-worker") or "")')"; \
+    if [ -z "$BIN" ]; then BIN="$("$PY" -c 'import sysconfig; print(sysconfig.get_path("scripts"))')/aegc-worker"; fi; \
+    [ -x /usr/local/bin/aegc-worker ] || ln -s "$BIN" /usr/local/bin/aegc-worker; \
+    if ! getent passwd "${AEGC_UID}" >/dev/null; then \
+        useradd --create-home --uid "${AEGC_UID}" aegc 2>/dev/null \
+        || adduser -D -u "${AEGC_UID}" aegc; \
+    fi
+USER ${AEGC_UID}
+# User data runs `docker run ... <image> aegc-worker run`: no wrapper entrypoint.
+ENTRYPOINT []
+RUN "${PYTHON}" -c "from globus_compute_endpoint.engines.helper import execute_task; import aegc.worker.agent" \
+ && aegc-worker selftest
+CMD ["aegc-worker", "run"]

@@ -513,3 +513,30 @@ def test_verify_sees_worker_network_interfaces(aws: Callable[[str], Any]) -> Non
         Filters=[{"Name": "tag:aegc:deployment", "Values": ["dev"]}]
     )
     assert eni["NetworkInterfaces"] == []
+
+
+def test_cli_deploy_fans_out_over_python_minors(
+    env: tuple[Clients, DeploymentSpec], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aegc import cli
+
+    c, _ = env
+    for minor in ("3.14", "3.13"):
+        images.record_image(c.ssm, images.ImageRecord(
+            env="geospatial", python_minor=minor, image=IMAGE, tag=f"t{minor}", base="b",
+            gce_version="4.21.0", aegc_version="0.3.0", built_at=1))  # fmt: skip
+    monkeypatch.setattr(cli, "_clients", lambda sess: c)
+    monkeypatch.setattr(cli, "_quota_preflight", lambda sess, pools: [])
+    argv = ["--region", REGION, "deploy", "dev", "--max-usd-day", "5"]
+    assert cli.main([*argv, "--pool", "geospatial:max_vcpus=4"]) == 0
+    pools = deployment.read_manifest(c.ssm, "dev")["pools"]
+    assert sorted(pools) == ["geospatial-py313", "geospatial-py314"]
+    assert {p["python_minor"] for p in pools.values()} == {"3.13", "3.14"}
+    assert {p["max_vcpus"] for p in pools.values()} == {4}
+    # python= picks one; the other is kept (not pruned) and keeps its options.
+    assert cli.main([*argv, "--pool", "geospatial:python=3.13,max_vcpus=8"]) == 0
+    pools = deployment.read_manifest(c.ssm, "dev")["pools"]
+    assert pools["geospatial-py313"]["max_vcpus"] == 8
+    assert pools["geospatial-py314"]["max_vcpus"] == 4
+    with pytest.raises(SystemExit, match=r"3\.12"):
+        cli.main([*argv, "--pool", "geospatial:python=3.12"])

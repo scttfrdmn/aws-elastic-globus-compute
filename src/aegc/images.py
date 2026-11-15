@@ -1,11 +1,19 @@
-"""Worker images: an aarchsci/aarchbio environment plus globus-compute-endpoint and aegc-worker.
+"""Worker images: a science environment plus globus-compute-endpoint and aegc-worker.
 
-``aegc image build`` renders ``templates/worker/Dockerfile``, builds it natively for arm64 with
-buildx, reads the Python version from the built image, pushes it to ECR as ``aegc/<env>``, and
-records ``{env, python_minor, image@digest}`` at ``/aegc/images/<env>`` for ``aegc deploy``.
+``aegc image build`` builds natively for arm64 with buildx, reads the Python version from the
+built image, pushes it to ECR as ``aegc/<env>``, and records it at ``/aegc/images/<env>`` for
+``aegc deploy``. One record per Python minor: an env can have images for several.
 
-Bases come through the ``aegc-quay`` pull-through cache (``aegc bootstrap``), so pulls stay
-in-region.
+Bases:
+
+- **aarchsci/aarchbio** (``--source``, ``--base-tag``): conda environments, built with
+  ``templates/worker/Dockerfile`` through the ``aegc-quay`` pull-through cache (in-region pulls).
+- **any arm64 image** (``--base REF``): if it's a micromamba/conda image, the same Dockerfile;
+  otherwise ``templates/worker/Dockerfile.pip``, which pip-installs into the base's Python without
+  changing its packages.
+
+``aegc image register`` records an image you built yourself (``FROM`` yours, plus
+``pip install aws-elastic-globus-compute globus-compute-endpoint``) after checking it.
 """
 
 from __future__ import annotations
@@ -71,19 +79,49 @@ LIFECYCLE = {
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
 
+#: The uid user data chowns the host's /scratch to (aarchsci's mambauser).
+WORKER_UID = 57439
+CONDA_PYTHON = "/opt/conda/bin/python"
+
+
 @dataclass(frozen=True)
 class ImageSpec:
     env: str
-    base_tag: str  # an immutable aarchsci tag (YYYY.MM.DD.HHMMSS) or aarchbio <version>--<build>
+    base_tag: str = (
+        ""  # an immutable aarchsci tag (YYYY.MM.DD.HHMMSS) or aarchbio <version>--<build>
+    )
     source: str = "aarchsci"
     gce_version: str = DEFAULT_GCE_VERSION
     allow_change: tuple[str, ...] = DEFAULT_ALLOW_CHANGE
+    base: str = ""  # any arm64 image ref, pinned (``repo@sha256:...`` or an immutable tag)
+    python: str = ""  # interpreter in a pip base (default: python3)
 
     def __post_init__(self) -> None:
         if self.source not in SOURCES:
             raise ValueError(f"source must be one of {sorted(SOURCES)}")
-        if self.base_tag in {"latest", ""}:
+        if bool(self.base) == bool(self.base_tag):
+            raise ValueError("give either --base REF or --base-tag TAG (with --source)")
+        if self.base_tag == "latest":
             raise ValueError("pin an immutable base tag, not 'latest'")
+        if self.base and not _pinned(self.base):
+            raise ValueError(
+                f"pin the base image ({self.base!r}): use repo@sha256:... or an immutable tag, "
+                "not latest or no tag"
+            )
+
+    @property
+    def base_id(self) -> str:
+        """Short, tag-safe identity of the base: the aarch tag, or a hash of the ref."""
+        if self.base_tag:
+            return self.base_tag
+        return hashlib.sha256(self.base.encode()).hexdigest()[:12]
+
+
+def _pinned(ref: str) -> bool:
+    if "@sha256:" in ref:
+        return True
+    last = ref.rsplit("/", 1)[-1]
+    return ":" in last and not last.endswith(":latest")
 
 
 @dataclass(frozen=True)
@@ -96,6 +134,8 @@ class ImageRecord:
     gce_version: str
     aegc_version: str
     built_at: int
+    base_kind: str = "conda"  # conda, pip or registered
+    python: str = CONDA_PYTHON
 
 
 def registry(account: str, region: str) -> str:
@@ -103,6 +143,8 @@ def registry(account: str, region: str) -> str:
 
 
 def base_ref(spec: ImageSpec, *, account: str, region: str, through_cache: bool = True) -> str:
+    if spec.base:  # straight from its registry: workers only ever pull the aegc/<env> copy
+        return spec.base
     repo = f"{SOURCES[spec.source]}/{spec.env}:{spec.base_tag}"
     if through_cache:
         return f"{registry(account, region)}/{naming.pull_through_prefix()}/{repo}"
@@ -114,9 +156,7 @@ def image_tag(python_minor: str, spec: ImageSpec, wheel_hash: str) -> str:
 
     The wheel hash gives each code change its own tag (hatchling wheels are reproducible).
     """
-    return (
-        f"py{python_minor}-gce{spec.gce_version}-aegc{__version__}-b{spec.base_tag}-w{wheel_hash}"
-    )
+    return f"py{python_minor}-gce{spec.gce_version}-aegc{__version__}-b{spec.base_id}-w{wheel_hash}"
 
 
 def wheel_hash(wheel_dir: Path) -> str:
@@ -314,14 +354,22 @@ def inuse_tags(ecr: Any, deployment: str) -> dict[str, list[str]]:
 
 
 def record_image(ssm: Any, rec: ImageRecord) -> None:
+    """Record ``rec`` as the env's image for its Python minor (other minors are kept)."""
     name = naming.image_parameter(rec.env)
-    value = json.dumps(asdict(rec), sort_keys=True)
     try:
-        ssm.get_parameter(Name=name)
-        ssm.put_parameter(Name=name, Value=value, Type="String", Overwrite=True)
+        records = read_images(ssm, rec.env)
+        exists = True
     except Exception as e:
         if not is_not_found(e):
             raise
+        records, exists = {}, False
+    records[rec.python_minor] = rec
+    value = json.dumps(
+        {"records": {m: asdict(r) for m, r in sorted(records.items())}}, sort_keys=True
+    )
+    if exists:
+        ssm.put_parameter(Name=name, Value=value, Type="String", Overwrite=True)
+    else:
         ssm.put_parameter(
             Name=name,
             Value=value,
@@ -330,16 +378,37 @@ def record_image(ssm: Any, rec: ImageRecord) -> None:
         )
 
 
-def read_image(ssm: Any, env: str) -> ImageRecord:
-    value = ssm.get_parameter(Name=naming.image_parameter(env))["Parameter"]["Value"]
-    return ImageRecord(**json.loads(value))
+def _record(raw: dict[str, Any]) -> ImageRecord:
+    known = {f for f in ImageRecord.__dataclass_fields__}
+    return ImageRecord(**{k: v for k, v in raw.items() if k in known})
 
 
-def build_context(dest: Path, *, wheel_dir: Path) -> Path:
-    """Copy the Dockerfile, the env guard and the aegc wheel(s) into a fresh build context."""
+def read_images(ssm: Any, env: str) -> dict[str, ImageRecord]:
+    """The env's images, by Python minor. Reads the single-record form of aegc 0.1/0.2 too."""
+    value = json.loads(ssm.get_parameter(Name=naming.image_parameter(env))["Parameter"]["Value"])
+    if "records" in value:
+        return {m: _record(r) for m, r in value["records"].items()}
+    rec = _record(value)
+    return {rec.python_minor: rec}
+
+
+def read_image(ssm: Any, env: str, python_minor: str | None = None) -> ImageRecord:
+    """One image of ``env``: for ``python_minor``, or the only/newest one."""
+    records = read_images(ssm, env)
+    if python_minor:
+        if python_minor not in records:
+            raise KeyError(f"no {env!r} image for Python {python_minor}; have {sorted(records)}")
+        return records[python_minor]
+    return max(records.values(), key=lambda r: r.built_at)
+
+
+def build_context(dest: Path, *, wheel_dir: Path, kind: str = "conda") -> Path:
+    """Copy the Dockerfile for the base's kind, the env guard and the aegc wheel(s) into a fresh
+    build context (always named ``Dockerfile`` there)."""
     templates = resources.files("aegc") / "templates" / "worker"
-    for name in ("Dockerfile", "aegc_env_guard.py"):
-        (dest / name).write_bytes((templates / name).read_bytes())
+    source = "Dockerfile.pip" if kind == "pip" else "Dockerfile"
+    (dest / "Dockerfile").write_bytes((templates / source).read_bytes())
+    (dest / "aegc_env_guard.py").write_bytes((templates / "aegc_env_guard.py").read_bytes())
     dist = dest / "dist"
     dist.mkdir()
     wheels = sorted(wheel_dir.glob("aws_elastic_globus_compute-*.whl"))
@@ -358,7 +427,14 @@ def build_wheel(project_dir: Path, out_dir: Path, run: Runner = subprocess.run) 
     return out_dir
 
 
-def docker_build_args(spec: ImageSpec, *, base: str, local_tag: str, context: Path) -> list[str]:
+def docker_build_args(
+    spec: ImageSpec, *, base: str, local_tag: str, context: Path, kind: str = "conda"
+) -> list[str]:
+    extra = (
+        ["--build-arg", f"PYTHON={spec.python or 'python3'}",
+         "--build-arg", f"AEGC_UID={WORKER_UID}"]
+        if kind == "pip" else []
+    )  # fmt: skip
     return [
         "docker", "buildx", "build",
         "--platform", "linux/arm64",
@@ -366,6 +442,7 @@ def docker_build_args(spec: ImageSpec, *, base: str, local_tag: str, context: Pa
         "--build-arg", f"BASE={base}",
         "--build-arg", f"GCE_VERSION={spec.gce_version}",
         "--build-arg", f"AEGC_ALLOW_CHANGE={','.join(spec.allow_change)}",
+        *extra,
         "--label", f"org.opencontainers.image.base.name={base}",
         "--label", f"science.aarch.aegc.version={__version__}",
         "--label", f"science.aarch.aegc.gce={spec.gce_version}",
@@ -374,10 +451,23 @@ def docker_build_args(spec: ImageSpec, *, base: str, local_tag: str, context: Pa
     ]  # fmt: skip
 
 
-def python_minor_of(image: str, run: Runner = subprocess.run) -> str:
+def detect_kind(base: str, run: Runner = subprocess.run) -> str:
+    """``conda`` for a micromamba/conda image (``/opt/conda`` and micromamba), else ``pip``."""
     out = run(
         [
-            "docker", "run", "--rm", "--entrypoint", "/opt/conda/bin/python", image,
+            "docker", "run", "--rm", "--platform", "linux/arm64", "--entrypoint", "sh", base, "-c",
+            "test -x /opt/conda/bin/python && command -v micromamba >/dev/null && echo conda"
+            " || echo pip",
+        ],
+        check=True, capture_output=True, text=True,
+    )  # fmt: skip
+    return "conda" if out.stdout.strip().endswith("conda") else "pip"
+
+
+def python_minor_of(image: str, run: Runner = subprocess.run, python: str = CONDA_PYTHON) -> str:
+    out = run(
+        [
+            "docker", "run", "--rm", "--entrypoint", python, image,
             "-c", "import sys; print('%d.%d' % sys.version_info[:2])",
         ],
         check=True, capture_output=True, text=True,
@@ -429,22 +519,25 @@ def build(
 ) -> ImageRecord | str:
     """Build, and by default push and record, a worker image. Returns the record or local tag."""
     base = base_ref(spec, account=account, region=region, through_cache=through_cache)
-    local_tag = f"aegc-build/{spec.env}:{spec.base_tag}"
+    local_tag = f"aegc-build/{spec.env}:{spec.base_id}"
+    cached = through_cache and not spec.base
     with tempfile.TemporaryDirectory(prefix="aegc-image-") as tmp:
         wheels = build_wheel(project_dir, Path(tmp) / "wheels", run=run)
         whash = wheel_hash(wheels)
         ctx_dir = Path(tmp) / "ctx"
         ctx_dir.mkdir()
-        ctx = build_context(ctx_dir, wheel_dir=wheels)
-        if through_cache:
+        if cached:
             docker_login(ecr, run=run)  # the base comes from the ECR pull-through cache
-        log(f"building {spec.env} from {base}")
+        kind = detect_kind(base, run=run) if spec.base else "conda"
+        ctx = build_context(ctx_dir, wheel_dir=wheels, kind=kind)
+        log(f"building {spec.env} from {base} ({kind} base)")
         run(
-            docker_build_args(spec, base=base, local_tag=local_tag, context=ctx),
+            docker_build_args(spec, base=base, local_tag=local_tag, context=ctx, kind=kind),
             check=True,
             text=True,
         )
-    minor = python_minor_of(local_tag, run=run)
+    python = CONDA_PYTHON if kind == "conda" else (spec.python or "python3")
+    minor = python_minor_of(local_tag, run=run, python=python)
     log(f"built {local_tag}: Python {minor}")
     if not push_image:
         return local_tag
@@ -466,10 +559,86 @@ def build(
         gce_version=spec.gce_version,
         aegc_version=__version__,
         built_at=int(time.time()),
+        base_kind=kind,
+        python=python,
     )
     record_image(ssm, rec)
-    log(f"pushed {pinned}; recorded {naming.image_parameter(spec.env)}")
+    log(f"pushed {pinned}; recorded {naming.image_parameter(spec.env)} (Python {minor})")
     return rec
+
+
+def register(
+    env: str,
+    image: str,
+    *,
+    account: str,
+    region: str,
+    ecr: Any,
+    ssm: Any,
+    python: str = "python3",
+    run: Runner = subprocess.run,
+    log: Callable[[str], None] = print,
+) -> ImageRecord:
+    """Check an image you built, copy it into ``aegc/<env>`` and record it.
+
+    The image must be ``linux/arm64``, pinned, and contain aegc (>= 0.2) and
+    globus-compute-endpoint in ``python``: ``aegc-worker selftest`` must pass in it.
+    """
+    naming.validate_name("pool", f"{env}-py314")  # the env must fit in a pool name
+    if not _pinned(image):
+        raise ValueError(f"pin the image ({image!r}): repo@sha256:... or an immutable tag")
+    run(["docker", "pull", "--platform", "linux/arm64", image], check=True, text=True)
+    arch = run(
+        ["docker", "image", "inspect", "--format", "{{.Architecture}}", image],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()  # fmt: skip
+    if arch != "arm64":
+        raise ValueError(f"{image} is {arch}, not arm64: workers are Graviton")
+    version = run(
+        ["docker", "run", "--rm", "--entrypoint", python, image, "-c",
+         "import aegc; print(aegc.__version__)"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip().splitlines()[-1]  # fmt: skip
+    if _version_tuple(version) < (0, 2):
+        raise ValueError(f"{image} has aegc {version}; workers need aegc 0.2 or later")
+    run(
+        ["docker", "run", "--rm", "--entrypoint", "aegc-worker", image, "selftest"],
+        check=True,
+        text=True,
+    )
+    minor = python_minor_of(image, run=run, python=python)
+    repo_uri = ensure_repository(ecr, env, Report())
+    docker_login(ecr, run=run)
+    tag = f"py{minor}-aegc{version}-r{hashlib.sha256(image.encode()).hexdigest()[:12]}"
+    pinned = existing_image(ecr, env, tag)
+    if pinned:
+        log(f"{repo_uri}:{tag} already exists; reusing it")
+    else:
+        pinned = push(image, f"{repo_uri}:{tag}", run=run)
+    rec = ImageRecord(
+        env=env,
+        python_minor=minor,
+        image=pinned,
+        tag=tag,
+        base=image,
+        gce_version="",
+        aegc_version=version,
+        built_at=int(time.time()),
+        base_kind="registered",
+        python=python,
+    )
+    record_image(ssm, rec)
+    log(f"registered {image} as {pinned}; recorded {naming.image_parameter(env)} (Python {minor})")
+    return rec
+
+
+def _version_tuple(text: str) -> tuple[int, ...]:
+    parts = []
+    for p in text.split("."):
+        if not p.isdigit():
+            break
+        parts.append(int(p))
+    return tuple(parts)
 
 
 def commands_used() -> Sequence[str]:

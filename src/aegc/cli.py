@@ -32,9 +32,17 @@ def _image_build(args: argparse.Namespace) -> int:
 
     from aegc import awsutil, images
 
-    spec = images.ImageSpec(
-        env=args.env, base_tag=args.base_tag, source=args.source, gce_version=args.gce_version
-    )
+    try:
+        spec = images.ImageSpec(
+            env=args.env,
+            base_tag=args.base_tag or "",
+            source=args.source,
+            gce_version=args.gce_version,
+            base=args.base or "",
+            python=args.python or "",
+        )
+    except ValueError as e:
+        raise SystemExit(f"aegc: {e}") from None
     sess = awsutil.session(args.profile, args.region)
     region = sess.region_name
     if not region:
@@ -51,6 +59,45 @@ def _image_build(args: argparse.Namespace) -> int:
         through_cache=not args.direct,
     )
     print(result if isinstance(result, str) else result.image)
+    return 0
+
+
+def _image_register(args: argparse.Namespace) -> int:
+    from aegc import awsutil, images
+
+    sess = awsutil.session(args.profile, args.region)
+    region = sess.region_name
+    if not region:
+        print("aegc: no region; pass --region or configure one", file=sys.stderr)
+        return 2
+    try:
+        rec = images.register(
+            args.env,
+            args.image,
+            account=awsutil.account_id(sess),
+            region=region,
+            ecr=awsutil.client(sess, "ecr"),
+            ssm=awsutil.client(sess, "ssm"),
+            python=args.python,
+        )
+    except ValueError as e:
+        raise SystemExit(f"aegc: {e}") from None
+    print(rec.image)
+    return 0
+
+
+def _image_list(args: argparse.Namespace) -> int:
+    from aegc import awsutil, images
+
+    sess = awsutil.session(args.profile, args.region)
+    try:
+        records = images.read_images(awsutil.client(sess, "ssm"), args.env)
+    except Exception as e:
+        if not awsutil.is_not_found(e):
+            raise
+        raise SystemExit(f"aegc: no image recorded for env {args.env!r}") from None
+    for minor, rec in sorted(records.items()):
+        print(f"{minor}\t{rec.base_kind}\taegc {rec.aegc_version}\t{rec.image}")
     return 0
 
 
@@ -169,9 +216,55 @@ def parse_pool(text: str) -> dict[str, Any]:
             out["root_volume_gib"] = int(value)
         elif key == "throughput":
             out["throughput_mibps"] = int(value)
+        elif key == "python":
+            out["python"] = value
         else:
             raise SystemExit(f"aegc: unknown pool option {key!r} in {text!r}")
     return out
+
+
+def _pool_spec(
+    args: argparse.Namespace,
+    env: str,
+    rec: Any,
+    opts: dict[str, Any],
+    prev_pools: dict[str, dict[str, Any]],
+) -> Any:
+    """The pool for one (env, Python minor) image: the options given over the last deploy's."""
+    from dataclasses import asdict
+
+    from aegc.infra import deployment
+
+    if _version(rec.aegc_version) < (0, 2) and not args.allow_old_image:
+        raise SystemExit(
+            f"aegc: the {env!r} image was built with aegc {rec.aegc_version}; its workers "
+            "ignore spend limits, stop and the lease, and write no cost ledger. Rebuild it: "
+            f"aegc image build --env {env} --base-tag ... (or pass --allow-old-image)"
+        )
+    name = f"{env}-py{rec.python_minor.replace('.', '')}"
+    base: dict[str, Any] = {}
+    if name in prev_pools:  # a redeploy keeps the options it isn't given (#30)
+        base = asdict(deployment.PoolSpec.from_manifest(name, prev_pools[name]))
+    vcpu_min = int(opts.get("vcpu_min", base.get("vcpu_min", 2)))
+    for legacy, field_ in (("_max_workers", "max_vcpus"), ("_min_workers", "min_vcpus")):
+        if legacy in opts:
+            n = opts.pop(legacy)
+            opts.setdefault(field_, n * vcpu_min)
+            print(
+                f"warning: {'max' if 'max' in legacy else 'min'}={n} counts workers; "
+                f"pools are sized in vCPUs now: using {field_}={n * vcpu_min} "
+                f"({n} x vcpu={vcpu_min})",
+                file=sys.stderr,
+            )
+    kw = {**base, **opts, "name": name, "env": env, "python_minor": rec.python_minor}
+    # A small max_vcpus with the default size range: keep workers within the pool's cap.
+    if "vcpu_max" not in opts and "max_vcpus" in kw:
+        default_max = deployment.PoolSpec.__dataclass_fields__["vcpu_max"].default
+        vmax = int(kw.get("vcpu_max", default_max))
+        if kw["max_vcpus"] and vmax > kw["max_vcpus"]:
+            kw["vcpu_max"] = max(int(kw["max_vcpus"]), int(kw.get("vcpu_min", 2)))
+    kw["image"] = rec.image
+    return deployment.PoolSpec(**kw)
 
 
 def _deploy(args: argparse.Namespace) -> int:
@@ -193,44 +286,24 @@ def _deploy(args: argparse.Namespace) -> int:
     prev_pools: dict[str, dict[str, Any]] = prev.get("pools", {})
     pools = []
     for text in args.pool:
-        opts = parse_pool(text)
-        env = str(opts.pop("env"))
+        parsed = parse_pool(text)
+        env = str(parsed.pop("env"))
+        want = parsed.pop("python", None)
         try:
-            rec = images.read_image(ssm, env)
+            records = images.read_images(ssm, env)
         except ssm.exceptions.ParameterNotFound:
             raise SystemExit(
                 f"aegc: no image recorded for env {env!r}; run `aegc image build --env {env} ...`"
             ) from None
-        if _version(rec.aegc_version) < (0, 2) and not args.allow_old_image:
-            raise SystemExit(
-                f"aegc: the {env!r} image was built with aegc {rec.aegc_version}; its workers "
-                "ignore spend limits, stop and the lease, and write no cost ledger. Rebuild it: "
-                f"aegc image build --env {env} --base-tag ... (or pass --allow-old-image)"
-            )
-        name = f"{env}-py{rec.python_minor.replace('.', '')}"
-        base: dict[str, Any] = {}
-        if name in prev_pools:  # a redeploy keeps the options it isn't given (#30)
-            base = asdict(deployment.PoolSpec.from_manifest(name, prev_pools[name]))
-        vcpu_min = int(opts.get("vcpu_min", base.get("vcpu_min", 2)))
-        for legacy, field_ in (("_max_workers", "max_vcpus"), ("_min_workers", "min_vcpus")):
-            if legacy in opts:
-                n = opts.pop(legacy)
-                opts.setdefault(field_, n * vcpu_min)
-                print(
-                    f"warning: {'max' if 'max' in legacy else 'min'}={n} counts workers; "
-                    f"pools are sized in vCPUs now: using {field_}={n * vcpu_min} "
-                    f"({n} x vcpu={vcpu_min})",
-                    file=sys.stderr,
+        if want:
+            if want not in records:
+                raise SystemExit(
+                    f"aegc: no {env!r} image for Python {want}; have {', '.join(sorted(records))}"
                 )
-        kw = {**base, **opts, "name": name, "env": env, "python_minor": rec.python_minor}
-        # A small max_vcpus with the default size range: keep workers within the pool's cap.
-        if "vcpu_max" not in opts and "max_vcpus" in kw:
-            default_max = deployment.PoolSpec.__dataclass_fields__["vcpu_max"].default
-            vmax = int(kw.get("vcpu_max", default_max))
-            if kw["max_vcpus"] and vmax > kw["max_vcpus"]:
-                kw["vcpu_max"] = max(int(kw["max_vcpus"]), int(kw.get("vcpu_min", 2)))
-        kw["image"] = rec.image
-        pools.append(deployment.PoolSpec(**kw))
+            records = {want: records[want]}
+        # One pool per recorded Python minor: each client minor routes to its own.
+        for _minor, rec in sorted(records.items(), reverse=True):
+            pools.append(_pool_spec(args, env, rec, dict(parsed), prev_pools))
     named = {p.name for p in pools}
     omitted = sorted(n for n in prev_pools if n not in named)
     pruning = bool(omitted and args.prune and args.yes and not args.dry_run)
@@ -569,9 +642,22 @@ def build_parser() -> argparse.ArgumentParser:
         dest="image_command", required=True
     )
     b = img.add_parser("build", help="build, push and record a worker image for an environment")
-    b.add_argument("--env", required=True, help="aarchsci env or aarchbio tool, e.g. geospatial")
-    b.add_argument("--base-tag", required=True, help="immutable base tag, e.g. 2026.10.17.115051")
+    b.add_argument(
+        "--env", required=True,
+        help="the environment's name: an aarchsci env or aarchbio tool with --base-tag, or any "
+        "name of yours with --base",
+    )  # fmt: skip
+    base = b.add_mutually_exclusive_group(required=True)
+    base.add_argument("--base-tag", help="immutable aarchsci/aarchbio tag, e.g. 2026.10.17.115051")
+    base.add_argument(
+        "--base", metavar="REF",
+        help="any linux/arm64 image with Python >= 3.11, pinned: repo@sha256:... or an "
+        "immutable tag (e.g. python:3.13.9-slim)",
+    )  # fmt: skip
     b.add_argument("--source", default="aarchsci", choices=["aarchsci", "aarchbio"])
+    b.add_argument(
+        "--python", metavar="PATH", help="with --base: the base's Python (default python3)"
+    )
     b.add_argument("--gce-version", default="4.21.0", help="globus-compute-endpoint version")
     b.add_argument("--no-push", action="store_true", help="build and test locally only")
     b.add_argument(
@@ -579,6 +665,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     b.add_argument("--project-dir", default=".", help="aegc source tree to build the wheel from")
     b.set_defaults(func=_image_build)
+    r = img.add_parser(
+        "register",
+        help="check an image you built (with aegc and globus-compute-endpoint) and record it",
+    )
+    r.add_argument("--env", required=True, help="the environment's name")
+    r.add_argument("--image", required=True, help="linux/arm64 image, pinned (repo@sha256:...)")
+    r.add_argument("--python", default="python3", help="its Python (default python3)")
+    r.set_defaults(func=_image_register)
+    ls = img.add_parser("list", help="an environment's recorded images, one per Python minor")
+    ls.add_argument("--env", required=True)
+    ls.set_defaults(func=_image_list)
 
     bs = sub.add_parser("bootstrap", help="create the region-wide resources (once per region)")
     bs.add_argument("--dry-run", action="store_true")
@@ -592,7 +689,8 @@ def build_parser() -> argparse.ArgumentParser:
     dp.add_argument(
         "--pool", action="append", required=True,
         help="env[:max_vcpus=N,min_vcpus=N,vcpu=LO-HI,mem=MiB,slots=N|auto,idle=S,disk=GiB,"
-        "throughput=MiBps,walltime=S,max_walltime=S,lifetime=S,on-demand|spot]; repeatable. "
+        "throughput=MiBps,walltime=S,max_walltime=S,lifetime=S,python=3.NN,on-demand|spot]; "
+        "repeatable. One pool per Python minor the env has images for (python= picks one). "
         "max_vcpus caps the pool (default 8); vcpu is each worker's size range (default 2-8, "
         "at most max_vcpus); disk: root gp3 GiB (30-16384, default 30); throughput: its MiB/s "
         "(125-1000, default 125); lifetime: 3600-259200 s (default 86400). On a redeploy, "

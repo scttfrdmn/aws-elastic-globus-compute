@@ -295,3 +295,147 @@ def test_lifecycle_preview_keeps_old_inuse_image(aws: Callable[[str], Any]) -> N
     preview = ecr.get_lifecycle_policy_preview(repositoryName="aegc/geospatial")
     expired = {r["imageDigest"] for r in preview["previewResults"]}
     assert old.split("@")[1] not in expired and len(expired) == 2
+
+
+# --- v0.3: any base, several Python minors, registered images (#67, #58) -----------------------
+
+
+def rec_for(minor: str, built_at: int = 1, **kw: Any) -> images.ImageRecord:
+    return images.ImageRecord(
+        env="geospatial", python_minor=minor, image="r/aegc/geospatial@sha256:" + "e" * 64,
+        tag=f"t{minor}", base="b", gce_version="4.21.0", aegc_version="0.3.0",
+        built_at=built_at, **kw,
+    )  # fmt: skip
+
+
+def test_free_form_bases_must_be_pinned() -> None:
+    spec = images.ImageSpec(env="mine", base="python:3.13.9-slim")
+    assert spec.base_id == hashlib.sha256(b"python:3.13.9-slim").hexdigest()[:12]
+    assert images.base_ref(spec, account=ACCOUNT, region=REGION) == "python:3.13.9-slim"
+    assert images.image_tag("3.13", spec, "w").endswith(f"-b{spec.base_id}-ww")
+    images.ImageSpec(env="mine", base="ghcr.io/me/img@sha256:" + "a" * 64)
+    images.ImageSpec(env="mine", base="localhost:5000/img:v1")
+    for bad in ("python", "python:latest", "localhost:5000/img", "ghcr.io/me/img"):
+        with pytest.raises(ValueError, match="pin the base"):
+            images.ImageSpec(env="mine", base=bad)
+    with pytest.raises(ValueError, match="either"):
+        images.ImageSpec(env="mine", base="python:3.13.9-slim", base_tag="2026.11.13.154112")
+    with pytest.raises(ValueError, match="either"):
+        images.ImageSpec(env="mine")
+
+
+def test_pip_base_context_and_args(tmp_path: Path) -> None:
+    wheels = tmp_path / "w"
+    wheels.mkdir()
+    (wheels / "aws_elastic_globus_compute-0.3.0-py3-none-any.whl").write_bytes(b"wheel")
+    ctx = tmp_path / "ctx"
+    ctx.mkdir()
+    images.build_context(ctx, wheel_dir=wheels, kind="pip")
+    text = (ctx / "Dockerfile").read_text()
+    assert "pip install" in text and "micromamba" not in text and "USER ${AEGC_UID}" in text
+    spec = images.ImageSpec(env="mine", base="python:3.13.9-slim", python="python3.13")
+    args = images.docker_build_args(spec, base="B", local_tag="L", context=ctx, kind="pip")
+    assert "PYTHON=python3.13" in args and f"AEGC_UID={images.WORKER_UID}" in args
+    conda = images.docker_build_args(SPEC, base="B", local_tag="L", context=ctx)
+    assert not any(a.startswith("PYTHON=") for a in conda)
+
+
+def fake_docker(kind: str, minor: str, calls: list[list[str]], aegc_version: str = "0.3.0"):  # type: ignore[no-untyped-def]
+    def run(cmd: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        out = ""
+        if cmd[:2] == ["uv", "build"]:
+            out_dir = Path(cmd[cmd.index("--out-dir") + 1])
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir / "aws_elastic_globus_compute-0.3.0-py3-none-any.whl").write_bytes(b"w")
+        elif cmd[:2] == ["docker", "run"] and "sh" in cmd:
+            out = kind + "\n"
+        elif cmd[:2] == ["docker", "run"] and "import aegc; print(aegc.__version__)" in cmd:
+            out = aegc_version + "\n"
+        elif cmd[:2] == ["docker", "run"] and "selftest" in cmd:
+            out = "ok\n"
+        elif cmd[:2] == ["docker", "run"]:
+            out = minor + "\n"
+        elif cmd[:3] == ["docker", "image", "inspect"]:
+            out = "arm64\n"
+        elif cmd[:2] == ["docker", "inspect"]:
+            out = json.dumps([cmd[-1].rsplit(":", 1)[0] + "@sha256:" + "f" * 64])
+        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+    return run
+
+
+def test_build_from_a_pip_base(aws: Callable[[str], Any], tmp_path: Path) -> None:
+    ecr, ssm = aws("ecr"), aws("ssm")
+    calls: list[list[str]] = []
+    spec = images.ImageSpec(env="geospatial", base="python:3.13.9-slim")
+    rec = images.build(
+        spec, account=ACCOUNT, region=REGION, ecr=ecr, ssm=ssm, project_dir=tmp_path,
+        run=fake_docker("pip", "3.13", calls), log=lambda _: None,
+    )  # fmt: skip
+    assert isinstance(rec, images.ImageRecord)
+    assert (rec.base_kind, rec.python, rec.python_minor) == ("pip", "python3", "3.13")
+    # No pull-through cache login before the build: the base comes from its own registry.
+    kinds = [c[1] for c in calls if c[0] == "docker"]
+    assert kinds == ["run", "buildx", "run", "login", "tag", "push", "inspect"]
+    minor_probe = [c for c in calls if c[:2] == ["docker", "run"]][-1]
+    assert minor_probe[minor_probe.index("--entrypoint") + 1] == "python3"
+
+
+def test_records_keep_every_minor(aws: Callable[[str], Any]) -> None:
+    ssm = aws("ssm")
+    images.record_image(ssm, rec_for("3.14", built_at=1))
+    images.record_image(ssm, rec_for("3.13", built_at=2, base_kind="pip", python="python3"))
+    images.record_image(ssm, rec_for("3.14", built_at=3))  # a rebuild replaces only 3.14
+    got = images.read_images(ssm, "geospatial")
+    assert sorted(got) == ["3.13", "3.14"]
+    assert got["3.14"].built_at == 3 and got["3.13"].base_kind == "pip"
+    assert images.read_image(ssm, "geospatial", "3.13") == got["3.13"]
+    assert images.read_image(ssm, "geospatial") == got["3.14"]  # the newest
+    with pytest.raises(KeyError, match=r"3\.12"):
+        images.read_image(ssm, "geospatial", "3.12")
+
+
+def test_reads_the_v02_single_record(aws: Callable[[str], Any]) -> None:
+    ssm = aws("ssm")
+    old = {k: v for k, v in rec_for("3.14").__dict__.items() if k not in {"base_kind", "python"}}
+    ssm.put_parameter(Name="/aegc/images/geospatial", Value=json.dumps(old), Type="String")
+    (rec,) = images.read_images(ssm, "geospatial").values()
+    assert rec.base_kind == "conda" and rec.python == images.CONDA_PYTHON
+    images.record_image(ssm, rec_for("3.13"))  # upgrades the parameter to the records map
+    assert sorted(images.read_images(ssm, "geospatial")) == ["3.13", "3.14"]
+
+
+def test_register(aws: Callable[[str], Any]) -> None:
+    ecr, ssm = aws("ecr"), aws("ssm")
+    calls: list[list[str]] = []
+    ref = "ghcr.io/me/geo@sha256:" + "a" * 64
+    rec = images.register(
+        "geospatial", ref, account=ACCOUNT, region=REGION, ecr=ecr, ssm=ssm,
+        run=fake_docker("pip", "3.12", calls), log=lambda _: None,
+    )  # fmt: skip
+    assert rec.base_kind == "registered" and rec.python_minor == "3.12"
+    assert rec.base == ref and rec.tag.startswith("py3.12-aegc0.3.0-r")
+    assert images.read_image(ssm, "geospatial", "3.12") == rec
+    assert any(c[:2] == ["docker", "tag"] and c[2] == ref for c in calls)
+    for bad, match in (("ghcr.io/me/geo", "pin"), ("ghcr.io/me/geo:latest", "pin")):
+        with pytest.raises(ValueError, match=match):
+            images.register("geospatial", bad, account=ACCOUNT, region=REGION, ecr=ecr, ssm=ssm,
+                            run=fake_docker("pip", "3.12", []))  # fmt: skip
+    with pytest.raises(ValueError, match=r"0\.2 or later"):
+        images.register("geospatial", ref, account=ACCOUNT, region=REGION, ecr=ecr, ssm=ssm,
+                        run=fake_docker("pip", "3.12", [], aegc_version="0.1.4"))  # fmt: skip
+
+
+def test_register_refuses_amd64(aws: Callable[[str], Any]) -> None:
+    calls: list[list[str]] = []
+    run = fake_docker("pip", "3.12", calls)
+
+    def amd64(cmd: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
+        if cmd[:3] == ["docker", "image", "inspect"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="amd64\n", stderr="")
+        return run(cmd, **kw)
+
+    with pytest.raises(ValueError, match="not arm64"):
+        images.register("geospatial", "me/geo:v1", account=ACCOUNT, region=REGION,
+                        ecr=aws("ecr"), ssm=aws("ssm"), run=amd64)  # fmt: skip
