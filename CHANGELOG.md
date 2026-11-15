@@ -16,6 +16,12 @@ All notable changes to this project are documented here. The format follows
   fit in IAM's 10,240 inline-policy characters. The grants are kept in the manifest and across
   redeploys; `--grant` replaces them and `--grant none` removes them. Requester-pays buckets need
   no extra IAM: pass `RequestPayer='requester'` (#53).
+- **`aegc.outputs`**, for results larger than Globus Compute's ~10 MB limit: inside a task,
+  `outputs.put(data_or_path, name=None, prefix=None)` uploads to
+  `<write grant prefix>/<task uuid>/<name>` (multipart for large files) and returns the `s3://`
+  URI; `outputs.get`, `outputs.download` and `outputs.uri_to_https` (plain or presigned) read it
+  back. Without a write grant it raises `PermissionError`, naming the `--grant` to add. Workers
+  export `AEGC_TASK_UUID` to each task (#54).
 
 ## [0.2.0] - 2026-11-15
 
