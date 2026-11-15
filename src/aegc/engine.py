@@ -50,6 +50,8 @@ STALL_PAUSE_S = 10 * 60
 #: Re-read the deployment state and manifest this often (scaler thread).
 STATE_TTL_S = 30.0
 MANIFEST_TTL_S = 60.0
+#: Before refusing a task, re-read a state older than this (a resume may have just happened).
+REFUSE_RECHECK_S = 5.0
 #: Tasks waiting this long with no workers because the spend limits admit none are failed.
 BLOCKED_FAIL_S = 600.0
 
@@ -289,6 +291,9 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         etid = protocol.executor_task_id(task_uuid, attempt)
 
         st = self._state
+        if not st.running and time.time() - self._state_read > REFUSE_RECHECK_S:
+            # Don't refuse on a stale copy: a resume may have happened since the last read.
+            st = self.refresh_state(force=True)
         if not st.running:
             return _resolved(
                 etid, failed_result(task_uuid, st.failure_code, st.explain(self.deployment))

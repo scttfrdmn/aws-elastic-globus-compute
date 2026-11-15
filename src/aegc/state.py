@@ -61,8 +61,8 @@ class State:
             )
             return (
                 f"deployment {d!r} has reached a spend limit ({self.reason}); new tasks are "
-                f"refused{until}. Raise the limit with `aegc limits {d} --max-usd-day N` (or "
-                f"--max-usd-month), or resume now with `aegc limits {d} --resume`."
+                f"refused{until}. To resume sooner, raise the limit: "
+                f"`aegc limits {d} --max-usd-day N --resume` (or --max-usd-month)."
             )
         if self.mode == "stopped":
             why = f" ({self.reason})" if self.reason else ""

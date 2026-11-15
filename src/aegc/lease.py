@@ -23,7 +23,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from aegc import naming
-from aegc.awsutil import is_not_found, paginate
+from aegc.awsutil import error_code, is_not_found, paginate
 from aegc.infra import Outcome, OwnershipError, Report
 from aegc.state import State, write_state
 
@@ -267,15 +267,34 @@ def ensure_lease(
             )
             continue
         if name in have:
-            scheduler.update_schedule(**kw)
+            _with_role_retry(lambda kw=kw: scheduler.update_schedule(**kw))
             report.add("schedule", name, "updated", kw["ScheduleExpression"])
         else:
-            scheduler.create_schedule(**kw)
+            _with_role_retry(lambda kw=kw: scheduler.create_schedule(**kw))
             report.add("schedule", name, "created", kw["ScheduleExpression"])
     for name in sorted(have - set(want)):
         if not dry_run:
             scheduler.delete_schedule(Name=name, GroupName=group_name(spec.deployment))
         report.add("schedule", name, "would-delete" if dry_run else "deleted")
+
+
+ROLE_RETRIES = 12
+ROLE_RETRY_S = 5.0
+
+
+def _with_role_retry(call: Any, *, sleep: Any = time.sleep) -> Any:
+    """A just-created role takes a few seconds before Scheduler can assume it ("The execution
+    role you provide must allow AWS EventBridge Scheduler to assume the role")."""
+    for attempt in range(ROLE_RETRIES):
+        try:
+            return call()
+        except Exception as e:
+            if error_code(e) != "ValidationException" or "assume the role" not in str(e):
+                raise
+            if attempt == ROLE_RETRIES - 1:
+                raise
+            sleep(ROLE_RETRY_S)
+    return None
 
 
 def _group_exists(scheduler: Any, deployment: str) -> bool:

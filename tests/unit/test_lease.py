@@ -73,3 +73,21 @@ def test_ensure_renew_destroy(aws: Callable[[str], Any]) -> None:
     lease.destroy_lease(scheduler=sch, iam=iam, deployment="dev", region=REGION, report=r,
                         dry_run=False)  # fmt: skip
     assert lease.expiry(sch, "dev") is None
+
+
+def test_new_role_is_retried() -> None:
+    from botocore.exceptions import ClientError
+
+    calls = []
+
+    def create() -> str:
+        calls.append(1)
+        if len(calls) < 3:
+            raise ClientError(
+                {"Error": {"Code": "ValidationException", "Message": "The execution role you "
+                           "provide must allow AWS EventBridge Scheduler to assume the role."}},
+                "CreateSchedule",
+            )  # fmt: skip
+        return "ok"
+
+    assert lease._with_role_retry(create, sleep=lambda _: None) == "ok" and len(calls) == 3

@@ -59,8 +59,8 @@ resuming the deployment doesn't resubmit them. Submit the tasks again once it's 
 
 ```
 deployment 'e2e' has reached a spend limit ($5.0123 of $5/day); new tasks are refused until
-2026-11-15 00:00 UTC. Raise the limit with `aegc limits e2e --max-usd-day N` (or --max-usd-month),
-or resume now with `aegc limits e2e --resume`.
+2026-11-15 00:00 UTC. To resume sooner, raise the limit: `aegc limits e2e --max-usd-day N --resume`
+(or --max-usd-month).
 ```
 
 **Cause:** the deployment's estimated spend reached one of its limits, and an engine capped it.

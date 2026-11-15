@@ -313,3 +313,19 @@ def test_a_idle_worker_leaves_a_vcpu_weighted_group(env: tuple[Clients, Deployme
     assert g["AutoScalingGroups"][0]["DesiredCapacity"] == 0
     left = {i["InstanceId"]: i["LifecycleState"] for i in g["AutoScalingGroups"][0]["Instances"]}
     assert not left.get(inst["InstanceId"], "Terminating").startswith("InService")
+
+
+@pytest.mark.timeout(60)
+def test_live_1_no_refusal_right_after_resume(engine_env: Env) -> None:
+    # Found live: a task submitted just after `aegc resume` was refused from the engine's
+    # 30-second-old copy of the state.
+    e = engine_env.engine()
+    try:
+        state.write_state(engine_env.ssm, "dev", state.State(mode="stopped"))
+        e.refresh_state(force=True)
+        state.write_state(engine_env.ssm, "dev", state.State())  # aegc resume
+        e._state_read = time.time() - 10  # the copy is a little stale
+        submit(e, triple, 1)
+        assert len(queued(engine_env)) == 1  # sent, not refused
+    finally:
+        e.shutdown()

@@ -68,7 +68,7 @@ class DeploymentStatus:
         if self.spend_today is not None:
             spend += f", today ${self.spend_today:.4f}"
         if self.spend_month is not None:
-            spend += f", this month ${self.spend_month:.2f}"
+            spend += f", this month ${self.spend_month:.4f}"
         lines.append(f"  spend: {spend} (estimates) | {self.limits}")
         if self.lease_expires or self.ttl_expires:
             parts = []
