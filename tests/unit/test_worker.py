@@ -82,7 +82,7 @@ class Rig:
         ami = self.aws("ssm").get_parameter(Name=deployment.AMI_PARAMETER)["Parameter"]["Value"]
         ec2.create_launch_template(
             LaunchTemplateName=GROUP,
-            LaunchTemplateData={"ImageId": ami, "InstanceType": "m5.large"},
+            LaunchTemplateData={"ImageId": ami, "InstanceType": "c7g.large"},  # arm64 AMI,
         )
         subnets = ec2.describe_subnets(Filters=[{"Name": "default-for-az", "Values": ["true"]}])[
             "Subnets"
