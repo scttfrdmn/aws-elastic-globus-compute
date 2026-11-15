@@ -310,10 +310,15 @@ def worker_policy(*, deployment: str, region: str, account: str, bucket: str) ->
             },
             {
                 # Stop claiming when the deployment is capped, stopped or expired.
+                # The state (stop, caps), and the manifest for aegc.outputs' current grants.
                 "Sid": "ReadDeploymentState",
                 "Effect": "Allow",
                 "Action": "ssm:GetParameter",
-                "Resource": f"arn:aws:ssm:{region}:{account}:parameter{naming.state_parameter(d)}",
+                "Resource": [
+                    f"arn:aws:ssm:{region}:{account}:parameter{naming.state_parameter(d)}",
+                    f"arn:aws:ssm:{region}:{account}:parameter"
+                    f"{naming.deployment_manifest_parameter(d)}",
+                ],
             },
             {
                 "Sid": "WriteCostLedger",

@@ -125,3 +125,25 @@ def test_runner_exports_the_task_uuid(rig: Rig) -> None:
     a.claim_once()
     a.wait_idle()
     assert value_of(rig.final(1)[tid], rig.s3) == (False, tid)
+
+
+def test_put_uses_the_current_grants(s3: Any, aws: Callable[[str], Any]) -> None:
+    # A redeploy changed the grants after this worker booted: the manifest has the new ones.
+    import json as _json
+
+    s3.create_bucket(Bucket="newer", CreateBucketConfiguration={"LocationConstraint": REGION})
+    aws("ssm").put_parameter(
+        Name="/aegc/dev/manifest", Type="String",
+        Value=_json.dumps({"grants": [{"access": "write", "bucket": "newer", "prefix": "o/"}]}),
+    )  # fmt: skip
+    outputs._grants_cache = None
+    assert outputs.put(b"x", "a").startswith("s3://newer/o/")
+
+
+def test_put_takes_str_paths(s3: Any, tmp_path: Path) -> None:
+    f = tmp_path / "movie.mp4"
+    f.write_bytes(b"frames")
+    uri = outputs.put(str(f))
+    assert uri.endswith("/movie.mp4") and outputs.get(uri) == b"frames"
+    with pytest.raises(FileNotFoundError, match=r"text\.encode"):
+        outputs.put("not a file, just text")
