@@ -565,7 +565,7 @@ class Agent:
             instance_type=self.config.instance_type,
             availability_zone=self.config.availability_zone,
             lifecycle=self.config.lifecycle or "spot",
-            vcpus=self.config.slot_count if self.config.slots == "auto" else 0,
+            vcpus=self.config.host_vcpus,
             launched_at=self._started_at,
             last_seen=time.time(),
             root_gib=self.config.root_volume_gib,

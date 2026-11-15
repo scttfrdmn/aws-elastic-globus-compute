@@ -33,7 +33,7 @@ from typing import Any
 from globus_compute_common.messagepack.message_types import EPStatusReport
 from globus_compute_endpoint.engines.base import GlobusComputeEngineBase
 
-from aegc import __version__, awsutil, lease, naming, payloads, protocol
+from aegc import __version__, awsutil, lease, naming, payloads, protocol, sizes
 from aegc.gcresult import failed_result
 from aegc.pricing import IPV4_HOUR, Prices, volume_hour
 from aegc.protocol import Call, ProtocolError, ResultMessage, TaskMessage
@@ -43,7 +43,10 @@ from aegc.state import Limits, State, read_state, write_state
 log = logging.getLogger("aegc.engine")
 
 #: resource_specification keys AWSEngine understands in v0.1.
-RESOURCE_KEYS = frozenset({"env", "pool", "walltime_s"})
+RESOURCE_KEYS = frozenset({"env", "pool", "walltime_s", "size", "cpus", "memory_gib"})
+#: Keys people reach for that aegc spells differently.
+_DID_YOU_MEAN = {"vcpus": "cpus", "num_cores": "cpus", "cores": "cpus", "memory": "memory_gib",
+                 "mem": "memory_gib", "mem_per_worker": "memory_gib"}  # fmt: skip
 COMPLETED_LRU = 10_000
 STALL_AFTER_S = 15 * 60
 STALL_PAUSE_S = 10 * 60
@@ -375,14 +378,24 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
             return None, 0, self._config_error or "AWSEngine isn't configured"
         unknown = set(spec) - RESOURCE_KEYS
         if unknown:
+            hints = [f"{k} -> {_DID_YOU_MEAN[k]}" for k in sorted(unknown) if k in _DID_YOU_MEAN]
             return (
                 None,
                 0,
                 (
                     f"unsupported resource_specification keys {sorted(unknown)}; "
                     f"AWSEngine accepts {sorted(RESOURCE_KEYS)}"
+                    + (f" (did you mean {', '.join(hints)}?)" if hints else "")
                 ),
             )
+        for key in ("cpus", "memory_gib"):
+            if key in spec:
+                try:
+                    ok = float(spec[key]) > 0
+                except (TypeError, ValueError):
+                    ok = False
+                if not ok:
+                    return None, 0, f"resource_specification {key} must be a positive number"
         pools: dict[str, dict[str, Any]] = self._manifest.get("pools", {})
         if "pool" in spec:
             name = str(spec["pool"])
@@ -414,8 +427,8 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
                     f"no worker image for Python {self.python_minor} in env {env!r}; "
                     f"available: {', '.join(have)}. Submit from a matching Python version."
                 )
-            return sorted(matching)[0], ""
-        return sorted(candidates)[0], ""
+            candidates = {n: candidates[n] for n in matching}
+        return _pick_size(spec, candidates, env)
 
     def _python_check(self, name: str, pool: dict[str, Any]) -> str:
         if self.python_minor and pool.get("python_minor") != self.python_minor:
@@ -1084,17 +1097,59 @@ def _vcpu_mode(pool: dict[str, Any]) -> bool:
     return pool.get("capacity_type") == "vcpu"
 
 
+def _pick_size(
+    spec: dict[str, Any], pools: dict[str, dict[str, Any]], env: str
+) -> tuple[str | None, str]:
+    """The pool for a request's ``size``, else the cheapest giving ``cpus``/``memory_gib``."""
+
+    def cls(p: dict[str, Any]) -> str:
+        return str(p.get("size_class") or sizes.DEFAULT)
+
+    def have() -> str:
+        return ", ".join(
+            f"{n} ({cls(p)}: {c:g} vCPU, {m:g} GiB per task)"
+            for n, p in sorted(pools.items())
+            for c, m in [sizes.per_task(p)]
+        )
+
+    if "size" in spec:
+        want = str(spec["size"])
+        named = sorted(n for n, p in pools.items() if cls(p) == want)
+        if not named:
+            return None, f"no size={want!r} pool for env {env!r}; available: {have()}"
+        return named[0], ""
+    cpus = float(spec.get("cpus", 0))
+    mem = float(spec.get("memory_gib", 0))
+    # Cheapest first: the vCPUs a task holds (a whole instance may be vcpu_max), then memory.
+    fits = [
+        (_capacity_for({**p, "slots": "auto", "capacity_type": "vcpu"}, 1), m, n)
+        for n, p in pools.items()
+        for c, m in [sizes.per_task(p)]
+        if c >= cpus and m >= mem
+    ]
+    if not fits:
+        return None, (
+            f"no pool for env {env!r} gives a task {cpus:g} vCPUs and {mem:g} GiB; "
+            f"available: {have()}. Deploy one with --pool {env}:size=..."
+        )
+    return min(fits)[2], ""
+
+
 def _capacity_for(pool: dict[str, Any], demand: int) -> int:
     """Capacity units (vCPUs, or workers for a v0.1 pool) that run ``demand`` tasks at once.
 
-    ``slots=auto`` runs one task per vCPU, so demand is vCPUs. Fixed ``slots=N`` runs N tasks per
-    worker of at least ``vcpu_min`` vCPUs.
+    ``slots=auto`` runs one task per ``task_cpus`` vCPUs (one per vCPU without a size class),
+    and ``size=whole`` one per instance: up to ``vcpu_max`` units each, so that many instances
+    launch even if Auto Scaling picks the largest size. Fixed ``slots=N`` runs N tasks per worker
+    of at least ``vcpu_min`` vCPUs.
     """
     if not _vcpu_mode(pool):
         return math.ceil(demand / _slots(pool))
     slots = str(pool.get("slots", "auto"))
     if slots == "auto":
-        return demand
+        if pool.get("size_class") == "whole":
+            return demand * int(pool.get("vcpu_max", 8))
+        return demand * max(1, int(pool.get("task_cpus") or 1))
     return math.ceil(demand / max(1, int(slots))) * int(pool.get("vcpu_min", 2))
 
 

@@ -32,11 +32,20 @@ class WorkerConfig:
     lifecycle: str = ""  # "spot" or "on-demand", from IMDS
     root_volume_gib: int = 30
     throughput_mibps: int = 125
+    size_class: str = ""  # aegc.sizes; empty: one task per vCPU
+    task_cpus: int = 1
+    task_memory_gib: float = 0
 
     @property
     def slot_count(self) -> int:
         if self.slots == "auto":
-            return max(1, os.cpu_count() or 1)
+            if not self.size_class:
+                return max(1, os.cpu_count() or 1)
+            from aegc import sizes
+
+            return sizes.slots(
+                self.task_cpus, self.task_memory_gib, os.cpu_count() or 1, host_memory_gib()
+            )
         n = int(self.slots)
         if n < 1:
             raise ValueError("slots must be >= 1")
@@ -45,6 +54,10 @@ class WorkerConfig:
     @property
     def heartbeat_s(self) -> float:
         return self.visibility_s / 3
+
+    @property
+    def host_vcpus(self) -> int:
+        return os.cpu_count() or 0
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> WorkerConfig:
@@ -63,3 +76,11 @@ class WorkerConfig:
         if env.get("AWS_REGION"):
             d.setdefault("region", env["AWS_REGION"])
         return cls.from_dict(d)
+
+
+def host_memory_gib() -> float:
+    """The host's memory (a container without a memory limit sees all of it)."""
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30
+    except (ValueError, OSError, AttributeError):
+        return 0.0

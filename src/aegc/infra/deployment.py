@@ -21,7 +21,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any
 
-from aegc import __version__, images, naming, protocol
+from aegc import __version__, images, naming, protocol, sizes
 from aegc.awsutil import error_code, is_not_found, paginate
 from aegc.infra import Outcome, OwnershipError, Report, iam, userdata
 
@@ -60,9 +60,23 @@ class PoolSpec:
     walltime_s: int = 0  # default per-task walltime (0: protocol.DEFAULT_WALLTIME_S)
     max_walltime_s: int = 0  # ceiling for requests (0: protocol.MAX_WALLTIME_S)
     max_lifetime_s: int = 24 * 3600  # a worker stops claiming after this
+    # Size class (aegc.sizes): empty for a pool deployed without size=, which runs one task per
+    # vCPU as before.
+    size_class: str = ""
+    task_cpus: int = 1  # vCPUs per task (0: the whole instance)
+    task_memory_gib: float = 0  # memory per task (0: not a slot limit)
+    memory_gib_per_vcpu_min: float = 0  # InstanceRequirements MemoryGiBPerVCpu.Min (0: unset)
 
     def __post_init__(self) -> None:
         naming.validate_name("pool", self.name)
+        if self.size_class:
+            sizes.get(self.size_class)  # a known class
+        if self.task_cpus and self.vcpu_min < self.task_cpus:
+            raise ValueError(
+                f"size={self.size_class or 'small'} gives each task {self.task_cpus} vCPUs, so "
+                f"workers need at least that many: vcpu={self.vcpu_min}-{self.vcpu_max} is too "
+                "small"
+            )
         if not 0 <= self.min_vcpus <= self.max_vcpus:
             raise ValueError("need 0 <= min_vcpus <= max_vcpus")
         if not 3600 <= self.max_lifetime_s <= 72 * 3600:
@@ -398,6 +412,16 @@ def worker_config(spec: DeploymentSpec, pool: PoolSpec, task_queue_url: str) -> 
         "root_volume_gib": pool.root_volume_gib,
         "throughput_mibps": pool.throughput_mibps,
         "max_lifetime_s": pool.max_lifetime_s,
+        # Only for sized pools, so other pools' user data (and launch templates) don't change.
+        **(
+            {
+                "size_class": pool.size_class,
+                "task_cpus": pool.task_cpus,
+                "task_memory_gib": pool.task_memory_gib,
+            }
+            if pool.size_class
+            else {}
+        ),
     }
 
 
@@ -564,6 +588,12 @@ def _asg_request(
                         "InstanceRequirements": {
                             "VCpuCount": {"Min": pool.vcpu_min, "Max": pool.vcpu_max},
                             "MemoryMiB": {"Min": pool.memory_mib_min},
+                            # Only when set: pools without a size class keep their template.
+                            **(
+                                {"MemoryGiBPerVCpu": {"Min": pool.memory_gib_per_vcpu_min}}
+                                if pool.memory_gib_per_vcpu_min
+                                else {}
+                            ),
                             "CpuManufacturers": ["amazon-web-services"],
                             "BurstablePerformance": "excluded",
                             "AllowedInstanceTypes": list(pool.allowed_instance_types),

@@ -218,6 +218,8 @@ def parse_pool(text: str) -> dict[str, Any]:
             out["throughput_mibps"] = int(value)
         elif key == "python":
             out["python"] = value
+        elif key == "size":
+            out["size_class"] = value
         else:
             raise SystemExit(f"aegc: unknown pool option {key!r} in {text!r}")
     return out
@@ -233,6 +235,7 @@ def _pool_spec(
     """The pool for one (env, Python minor) image: the options given over the last deploy's."""
     from dataclasses import asdict
 
+    from aegc import naming, sizes
     from aegc.infra import deployment
 
     if _version(rec.aegc_version) < (0, 2) and not args.allow_old_image:
@@ -241,7 +244,12 @@ def _pool_spec(
             "ignore spend limits, stop and the lease, and write no cost ledger. Rebuild it: "
             f"aegc image build --env {env} --base-tag ... (or pass --allow-old-image)"
         )
-    name = f"{env}-py{rec.python_minor.replace('.', '')}"
+    size = str(opts.pop("size_class", ""))
+    try:
+        cls = sizes.get(size) if size else None
+    except ValueError as e:
+        raise SystemExit(f"aegc: {e}") from None
+    name = f"{env}-py{rec.python_minor.replace('.', '')}" + (f"-{size}" if size else "")
     base: dict[str, Any] = {}
     if name in prev_pools:  # a redeploy keeps the options it isn't given (#30)
         base = asdict(deployment.PoolSpec.from_manifest(name, prev_pools[name]))
@@ -257,6 +265,16 @@ def _pool_spec(
                 file=sys.stderr,
             )
     kw = {**base, **opts, "name": name, "env": env, "python_minor": rec.python_minor}
+    if cls is not None:
+        kw.update(
+            size_class=cls.name,
+            task_cpus=cls.task_cpus,
+            task_memory_gib=cls.task_memory_gib,
+            memory_gib_per_vcpu_min=cls.memory_gib_per_vcpu,
+        )
+        if "vcpu_min" not in opts and int(kw.get("vcpu_min", 2)) < cls.task_cpus:
+            kw["vcpu_min"] = cls.task_cpus  # workers big enough for one task
+            kw["vcpu_max"] = max(int(kw.get("vcpu_max", 8)), cls.task_cpus)
     # A small max_vcpus with the default size range: keep workers within the pool's cap.
     if "vcpu_max" not in opts and "max_vcpus" in kw:
         default_max = deployment.PoolSpec.__dataclass_fields__["vcpu_max"].default
@@ -264,7 +282,14 @@ def _pool_spec(
         if kw["max_vcpus"] and vmax > kw["max_vcpus"]:
             kw["vcpu_max"] = max(int(kw["max_vcpus"]), int(kw.get("vcpu_min", 2)))
     kw["image"] = rec.image
-    return deployment.PoolSpec(**kw)
+    try:
+        return deployment.PoolSpec(**kw)
+    except ValueError as e:
+        hint = ""
+        if size and len(name) > naming.MAX_POOL:
+            room = naming.MAX_POOL - len(name) + len(env)
+            hint = f" (with size={size}, env names can be at most {room} characters)"
+        raise SystemExit(f"aegc: {e}{hint}") from None
 
 
 def _deploy(args: argparse.Namespace) -> int:
@@ -689,7 +714,8 @@ def build_parser() -> argparse.ArgumentParser:
     dp.add_argument(
         "--pool", action="append", required=True,
         help="env[:max_vcpus=N,min_vcpus=N,vcpu=LO-HI,mem=MiB,slots=N|auto,idle=S,disk=GiB,"
-        "throughput=MiBps,walltime=S,max_walltime=S,lifetime=S,python=3.NN,on-demand|spot]; "
+        "throughput=MiBps,walltime=S,max_walltime=S,lifetime=S,python=3.NN,"
+        "size=small|medium|mem|large|whole,on-demand|spot]; "
         "repeatable. One pool per Python minor the env has images for (python= picks one). "
         "max_vcpus caps the pool (default 8); vcpu is each worker's size range (default 2-8, "
         "at most max_vcpus); disk: root gp3 GiB (30-16384, default 30); throughput: its MiB/s "

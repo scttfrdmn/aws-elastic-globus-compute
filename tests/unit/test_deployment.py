@@ -540,3 +540,33 @@ def test_cli_deploy_fans_out_over_python_minors(
     assert pools["geospatial-py314"]["max_vcpus"] == 4
     with pytest.raises(SystemExit, match=r"3\.12"):
         cli.main([*argv, "--pool", "geospatial:python=3.12"])
+
+
+def test_cli_deploy_size_classes(
+    env: tuple[Clients, DeploymentSpec], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aegc import cli
+
+    c, _ = env
+    images.record_image(c.ssm, images.ImageRecord(
+        env="geospatial", python_minor="3.14", image=IMAGE, tag="t", base="b",
+        gce_version="4.21.0", aegc_version="0.3.0", built_at=1))  # fmt: skip
+    monkeypatch.setattr(cli, "_clients", lambda sess: c)
+    monkeypatch.setattr(cli, "_quota_preflight", lambda sess, pools: [])
+    argv = ["--region", REGION, "deploy", "dev", "--max-usd-day", "5"]
+    assert cli.main([*argv, "--pool", "geospatial", "--pool", "geospatial:size=mem",
+                     "--pool", "geospatial:size=large,max_vcpus=32"]) == 0  # fmt: skip
+    pools = deployment.read_manifest(c.ssm, "dev")["pools"]
+    assert sorted(pools) == ["geospatial-py314", "geospatial-py314-large", "geospatial-py314-mem"]
+    assert pools["geospatial-py314"]["size_class"] == ""
+    assert pools["geospatial-py314-mem"]["memory_gib_per_vcpu_min"] == 8
+    large = pools["geospatial-py314-large"]
+    assert (large["vcpu_min"], large["task_cpus"], large["max_vcpus"]) == (8, 8, 32)
+    with pytest.raises(SystemExit, match="unknown size class"):
+        cli.main([*argv, "--pool", "geospatial:size=huge"])
+    long_env = "e" * 30  # 30 + "-py314-medium" > 40
+    images.record_image(c.ssm, images.ImageRecord(
+        env=long_env, python_minor="3.14", image=IMAGE, tag="t", base="b",
+        gce_version="4.21.0", aegc_version="0.3.0", built_at=1))  # fmt: skip
+    with pytest.raises(SystemExit, match="at most 27 characters"):
+        cli.main([*argv, "--pool", f"{long_env}:size=medium"])
