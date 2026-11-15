@@ -1,5 +1,5 @@
 # Pinned test tools live in .tools/ (gitignored).
-SUBSTRATE_VERSION ?= v0.128.0
+SUBSTRATE_VERSION ?= v0.129.0
 
 .PHONY: tools test lint docs
 

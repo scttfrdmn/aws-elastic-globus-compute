@@ -229,7 +229,11 @@ def test_deployed_group_launches_graviton_spot(env: tuple[Clients, DeploymentSpe
     assert inst["LifecycleState"] == "InService" and inst["ProtectedFromScaleIn"] is True
     (r,) = c.ec2.describe_instances(InstanceIds=[inst["InstanceId"]])["Reservations"]
     assert r["Instances"][0]["InstanceLifecycle"] == "spot"
-    assert inst["InstanceType"].split(".")[0].endswith("g")  # Graviton
+    assert r["Instances"][0]["Architecture"] == "arm64"  # Graviton
+    arm = c.ec2.describe_instances(Filters=[{"Name": "architecture", "Values": ["arm64"]}])
+    assert inst["InstanceId"] in {
+        i["InstanceId"] for r in arm["Reservations"] for i in r["Instances"]
+    }
 
 
 def test_deploy_is_idempotent(env: tuple[Clients, DeploymentSpec]) -> None:

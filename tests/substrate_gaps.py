@@ -3,12 +3,8 @@
 Each one names the substrate issue that tracks it. When substrate fixes the issue, delete the
 workaround and its uses, so the test exercises substrate directly.
 
-Gaps without code here (substrate v0.127.0 fixed #1469, #1471, #1497, #1498, #1501, #1502):
-- substrate#1523: GetResources omits EC2 security groups, launch templates and volumes, and IAM
-  instance profiles. aegc footprint's name scan still finds the launch templates (a strict xfail
-  in test_ops.py).
+Gaps without code here (substrate v0.129.0 fixed #1523 and #1525):
 - substrate#1524: no ECR lifecycle policy preview (a strict xfail in test_images.py).
-- substrate#1525: DescribeInstances omits Architecture (tests check the instance type instead).
 """
 
 from __future__ import annotations

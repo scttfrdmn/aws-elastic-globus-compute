@@ -135,11 +135,6 @@ def test_footprint_of_nothing(aws: Callable[[str], Any]) -> None:
     assert fp.items == {} and "0 owned, 0 look-alike(s)" in fp.render()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="substrate#1523: GetResources omits EC2 security groups, launch templates "
-    "and volumes, and IAM instance profiles",
-)
 def test_footprint_tagging_api_covers_ec2_and_profiles(
     env: tuple[deployment.Clients, deployment.DeploymentSpec], aws: Callable[[str], Any]
 ) -> None:
