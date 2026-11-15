@@ -78,6 +78,8 @@ aegc cost e2e --since month --by type        # this month, by instance type
 aegc cost e2e --since 7d --actual            # the last 7 days, and Cost Explorer's figure
 ```
 
+`--actual` needs aegc's cost allocation tags activated once per account; see
+[Cost Explorer and cost allocation tags](../concepts/cost.md#cost-explorer-and-cost-allocation-tags).
 Running endpoints pick up new limits within a minute. `--resume` only ends a `capped` state, and
 refuses while spend is still over a limit (`still over a limit (...); raise it`), so raise the limit
 in the same command. See

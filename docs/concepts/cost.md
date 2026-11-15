@@ -190,8 +190,8 @@ sources it used: `spot`, `on-demand` or `static`. Every rate adds the root volum
 IPv4 address.
 
 **`--actual`** asks Cost Explorer for the cost of resources tagged `aegc:deployment=<d>`, in whole
-UTC days. It works only once that [cost allocation tag](#keeping-costs-predictable) is active, its
-data lags by up to a day, and each request costs $0.01.
+UTC days. It works only once that [cost allocation tag](#cost-explorer-and-cost-allocation-tags)
+is active, its data lags by up to a day, and each request costs $0.01.
 
 ### What the estimates leave out
 
@@ -200,6 +200,35 @@ data lags by up to a day, and each request costs $0.01.
 - Price changes: past usage is priced at the current Spot price, not the one in effect at the time.
 - SQS, S3, ECR, CloudWatch Logs, data transfer, and Cost Explorer requests.
 - Discounts, credits, Savings Plans and taxes.
+
+## Cost Explorer and cost allocation tags
+
+Cost Explorer can break spend down by aegc's tags, and `aegc cost --actual` uses that, but only
+for tags you activate. Tag keys show up in billing a day or so after the first deployment uses
+them. Activate them once per account. In an AWS Organization, that's the management (payer)
+account; the caller needs `ce:UpdateCostAllocationTagsStatus` (and
+`ce:StartCostAllocationTagBackfill` for the backfill).
+
+```sh
+# Are the keys known to billing yet, and active?
+aws ce list-cost-allocation-tags --region us-east-1 \
+  --tag-keys aegc:deployment aegc:pool aegc:role aws:autoscaling:groupName
+
+# Activate them.
+aws ce update-cost-allocation-tags-status --region us-east-1 --cost-allocation-tags-status \
+  TagKey=aegc:deployment,Status=Active TagKey=aegc:pool,Status=Active \
+  TagKey=aegc:role,Status=Active TagKey=aws:autoscaling:groupName,Status=Active
+
+# Optional: apply them to past usage too (up to 12 months back; takes up to a day).
+aws ce start-cost-allocation-tag-backfill --region us-east-1 \
+  --backfill-from 2026-11-01T00:00:00Z
+aws ce list-cost-allocation-tag-backfill-history --region us-east-1
+```
+
+Don't activate `aegc:managed` (every aegc resource has it) or `aegc:version` (it changes with
+every release). The Cost Explorer API is served from `us-east-1` whatever region aegc runs in. The
+[Billing console](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/activating-tags.html)
+does the same thing. Without a backfill, activation applies only to usage from then on.
 
 ## Keeping costs predictable
 
@@ -217,11 +246,8 @@ data lags by up to a day, and each request costs $0.01.
 - Keep the lease (the default, 48 hours), and add `--ttl` for a deployment that should end on a
   date. See [Architecture](architecture.md#lease-and-ttl).
 - Set an AWS Budget on the account; aegc doesn't create one.
-- To see aegc's spend in Cost Explorer, activate these
-  [cost allocation tags](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/activating-tags.html)
-  once they appear in the Billing console (a day or so after the first deployment):
-  `aegc:deployment`, `aegc:pool`, `aegc:role`, and the AWS-generated `aws:autoscaling:groupName`.
-  Activation isn't retroactive.
+- Activate aegc's [cost allocation tags](#cost-explorer-and-cost-allocation-tags) so Cost Explorer
+  (and `aegc cost --actual`) can show its spend.
 
 ## Stopping spend now
 
