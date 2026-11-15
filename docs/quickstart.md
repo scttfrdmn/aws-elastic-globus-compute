@@ -58,7 +58,7 @@ aegc image build --env geospatial --base-tag 2026.11.13.154112
 This layers `globus-compute-endpoint` and the aegc worker onto
 `quay.io/aarchsci/geospatial:2026.11.13.154112` (pulled through the ECR cache), runs the image's
 smoke test and `aegc-worker selftest`, reads the image's Python version, pushes it to ECR as
-`aegc/geospatial`, and records the pinned digest at `/aegc/images/geospatial`. That aarchsci build
+`aegc/geospatial`, and records the pinned digest at `/aegc/images/geospatial`. That [aarchsci](https://aarch.science/) build
 runs Python 3.14.
 
 Use an immutable base tag, never `latest`. See [Worker images](how-to/images.md).

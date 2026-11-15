@@ -1,12 +1,28 @@
 # Architecture
 
-```
-laptop: endpoint container (globus-compute-endpoint + aegc)
-  user endpoint process → AWSEngine ── SendMessage ──▶ SQS aegc-<d>-<pool>-tasks ◀── long poll ── workers
-                            │  └─ SetDesiredCapacity ─▶ Auto Scaling group aegc-<d>-<pool>
-                            └── long poll ◀── SQS aegc-<d>-res-<uep> ◀── started / result / system_failure
-  payloads over ~700 KB → S3 aegc-<account>-<region>/payloads/<d>/…
-workers: stock ECS-optimized Amazon Linux 2023 arm64 → docker run aegc/<env>@digest aegc-worker run
+```mermaid
+flowchart LR
+    subgraph laptop["Your machine"]
+        engine["Endpoint container<br/>user endpoint process<br/><b>AWSEngine</b>"]
+    end
+    subgraph aws["AWS account, one region"]
+        tq[["Task queue<br/>aegc-&lt;d&gt;-&lt;pool&gt;-tasks<br/>+ dead-letter queue"]]
+        subgraph asg["Auto Scaling group (Spot Graviton)"]
+            w1["Worker instance<br/>ECS AL2023 arm64 AMI<br/>aegc/&lt;env&gt;@digest<br/>aegc-worker"]
+        end
+        rq[["Result queue<br/>aegc-&lt;d&gt;-res-&lt;uep&gt;"]]
+        ssm[("SSM<br/>manifest")]
+        s3[("S3<br/>payloads")]
+        ecr[("ECR<br/>images")]
+    end
+    engine -- "1 · send task" --> tq
+    tq -- "2 · claim" --> w1
+    w1 -- "3 · started, result" --> rq
+    rq -- "4 · long poll" --> engine
+    engine -. "scale out" .-> asg
+    engine -. "read at start" .-> ssm
+    w1 <-. "> 700 KB" .-> s3
+    ecr -. "pull" .-> w1
 ```
 
 `<d>` is the deployment name, `<pool>` the pool name (`<env>-py<NNN>`, for example
@@ -54,10 +70,33 @@ encoded. Larger bodies go to the region's payload bucket under `payloads/<d>/` a
 carries a pointer with a SHA-256 checksum.
 
 **Images.** Worker images live in ECR as `aegc/<env>`, built by `aegc image build` over an
-aarchsci environment. Bases are pulled through the `aegc-quay` ECR pull-through cache, so pulls stay
+[aarchsci](https://aarch.science/) environment (or an [aarchbio](https://aarch.bio/) tool image). Bases are pulled through the `aegc-quay` ECR pull-through cache, so pulls stay
 in-region.
 
 ## Task path
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant SDK as SDK
+    participant G as Globus Compute
+    participant E as Endpoint (AWSEngine)
+    participant T as SQS task queue
+    participant W as Worker
+    participant R as SQS result queue
+    SDK->>G: submit(function, args)
+    G->>E: task (AMQPS)
+    E->>T: SendMessage (before acking)
+    E-->>W: scale out (desired capacity)
+    W->>T: ReceiveMessage (long poll)
+    W->>R: started
+    Note over W: execute_task in a fresh child<br/>heartbeat extends the claim every 100 s
+    W->>R: result (or system_failure)
+    W->>T: DeleteMessage
+    R->>E: ReceiveMessage (long poll)
+    E->>G: result
+    G->>SDK: future resolves
+```
 
 1. The SDK submits a task to Globus. The endpoint receives it and calls `AWSEngine.submit()`.
 2. The engine resolves the pool from `resource_specification`, the endpoint's `env`, and the

@@ -12,7 +12,7 @@ nothing needs an inbound port or a cluster to look after.
   there (for example Sentinel-2 COGs in us-west-2) without moving them, as long as the reads are
   unsigned (see below).
 - **Pinned, reproducible environments.** Every worker runs a science image pinned by digest, built
-  over a dated aarchsci release.
+  over a dated [aarchsci](https://aarch.science/) release.
 - **Mixed Globus Compute setups.** The same function can go to a campus endpoint or to an aegc
   endpoint; only the endpoint id changes.
 - **Spot pricing.** Pools use Spot by default. An interrupted task is released at once and rerun

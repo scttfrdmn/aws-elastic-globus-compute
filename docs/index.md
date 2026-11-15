@@ -7,10 +7,23 @@ Tasks go onto an SQS queue. Graviton EC2 workers pull them, run them inside arm6
 on stock AMIs, and post the results back. When the queue is empty the workers terminate themselves,
 and each Auto Scaling group returns to zero.
 
-```
-endpoint (laptop container) ─ AWSEngine ─▶ SQS tasks ◀── Graviton workers (Spot, Auto Scaling, scale to 0)
-                                  ▲                          │ docker run aegc/<env>  →  execute_task
-                                  └──── SQS results ◀────────┘   payloads > 700 KB via S3
+```mermaid
+flowchart LR
+    sdk["Globus Compute SDK<br/>(your code)"] -->|submit| globus(("Globus<br/>Compute"))
+    globus <-->|AMQPS, outbound| ep["Endpoint in Docker<br/>on your machine<br/><b>AWSEngine</b>"]
+    subgraph aws["Your AWS account"]
+        tasks[["SQS task queue"]]
+        results[["SQS result queue"]]
+        asg["Spot Graviton workers<br/>Auto Scaling, scale to 0"]
+        s3[("S3<br/>payloads > 700 KB")]
+    end
+    ep -->|send task| tasks
+    ep -.->|scale out| asg
+    asg -->|claim| tasks
+    asg -->|post result| results
+    results -->|long poll| ep
+    asg <-.-> s3
+    ep <-.-> s3
 ```
 
 - **Every connection is outbound.** The endpoint talks to Globus over AMQPS and to AWS APIs over

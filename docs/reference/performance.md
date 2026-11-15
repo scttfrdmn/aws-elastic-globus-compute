@@ -7,7 +7,7 @@ deployment on one day; Spot capacity, instance types and image size all change t
 ## Setup
 
 - Endpoint: a container on a laptop, Globus Compute endpoint 4.21.0, Python 3.14.
-- Deployment `e2e`: one pool, `geospatial` (aarchsci 2026.11.13.154112, Python 3.14), at most 3
+- Deployment `e2e`: one pool, `geospatial` ([aarchsci](https://aarch.science/) 2026.11.13.154112, Python 3.14), at most 3
   workers.
 - Spot Graviton workers with 2 slots each.
 - Worker image pulled from ECR; its base came through the pull-through cache.

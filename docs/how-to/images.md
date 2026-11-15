@@ -42,7 +42,7 @@ Options:
   with the endpoint's.
 - `--no-push` builds and tests locally, and records nothing.
 - `--direct` pulls the base from quay.io instead of the ECR cache.
-- `--source aarchbio` builds from `quay.io/aarchbio/<tool>` instead. This isn't validated in v0.1:
+- `--source aarchbio` builds from `quay.io/aarchbio/<tool>` ([aarch.bio](https://aarch.bio/)) instead. This isn't validated in v0.1:
   aarchbio images don't pin a Python for worker use yet (gap G4 in
   [#16](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/16)).
 
