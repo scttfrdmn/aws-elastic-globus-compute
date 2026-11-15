@@ -59,7 +59,11 @@ def test_pool_validation() -> None:
     with pytest.raises(ValueError, match="8 vCPUs"):
         sized("p-large", "large")  # workers of 2-8 vCPUs can't run an 8-vCPU task
     assert sized("p-large", "large", vcpu_min=8, vcpu_max=16, max_vcpus=32).task_cpus == 8
-    assert sized("p-whole", "whole").task_cpus == 0
+    assert sized("p-whole", "whole", vcpu_min=8).task_cpus == 0
+    with pytest.raises(ValueError, match="one worker size"):
+        sized("p-whole", "whole")  # vcpu=2-8: Auto Scaling could use four 2-vCPU instances
+    with pytest.raises(ValueError, match="drop slots=8"):
+        sized("p-mem", "mem", slots="8")
 
 
 def test_requests_and_templates_only_change_for_sized_pools() -> None:
@@ -80,7 +84,7 @@ def test_requests_and_templates_only_change_for_sized_pools() -> None:
 def manifest_pools() -> dict[str, dict[str, Any]]:
     out = {}
     large = sized("g-large", "large", vcpu_min=8, vcpu_max=16, max_vcpus=32)
-    for p in (POOL, sized("g-mem", "mem"), large, sized("g-whole", "whole")):
+    for p in (POOL, sized("g-mem", "mem"), large, sized("g-whole", "whole", vcpu_min=8)):
         out[p.name] = {**asdict(p), "capacity_type": "vcpu"}
     return out
 
@@ -94,8 +98,10 @@ def test_pick_by_size_or_need() -> None:
     assert pick({"memory_gib": 12}, pools, "geospatial") == ("g-mem", "")
     assert pick({"cpus": 4}, pools, "geospatial") == ("g-large", "")
     assert pick({"cpus": 2, "memory_gib": 4}, pools, "geospatial") == ("g-mem", "")
-    # A whole instance only when nothing smaller fits (it may hold vcpu_max vCPUs).
-    assert pick({"cpus": 2}, {n: pools[n] for n in ("g-whole", "g-large")}, "x")[0] == "g-whole"
+    # By vCPUs held: a 4-vCPU whole instance beats an 8-vCPU large slot; on a tie, the sized pool.
+    w4 = {**asdict(sized("g-w4", "whole", vcpu_min=4, vcpu_max=4)), "capacity_type": "vcpu"}
+    assert pick({"cpus": 2}, {"g-w4": w4, "g-large": pools["g-large"]}, "x")[0] == "g-w4"
+    assert pick({"cpus": 2}, {n: pools[n] for n in ("g-whole", "g-large")}, "x")[0] == "g-large"
     name, problem = pick({"cpus": 4, "memory_gib": 64}, pools, "geospatial")
     assert name is None and "g-mem (mem: 2 vCPU, 16 GiB per task)" in problem
     name, problem = pick({"size": "medium"}, pools, "geospatial")
@@ -107,7 +113,7 @@ def test_capacity_per_class() -> None:
     assert engine._capacity_for(pools[POOL.name], 3) == 3
     assert engine._capacity_for(pools["g-mem"], 3) == 6
     assert engine._capacity_for(pools["g-large"], 3) == 24
-    assert engine._capacity_for(pools["g-whole"], 3) == 3 * POOL.vcpu_max
+    assert engine._capacity_for(pools["g-whole"], 3) == 3 * 8  # one 8-vCPU worker each
 
 
 @pytest.mark.timeout(60)

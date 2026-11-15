@@ -15,7 +15,8 @@ COPY dist/ /opt/aegc/dist/
 RUN set -e; \
     PY="$(command -v "${PYTHON}" || echo "${PYTHON}")"; \
     "$PY" -c 'import sys; assert sys.version_info >= (3, 11), "aegc workers need Python >= 3.11, not " + sys.version'; \
-    "$PY" -m pip --version >/dev/null 2>&1 || "$PY" -m ensurepip --upgrade; \
+    "$PY" -m pip --version >/dev/null 2>&1 || "$PY" -m ensurepip --upgrade >/dev/null 2>&1 \
+        || { echo "aegc: $PY has no pip and no ensurepip; add pip to the base (e.g. apt-get install python3-pip)" >&2; exit 1; }; \
     "$PY" -m pip list --format=freeze > /opt/aegc/constraints.txt; \
     PIP_BREAK_SYSTEM_PACKAGES=1 PIP_ROOT_USER_ACTION=ignore "$PY" -m pip install --no-cache-dir -c /opt/aegc/constraints.txt \
         "globus-compute-endpoint==${GCE_VERSION}" /opt/aegc/dist/*.whl; \
@@ -23,7 +24,7 @@ RUN set -e; \
     rm -rf /opt/aegc/dist; \
     BIN="$("$PY" -c 'import shutil; print(shutil.which("aegc-worker") or "")')"; \
     if [ -z "$BIN" ]; then BIN="$("$PY" -c 'import sysconfig; print(sysconfig.get_path("scripts"))')/aegc-worker"; fi; \
-    [ -x /usr/local/bin/aegc-worker ] || ln -s "$BIN" /usr/local/bin/aegc-worker; \
+    ln -sf "$BIN" /usr/local/bin/aegc-worker; \
     if ! getent passwd "${AEGC_UID}" >/dev/null; then \
         useradd --create-home --uid "${AEGC_UID}" aegc 2>/dev/null \
         || adduser -D -u "${AEGC_UID}" aegc; \

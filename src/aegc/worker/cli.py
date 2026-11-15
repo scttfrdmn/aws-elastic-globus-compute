@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import signal
 import sys
@@ -94,6 +95,31 @@ def _selftest(_: argparse.Namespace) -> int:
     return 0
 
 
+def _version(_: argparse.Namespace) -> int:
+    """What ``aegc image register`` checks, as JSON on one line."""
+    import os
+    import platform
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as dist_version
+
+    import aegc
+
+    try:
+        gce = dist_version("globus-compute-endpoint")
+    except PackageNotFoundError:
+        gce = ""
+    info = {
+        "aegc": aegc.__version__,
+        "gce": gce,
+        "python": f"{sys.version_info[0]}.{sys.version_info[1]}",
+        "python_full": platform.python_version(),
+        "executable": sys.executable,
+        "uid": os.getuid(),
+    }
+    print(json.dumps(info, sort_keys=True))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(prog="aegc-worker")
@@ -102,6 +128,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("selftest", help="run a probe task through execute_task").set_defaults(
         func=_selftest
     )
+    sub.add_parser("version", help="aegc, Python and uid, as JSON").set_defaults(func=_version)
     args = parser.parse_args(argv)
     return int(args.func(args))
 

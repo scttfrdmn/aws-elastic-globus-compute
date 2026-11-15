@@ -67,8 +67,12 @@ def test_bad_grants_are_refused(text: str, match: str) -> None:
 
 def test_too_many_grants_fail_before_anything_changes() -> None:
     many = tuple(Grant("read", f"bucket-{i:04d}", f"some/longish/prefix/{i}/") for i in range(200))
-    with pytest.raises(ValueError, match="10240"):
+    with pytest.raises(ValueError, match="at most 32"):  # user data holds them too
         iam.grants_policy(many, deployment="dev")
+    # Few grants with long prefixes can still overflow IAM's inline-policy budget.
+    long = tuple(Grant("read", f"bucket-{i:04d}", "p/" * 150 + f"{i}/") for i in range(32))
+    with pytest.raises(ValueError, match="10240"):
+        iam.grants_policy(long, deployment="dev")
     with pytest.raises(ValueError, match="room for"):
         DeploymentSpec(
             deployment="dev",
@@ -76,7 +80,7 @@ def test_too_many_grants_fail_before_anything_changes() -> None:
             region=REGION,
             bucket=naming.bucket_name(ACCOUNT, REGION),
             pools=(),
-            grants=many[:60],  # fits alone, not next to aegc-worker
+            grants=long[:24],  # fits alone, not next to aegc-worker
         )
     with pytest.raises(ValueError, match="no grants"):
         iam.grants_policy((), deployment="dev")
@@ -177,7 +181,9 @@ def test_deploy_puts_redeploy_clears_destroy_removes(env: tuple[Clients, Deploym
     assert role_policies(c) == [iam.GRANTS_POLICY, iam.WORKER_POLICY]
     doc = c.iam.get_role_policy(RoleName=ROLE, PolicyName=iam.GRANTS_POLICY)["PolicyDocument"]
     doc = json.loads(doc) if isinstance(doc, str) else doc
-    assert doc == iam.grants_policy(grants, deployment="dev")
+    assert doc == iam.grants_policy(grants, deployment="dev", account=ACCOUNT)
+    write = next(st for st in doc["Statement"] if st["Sid"] == "GrantWrite")
+    assert write["Condition"] == {"StringEquals": {"s3:ResourceAccount": ACCOUNT}}
     m = deployment.read_manifest(c.ssm, "dev")
     assert m["grants"] == [
         {"access": "read", "bucket": "open-data", "prefix": "in/"},
@@ -242,7 +248,7 @@ def test_cli_grants_merge_with_the_previous_manifest() -> None:
         (["read=s3://open-data"], "whole bucket"),
         (["read=s3://*/"], "wildcards"),
         ([f"read=s3://{naming.bucket_name(ACCOUNT, REGION)}/"], "aegc's own bucket"),
-        ([f"read=s3://bucket-{i:04d}/some/longish/prefix/" for i in range(150)], "room for"),
+        ([f"read=s3://bucket-{i:04d}/some/longish/prefix/" for i in range(150)], "at most 32"),
     ],
 )
 def test_cli_grant_errors(given: list[str], match: str) -> None:

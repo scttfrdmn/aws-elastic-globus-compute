@@ -71,6 +71,18 @@ class PoolSpec:
         naming.validate_name("pool", self.name)
         if self.size_class:
             sizes.get(self.size_class)  # a known class
+            if self.slots != "auto":
+                raise ValueError(
+                    f"size={self.size_class} sets each worker's slots from its vCPUs and memory; "
+                    f"drop slots={self.slots}"
+                )
+        if self.size_class == "whole" and self.vcpu_min != self.vcpu_max:
+            # Auto Scaling counts vCPUs: with a range it may meet N tasks' worth of the largest
+            # size with many small instances, most of them idle.
+            raise ValueError(
+                f"size=whole needs one worker size, e.g. vcpu={self.vcpu_max}; "
+                f"not vcpu={self.vcpu_min}-{self.vcpu_max}"
+            )
         if self.task_cpus and self.vcpu_min < self.task_cpus:
             raise ValueError(
                 f"size={self.size_class or 'small'} gives each task {self.task_cpus} vCPUs, so "
@@ -153,7 +165,9 @@ class DeploymentSpec:
         if not self.grants:
             return None
         room = iam.INLINE_POLICY_LIMIT - iam.policy_size(self.worker_policy())
-        return iam.grants_policy(self.grants, deployment=self.deployment, budget=room)
+        return iam.grants_policy(
+            self.grants, deployment=self.deployment, budget=room, account=self.account
+        )
 
 
 @dataclass

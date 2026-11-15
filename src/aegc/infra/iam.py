@@ -101,11 +101,16 @@ def policy_size(doc: dict[str, Any]) -> int:
     return len(json.dumps(doc, separators=(",", ":")))
 
 
+#: More grants than this are refused: they also go into each worker's user data (16 KB).
+MAX_GRANTS = 32
+
+
 def grants_policy(
     grants: tuple[Grant, ...] | list[Grant],
     *,
     deployment: str,
     budget: int = INLINE_POLICY_LIMIT,
+    account: str = "",
 ) -> dict[str, Any]:
     """The inline policy ``aegc-grants``: worker access to the user's own S3 prefixes.
 
@@ -121,12 +126,21 @@ def grants_policy(
     with a customer managed KMS key also need ``kms:Decrypt`` (read) or ``kms:GenerateDataKey``
     (write) on that key, which aegc doesn't grant.
 
+    With ``account``, writes are limited to buckets that account owns (``s3:ResourceAccount``),
+    so a mistyped or squatted bucket name in another account can't receive task outputs. Reads
+    may cross accounts (open data lives in other accounts).
+
     ``budget`` is the room left in the role's 10,240 inline characters; too many grants raise
     ``ValueError``.
     """
     gs = list(dict.fromkeys(grants))
     if not gs:
         raise ValueError("no grants: delete the aegc-grants policy instead")
+    if len(gs) > MAX_GRANTS:
+        raise ValueError(
+            f"deployment {deployment} has {len(gs)} grants; at most {MAX_GRANTS} (use fewer, "
+            "broader prefixes)"
+        )
     reads = [g for g in gs if g.access == "read"]
     writes = [g for g in gs if g.access == "write"]
     statements: list[dict[str, Any]] = []
@@ -161,6 +175,11 @@ def grants_policy(
                     "s3:ListMultipartUploadParts",
                 ],
                 "Resource": [f"arn:aws:s3:::{g.bucket}/{g.prefix}*" for g in writes],
+                **(
+                    {"Condition": {"StringEquals": {"s3:ResourceAccount": account}}}
+                    if account
+                    else {}
+                ),
             }
         )
     doc = {"Version": "2012-10-17", "Statement": statements}
@@ -291,10 +310,15 @@ def worker_policy(*, deployment: str, region: str, account: str, bucket: str) ->
             },
             {
                 # Stop claiming when the deployment is capped, stopped or expired.
+                # The state (stop, caps), and the manifest for aegc.outputs' current grants.
                 "Sid": "ReadDeploymentState",
                 "Effect": "Allow",
                 "Action": "ssm:GetParameter",
-                "Resource": f"arn:aws:ssm:{region}:{account}:parameter{naming.state_parameter(d)}",
+                "Resource": [
+                    f"arn:aws:ssm:{region}:{account}:parameter{naming.state_parameter(d)}",
+                    f"arn:aws:ssm:{region}:{account}:parameter"
+                    f"{naming.deployment_manifest_parameter(d)}",
+                ],
             },
             {
                 "Sid": "WriteCostLedger",
@@ -890,6 +914,7 @@ def builder_policy(*, region: str, account: str) -> dict[str, Any]:
                 "Action": [
                     "ssm:GetParameter",
                     "ssm:PutParameter",
+                    "ssm:DeleteParameter",
                     "ssm:AddTagsToResource",
                     "ssm:ListTagsForResource",
                 ],

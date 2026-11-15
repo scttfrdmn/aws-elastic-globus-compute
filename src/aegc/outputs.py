@@ -6,7 +6,7 @@ makes something bigger writes it under one of the deployment's write grants and 
 
     def render(scene):
         from aegc import outputs
-        path = make_movie(scene)
+        path = make_movie(scene)  # a file path (str or Path)
         return outputs.put(path)  # s3://bucket/out/<task uuid>/movie.mp4
 
 Deploy with ``aegc deploy <d> --grant write=s3://bucket/out/`` first. Keys are
@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import io
 import itertools
+import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -49,12 +51,40 @@ def _client(region: str | None = None) -> Any:
     return boto3.client("s3", region_name=region)
 
 
+#: How long a worker trusts its copy of the deployment's grants.
+GRANTS_TTL_S = 60.0
+_grants_cache: tuple[float, list[dict[str, str]]] | None = None
+
+
+def _current_grants(cfg: Any) -> list[dict[str, str]]:
+    """The deployment's grants now, from its manifest (a redeploy may have changed them since
+    this worker booted); the boot-time copy if the manifest can't be read."""
+    global _grants_cache
+    now = time.monotonic()
+    if _grants_cache is not None and now - _grants_cache[0] < GRANTS_TTL_S:
+        return _grants_cache[1]
+    grants = [dict(g) for g in cfg.grants]
+    try:
+        import boto3
+
+        from aegc import naming
+
+        ssm = boto3.client("ssm", region_name=cfg.region)
+        name = naming.deployment_manifest_parameter(cfg.deployment)
+        manifest = json.loads(ssm.get_parameter(Name=name)["Parameter"]["Value"])
+        grants = [dict(g) for g in manifest.get("grants", [])]
+    except Exception:
+        pass
+    _grants_cache = (now, grants)
+    return grants
+
+
 def write_grants() -> list[Grant]:
     """This deployment's write grants, in the order they were given."""
     cfg = _config()
     if cfg is None:
         return []
-    return [g for g in (Grant.from_dict(d) for d in cfg.grants) if g.access == "write"]
+    return [g for g in (Grant.from_dict(d) for d in _current_grants(cfg)) if g.access == "write"]
 
 
 def _join(*parts: str) -> str:
@@ -74,7 +104,8 @@ def put(
 ) -> str:
     """Upload ``data`` and return its ``s3://`` URI.
 
-    ``data`` is bytes, a str (uploaded as UTF-8 text) or a path (``pathlib.Path``) to a file.
+    ``data`` is bytes, or a path (``str`` or ``pathlib.Path``) to a file; for text, pass
+    ``text.encode()``. A path that doesn't exist raises FileNotFoundError.
     It goes to ``<prefix>/<task uuid>/<name>``, where the prefix is the first write grant's, or
     ``prefix`` (``s3://bucket/some/prefix``, inside a write grant). ``name`` defaults to the
     file's name, or ``output-<n>``. Large files go up in parts.
@@ -84,8 +115,13 @@ def put(
         raise PermissionError(
             "no write grant: deploy with `aegc deploy <d> --grant write=s3://bucket/prefix`"
         )
-    path = Path(data) if isinstance(data, os.PathLike) else None
+    path = Path(data) if isinstance(data, (str, os.PathLike)) else None
     if path is not None:
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"no file {str(path)!r} to upload (put takes bytes or a file path; for text, "
+                "pass text.encode())"
+            )
         name = name or path.name
     if not name:
         name = f"output-{next(_counter)}"
@@ -105,9 +141,8 @@ def put(
     if path is not None:
         s3.upload_file(str(path), bucket, key)
     else:
-        assert not isinstance(data, os.PathLike)
-        body = data.encode() if isinstance(data, str) else bytes(data)
-        s3.upload_fileobj(io.BytesIO(body), bucket, key)
+        assert not isinstance(data, (str, os.PathLike))
+        s3.upload_fileobj(io.BytesIO(bytes(data)), bucket, key)
     return f"s3://{bucket}/{key}"
 
 

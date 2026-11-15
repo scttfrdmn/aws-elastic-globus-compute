@@ -62,7 +62,13 @@ def slots(task_cpus: int, task_memory_gib: float, cpus: int, memory_gib: float) 
 
 def per_task(pool: dict[str, Any]) -> tuple[float, float]:
     """(vCPUs, GiB) one task of a manifest pool is sure to get."""
+    vcpus = float(pool.get("vcpu_min", 2))
+    mem = float(pool.get("memory_mib_min", 4096)) / 1024
     if pool.get("size_class") == "whole":
-        return float(pool.get("vcpu_min", 2)), float(pool.get("memory_mib_min", 4096)) / 1024
+        return vcpus, mem
+    slots = str(pool.get("slots", "auto"))
+    if not pool.get("size_class") and slots != "auto":  # fixed slots share the smallest worker
+        n = max(1, int(slots))
+        return vcpus / n, mem / n
     cpus = float(pool.get("task_cpus") or 1)
     return cpus, float(pool.get("task_memory_gib") or 2 * cpus)

@@ -402,7 +402,8 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
             if name not in pools:
                 return None, 0, f"no pool {name!r} in deployment {self.deployment!r}"
             walltime, problem = _walltime(spec, pools[name])
-            return name, walltime, problem or self._python_check(name, pools[name])
+            problem = problem or self._python_check(name, pools[name]) or _fit(spec, name, pools)
+            return name, walltime, problem
         picked, problem = self._pick_pool(spec, pools)
         if picked is None:
             return None, 0, problem
@@ -1117,12 +1118,13 @@ def _pick_size(
         named = sorted(n for n, p in pools.items() if cls(p) == want)
         if not named:
             return None, f"no size={want!r} pool for env {env!r}; available: {have()}"
-        return named[0], ""
+        problem = _fit(spec, named[0], pools)
+        return (None, problem) if problem else (named[0], "")
     cpus = float(spec.get("cpus", 0))
     mem = float(spec.get("memory_gib", 0))
-    # Cheapest first: the vCPUs a task holds (a whole instance may be vcpu_max), then memory.
+    # Cheapest first: the vCPUs a task holds, then a sized pool over a whole one, then memory.
     fits = [
-        (_capacity_for({**p, "slots": "auto", "capacity_type": "vcpu"}, 1), m, n)
+        (_capacity_for({**p, "slots": "auto", "capacity_type": "vcpu"}, 1), cls(p) == "whole", m, n)
         for n, p in pools.items()
         for c, m in [sizes.per_task(p)]
         if c >= cpus and m >= mem
@@ -1132,23 +1134,34 @@ def _pick_size(
             f"no pool for env {env!r} gives a task {cpus:g} vCPUs and {mem:g} GiB; "
             f"available: {have()}. Deploy one with --pool {env}:size=..."
         )
-    return min(fits)[2], ""
+    return min(fits)[-1], ""
+
+
+def _fit(spec: dict[str, Any], name: str, pools: dict[str, dict[str, Any]]) -> str:
+    """A problem if the request's ``cpus``/``memory_gib`` don't fit pool ``name``'s tasks."""
+    cpus, mem = float(spec.get("cpus", 0)), float(spec.get("memory_gib", 0))
+    c, m = sizes.per_task(pools[name])
+    if cpus > c or mem > m:
+        return (
+            f"pool {name!r} gives a task {c:g} vCPUs and {m:g} GiB, less than the "
+            f"{cpus:g} vCPUs and {mem:g} GiB asked for"
+        )
+    return ""
 
 
 def _capacity_for(pool: dict[str, Any], demand: int) -> int:
     """Capacity units (vCPUs, or workers for a v0.1 pool) that run ``demand`` tasks at once.
 
     ``slots=auto`` runs one task per ``task_cpus`` vCPUs (one per vCPU without a size class),
-    and ``size=whole`` one per instance: up to ``vcpu_max`` units each, so that many instances
-    launch even if Auto Scaling picks the largest size. Fixed ``slots=N`` runs N tasks per worker
-    of at least ``vcpu_min`` vCPUs.
+    and ``size=whole`` one per instance (whole pools have one worker size). Fixed ``slots=N`` runs N
+    tasks per worker of at least ``vcpu_min`` vCPUs.
     """
     if not _vcpu_mode(pool):
         return math.ceil(demand / _slots(pool))
     slots = str(pool.get("slots", "auto"))
     if slots == "auto":
-        if pool.get("size_class") == "whole":
-            return demand * int(pool.get("vcpu_max", 8))
+        if pool.get("size_class") == "whole":  # one worker size (vcpu_min == vcpu_max)
+            return demand * int(pool.get("vcpu_min", 2))
         return demand * max(1, int(pool.get("task_cpus") or 1))
     return math.ceil(demand / max(1, int(slots))) * int(pool.get("vcpu_min", 2))
 

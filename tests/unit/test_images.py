@@ -340,27 +340,39 @@ def test_pip_base_context_and_args(tmp_path: Path) -> None:
     assert not any(a.startswith("PYTHON=") for a in conda)
 
 
-def fake_docker(kind: str, minor: str, calls: list[list[str]], aegc_version: str = "0.3.0"):  # type: ignore[no-untyped-def]
+def fake_docker(  # type: ignore[no-untyped-def]
+    kind: str,
+    minor: str,
+    calls: list[list[str]],
+    aegc_version: str = "0.3.0",
+    *,
+    arch: str = "arm64",
+    image_id: str = "sha256:" + "1" * 64,
+    uid: int = 57439,
+    version_ok: bool = True,
+):
     def run(cmd: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
         calls.append(cmd)
-        out = ""
+        out, rc = "", 0
         if cmd[:2] == ["uv", "build"]:
             out_dir = Path(cmd[cmd.index("--out-dir") + 1])
             out_dir.mkdir(parents=True, exist_ok=True)
             (out_dir / "aws_elastic_globus_compute-0.3.0-py3-none-any.whl").write_bytes(b"w")
         elif cmd[:2] == ["docker", "run"] and "sh" in cmd:
             out = kind + "\n"
-        elif cmd[:2] == ["docker", "run"] and "import aegc; print(aegc.__version__)" in cmd:
-            out = aegc_version + "\n"
+        elif cmd[:2] == ["docker", "run"] and cmd[-2:] == ["aegc-worker", "version"]:
+            info = {"aegc": aegc_version, "python": minor, "uid": uid, "gce": "4.21.0",
+                    "executable": "/usr/local/bin/python3"}  # fmt: skip
+            out, rc = (json.dumps(info) + "\n", 0) if version_ok else ("", 1)
         elif cmd[:2] == ["docker", "run"] and "selftest" in cmd:
             out = "ok\n"
         elif cmd[:2] == ["docker", "run"]:
             out = minor + "\n"
         elif cmd[:3] == ["docker", "image", "inspect"]:
-            out = "arm64\n"
+            out = f"{arch} {image_id}\n"
         elif cmd[:2] == ["docker", "inspect"]:
             out = json.dumps([cmd[-1].rsplit(":", 1)[0] + "@sha256:" + "f" * 64])
-        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+        return subprocess.CompletedProcess(cmd, rc, stdout=out, stderr="")
 
     return run
 
@@ -377,7 +389,14 @@ def test_build_from_a_pip_base(aws: Callable[[str], Any], tmp_path: Path) -> Non
     assert (rec.base_kind, rec.python, rec.python_minor) == ("pip", "python3", "3.13")
     # No pull-through cache login before the build: the base comes from its own registry.
     kinds = [c[1] for c in calls if c[0] == "docker"]
-    assert kinds == ["run", "buildx", "run", "login", "tag", "push", "inspect"]
+    assert kinds == ["pull", "image", "run", "buildx", "run", "login", "tag", "push", "inspect"]
+    assert rec.tag.endswith("-b" + "1" * 12 + "-w" + hashlib.sha256(b"w").hexdigest()[:8])
+    # The same tag pointing at a new image builds anew (a moved tag isn't "already built").
+    moved = images.build(
+        spec, account=ACCOUNT, region=REGION, ecr=ecr, ssm=ssm, project_dir=tmp_path,
+        run=fake_docker("pip", "3.13", [], image_id="sha256:" + "2" * 64), log=lambda _: None,
+    )  # fmt: skip
+    assert isinstance(moved, images.ImageRecord) and moved.tag != rec.tag
     minor_probe = [c for c in calls if c[:2] == ["docker", "run"]][-1]
     assert minor_probe[minor_probe.index("--entrypoint") + 1] == "python3"
 
@@ -398,12 +417,58 @@ def test_records_keep_every_minor(aws: Callable[[str], Any]) -> None:
 
 def test_reads_the_v02_single_record(aws: Callable[[str], Any]) -> None:
     ssm = aws("ssm")
-    old = {k: v for k, v in rec_for("3.14").__dict__.items() if k not in {"base_kind", "python"}}
+    old = {k: v for k, v in rec_for("3.14").__dict__.items() if k in images.LEGACY_FIELDS}
     ssm.put_parameter(Name="/aegc/images/geospatial", Value=json.dumps(old), Type="String")
     (rec,) = images.read_images(ssm, "geospatial").values()
     assert rec.base_kind == "conda" and rec.python == images.CONDA_PYTHON
-    images.record_image(ssm, rec_for("3.13"))  # upgrades the parameter to the records map
+    images.record_image(ssm, rec_for("3.13", built_at=5))
     assert sorted(images.read_images(ssm, "geospatial")) == ["3.13", "3.14"]
+
+
+def test_v02_clis_keep_working(aws: Callable[[str], Any]) -> None:
+    ssm = aws("ssm")
+    images.record_image(ssm, rec_for("3.14", built_at=1))
+    images.record_image(ssm, rec_for("3.13", built_at=2, base_kind="pip", python="python3"))
+    # What a 0.2 CLI reads: one record, only the fields it knows (ImageRecord(**value) there).
+    legacy = json.loads(ssm.get_parameter(Name="/aegc/images/geospatial")["Parameter"]["Value"])
+    assert set(legacy) == set(images.LEGACY_FIELDS) and legacy["python_minor"] == "3.13"
+    # A 0.2 `image build` overwrites the single record: the newer 3.14 wins, 3.13 stays.
+    newer = {**legacy, "python_minor": "3.14", "built_at": 9, "tag": "from-0.2"}
+    ssm.put_parameter(Name="/aegc/images/geospatial", Value=json.dumps(newer), Type="String",
+                      Overwrite=True)  # fmt: skip
+    got = images.read_images(ssm, "geospatial")
+    assert sorted(got) == ["3.13", "3.14"] and got["3.14"].tag == "from-0.2"
+
+
+def test_forget(aws: Callable[[str], Any]) -> None:
+    ssm = aws("ssm")
+    images.record_image(ssm, rec_for("3.14", built_at=1))
+    images.record_image(ssm, rec_for("3.13", built_at=2))
+    assert sorted(images.forget(ssm, "geospatial", "3.13")) == ["3.14"]
+    assert sorted(images.read_images(ssm, "geospatial")) == ["3.14"]
+    legacy = json.loads(ssm.get_parameter(Name="/aegc/images/geospatial")["Parameter"]["Value"])
+    assert legacy["python_minor"] == "3.14"
+    with pytest.raises(KeyError):
+        images.forget(ssm, "geospatial", "3.13")
+    assert images.forget(ssm, "geospatial", "3.14") == {}
+    with pytest.raises(ssm.exceptions.ParameterNotFound):
+        images.read_images(ssm, "geospatial")
+
+
+def test_forget_refuses_foreign_records(aws: Callable[[str], Any]) -> None:
+    ssm = aws("ssm")
+    old = {k: v for k, v in rec_for("3.14").__dict__.items() if k in images.LEGACY_FIELDS}
+    ssm.put_parameter(Name="/aegc/images/geospatial", Value=json.dumps(old), Type="String")
+    with pytest.raises(images.OwnershipError):
+        images.forget(ssm, "geospatial", "3.14")
+
+
+def test_distroless_bases_fail_clearly() -> None:
+    def run(cmd: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
+        raise subprocess.CalledProcessError(127, cmd, stderr='exec: "sh": not found')
+
+    with pytest.raises(ValueError, match="needs sh"):
+        images.detect_kind("gcr.io/distroless/python3@sha256:" + "a" * 64, run=run)
 
 
 def test_register(aws: Callable[[str], Any]) -> None:
@@ -415,27 +480,37 @@ def test_register(aws: Callable[[str], Any]) -> None:
         run=fake_docker("pip", "3.12", calls), log=lambda _: None,
     )  # fmt: skip
     assert rec.base_kind == "registered" and rec.python_minor == "3.12"
-    assert rec.base == ref and rec.tag.startswith("py3.12-aegc0.3.0-r")
+    assert rec.base.startswith(ref) and rec.tag == "py3.12-aegc0.3.0-r" + "1" * 12
+    # Checked the way user data runs it: no --entrypoint override.
+    assert all("--entrypoint" not in c for c in calls if c[:2] == ["docker", "run"])
     assert images.read_image(ssm, "geospatial", "3.12") == rec
     assert any(c[:2] == ["docker", "tag"] and c[2] == ref for c in calls)
     for bad, match in (("ghcr.io/me/geo", "pin"), ("ghcr.io/me/geo:latest", "pin")):
         with pytest.raises(ValueError, match=match):
             images.register("geospatial", bad, account=ACCOUNT, region=REGION, ecr=ecr, ssm=ssm,
                             run=fake_docker("pip", "3.12", []))  # fmt: skip
-    with pytest.raises(ValueError, match=r"0\.2 or later"):
-        images.register("geospatial", ref, account=ACCOUNT, region=REGION, ecr=ecr, ssm=ssm,
-                        run=fake_docker("pip", "3.12", [], aegc_version="0.1.4"))  # fmt: skip
+    for kw, match in (
+        ({"aegc_version": "0.2.0"}, r"0\.3 or later"),
+        ({"uid": 1000}, "uid 1000"),
+        ({"version_ok": False}, "entrypoint"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            images.register("geospatial", ref, account=ACCOUNT, region=REGION, ecr=ecr, ssm=ssm,
+                            run=fake_docker("pip", "3.12", [], **kw))  # fmt: skip
 
 
 def test_register_refuses_amd64(aws: Callable[[str], Any]) -> None:
     calls: list[list[str]] = []
     run = fake_docker("pip", "3.12", calls)
 
-    def amd64(cmd: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
-        if cmd[:3] == ["docker", "image", "inspect"]:
-            return subprocess.CompletedProcess(cmd, 0, stdout="amd64\n", stderr="")
-        return run(cmd, **kw)
-
+    del run
     with pytest.raises(ValueError, match="not arm64"):
         images.register("geospatial", "me/geo:v1", account=ACCOUNT, region=REGION,
-                        ecr=aws("ecr"), ssm=aws("ssm"), run=amd64)  # fmt: skip
+                        ecr=aws("ecr"), ssm=aws("ssm"),
+                        run=fake_docker("pip", "3.12", calls, arch="amd64"))  # fmt: skip
+    with pytest.raises(ValueError, match="not arm64"):
+        images.build(
+            images.ImageSpec(env="g", base="me/geo:v1"), account=ACCOUNT, region=REGION,
+            ecr=aws("ecr"), ssm=aws("ssm"), project_dir=Path("."),
+            run=fake_docker("pip", "3.12", [], arch="amd64"), log=lambda _: None,
+        )  # fmt: skip
