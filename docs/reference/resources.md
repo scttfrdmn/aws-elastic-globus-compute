@@ -44,7 +44,9 @@ Deleted by `aegc unbootstrap`.
 | SSM parameter | `/aegc/bootstrap` | `manifest` |
 
 The bucket has Block Public Access, bucket-owner-enforced ownership, SSE-S3, a TLS-only bucket
-policy, and a lifecycle rule that expires `payloads/` after 15 days.
+policy, and two lifecycle rules: `aegc-expire-payloads` expires `payloads/` after 15 days, and
+`aegc-expire-ledger` expires `ledger/` after 400 days. A bucket bootstrapped by v0.1 gets the ledger
+rule the next time you run `aegc bootstrap`.
 
 ## Images: aegc image build
 
@@ -52,7 +54,7 @@ Not deleted by any aegc command.
 
 | Resource | Name | `aegc:role` |
 |---|---|---|
-| ECR repository (immutable tags, scan on push, keeps 10 images) | `aegc/<env>` | `image-repo` |
+| ECR repository (immutable tags, scan on push, keeps 10 images plus those tagged `inuse-`) | `aegc/<env>` | `image-repo` |
 | SSM parameter: `{env, python_minor, image, tag, base, gce_version, aegc_version, built_at}` | `/aegc/images/<env>` | `image-record` |
 
 ## Deployment: aegc deploy
@@ -66,6 +68,15 @@ Deleted by `aegc destroy`.
 | EC2 security group, no ingress, in the default VPC | `aegc-<d>-workers` | `sg` |
 | CloudWatch log group, 14-day retention | `/aegc/<d>` | `logs` |
 | SSM parameter (the manifest the engine reads) | `/aegc/<d>/manifest` | `manifest` |
+| SSM parameter (the [deployment state](../concepts/architecture.md#deployment-state)) | `/aegc/<d>/state` | `state` |
+| EventBridge Scheduler schedule group | `aegc-<d>` | `schedules` |
+| EventBridge Scheduler schedules (one-shot, in the group; schedules can't be tagged) | `lease-state`, `lease-<pool>`, and with `--ttl`, `ttl-state`, `ttl-<pool>` | — |
+| IAM role, path `/aegc/`, inline policy `aegc-lease`, trusts `scheduler.amazonaws.com` | `aegc-<d>-scheduler-<region>` | `scheduler` |
+| ECR image tags on the images the pools use | `inuse-<d>-<first 12 hex of the digest>` in `aegc/<env>` | — |
+
+The schedule group and role exist unless the deployment was made with `--lease none` and no TTL.
+`deploy` adds the in-use tags and removes the deployment's older ones; `destroy` removes them all,
+leaving the images.
 
 ## Pool: aegc deploy --pool
 
@@ -90,6 +101,12 @@ a redeploy with no changes adds no version.
 | SQS result queue (14-day retention, visibility 120 s, SSE) | `aegc-<d>-res-<first 12 hex of the endpoint id>` | `result-queue` | `aegc reap` (when empty and idle 14 days) or `aegc destroy` |
 | S3 objects | `payloads/<d>/tasks/<task>/<attempt>.task`, `payloads/<d>/results/<task>/<task>:<attempt>.result` | — | the engine after use, else the 15-day lifecycle rule |
 
+## Workers: aegc-worker
+
+| Resource | Name | `aegc:role` | Deleted by |
+|---|---|---|---|
+| S3 objects (the [cost ledger](../concepts/cost.md#cost-ledger), one JSON record per instance) | `ledger/<d>/<yyyy-mm-dd>/<instance-id>.json`, dated by the instance's boot (UTC) | — | the 400-day lifecycle rule; not `aegc destroy` |
+
 ## On your machine: aegc endpoint
 
 | Resource | Name |
@@ -101,6 +118,18 @@ a redeploy with no changes adds no version.
 ## Manifest
 
 `/aegc/<d>/manifest` is JSON written at the end of each `aegc deploy`. It holds the deployment,
-region, account, bucket, instance profile ARN, security group and subnets, and for each pool its
-settings (env, Python, image digest, sizes, slots, idle timeout, instance types) and the URLs and
-names of its queues, launch template and group. `AWSEngine` and `aegc status` read it.
+region, account, bucket, instance profile ARN, security group and subnets; for each pool its
+settings (env, Python, image digest, `min_vcpus`/`max_vcpus` and `capacity_type: vcpu`, sizes,
+slots, idle timeout, volume, walltimes, lifetime, instance types) and the URLs and names of its
+queues, launch template and group; `limits` (`max_usd_day`, `max_usd_month`,
+`max_instance_hours_day`, `on_cap`); `lease` (`lease_s`, `ttl_at`); and `generation`, a hash of
+the rest, which engines compare to notice a redeploy. `aegc limits` rewrites it. `AWSEngine` and
+`aegc status` read it.
+
+## State
+
+`/aegc/<d>/state` is JSON: `mode` (`running`, `capped`, `stopped` or `expired`), `reason`, `since`,
+`until` (for `capped`, the end of the cap's period), `by` (`aegc deploy`, `engine`, `aegc stop`,
+`aegc resume`, `lease` or `ttl`) and `kill` (fail running tasks too). `aegc deploy` creates it;
+engines, `aegc stop`, `aegc resume`, `aegc limits --resume` and the lease schedules overwrite it.
+A missing parameter reads as `running`.

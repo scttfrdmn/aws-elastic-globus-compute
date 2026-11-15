@@ -41,7 +41,9 @@ It replaces the HTEX-based setup from
 submit host, which needs tunnels or exposed ports.
 
 !!! note "Status"
-    Version 0.1.0, an early release; expect changes before later 0.x versions. Work is tracked in the repository's
+    An early 0.x release. These pages describe the main branch, which adds v0.2's spend limits,
+    `aegc stop` and the cost ledger to v0.1.0; expect more changes before later 0.x versions.
+    Work is tracked in the repository's
     [issues](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues) and
     [milestones](https://github.com/scttfrdmn/aws-elastic-globus-compute/milestones).
 
@@ -49,7 +51,7 @@ submit host, which needs tunnels or exposed ports.
 
 - **[Quickstart](quickstart.md):** bootstrap a region, build one worker image, deploy a pool, and run
   tasks through a laptop endpoint, then tear it down.
-- **[When to use aegc](concepts/when-to-use.md):** what it's good at, and the limits of v0.1.
+- **[When to use aegc](concepts/when-to-use.md):** what it's good at, and its limits.
 - **[Architecture](concepts/architecture.md):** how a task travels from the SDK to a worker and back.
 
 The site is organised into concepts (how it works and why), how-to guides (tasks you'll do), and

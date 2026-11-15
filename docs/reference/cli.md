@@ -11,13 +11,30 @@ aegc [-h] [--version] [--profile PROFILE] [--region REGION] COMMAND ...
 |---|---|
 | `--profile PROFILE` | AWS profile (default: the environment's) |
 | `--region REGION` | AWS region (default: the profile's) |
-| `--version` | Print `aegc 0.1.0` |
+| `--version` | Print the version, e.g. `aegc 0.1.0` |
 
 Global options go **before** the command: `aegc --region us-west-2 status e2e`.
 
 Commands that delete are dry runs unless given `--yes`. Commands that create accept `--dry-run`.
 Each prints a report, one line per resource, with an outcome: `created`, `exists`, `updated`,
-`deleted`, `would-create`, `would-delete` or `kept`.
+`deleted`, `would-create`, `would-update`, `would-delete`, `kept` or `remaining`.
+
+| Command | What it does |
+|---|---|
+| [`bootstrap`](#aegc-bootstrap) | Create the region-wide resources (once per region) |
+| [`unbootstrap`](#aegc-unbootstrap) | Remove the region-wide resources (dry run by default) |
+| [`image build`](#aegc-image-build) | Build, push and record a worker image for an environment |
+| [`deploy`](#aegc-deploy) | Create or update a deployment and its worker pools |
+| [`stop`](#aegc-stop) | Stop a deployment's spending now (kill switch) |
+| [`resume`](#aegc-resume) | Resume a stopped, capped or expired deployment |
+| [`limits`](#aegc-limits) | Show or change a deployment's spend limits |
+| [`cost`](#aegc-cost) | Estimated spend from the cost ledger |
+| [`destroy`](#aegc-destroy) | Delete a deployment (dry run by default) |
+| [`footprint`](#aegc-footprint) | List what exists for a deployment: owned resources and untagged look-alikes |
+| [`status`](#aegc-status) | State, spend, limits, lease, pools, queues, workers and waiting results |
+| [`reap`](#aegc-reap) | Delete idle result queues of finished endpoint processes |
+| [`iam-policy`](#aegc-iam-policy) | Print an IAM policy document for one of aegc's roles |
+| [`endpoint`](#aegc-endpoint) | Run a Globus Compute endpoint with `AWSEngine` in Docker |
 
 ## aegc bootstrap
 
@@ -71,54 +88,158 @@ Prints the pinned image (`<registry>/aegc/<env>@sha256:…`), or the local tag w
 ## aegc deploy
 
 ```
-aegc deploy DEPLOYMENT --pool POOL [--pool POOL ...] [--dry-run]
+aegc deploy DEPLOYMENT --pool POOL [--pool POOL ...]
+            [--max-usd-day N|none] [--max-usd-month N|none] [--max-instance-hours-day N|none]
+            [--on-cap {fail,kill}] [--lease DURATION] [--ttl DURATION]
+            [--prune] [--yes] [--force] [--allow-old-image] [--dry-run]
 ```
 
-Create or update a deployment and its worker pools. Pass every pool on each run.
+Create or update a deployment and its worker pools. On a redeploy, pools and options you don't give
+keep their last values. See [Configure pools](../how-to/configuration.md).
 
 | Argument / option | Meaning |
 |---|---|
 | `DEPLOYMENT` | Deployment name: 1–20 characters of `[a-z0-9-]`, starting with a letter |
-| `--pool POOL` | `env[:max=N,min=N,vcpu=LO-HI,mem=MiB,slots=N|auto,idle=S,on-demand]`; repeatable, at least one |
+| `--pool POOL` | `env[:option=value,...]` (below); repeatable, at least one |
+| `--max-usd-day N|none` | Cap on estimated $ per UTC day |
+| `--max-usd-month N|none` | Cap on estimated $ per UTC month |
+| `--max-instance-hours-day N|none` | Cap on instance-hours per UTC day |
+| `--on-cap {fail,kill}` | When a cap trips, let running tasks finish (`fail`, the default) or fail them (`kill`) |
+| `--lease DURATION` | Freeze the deployment if no endpoint renews it for this long (default `48h`, at least `3h`; `none` disables); running endpoints renew hourly |
+| `--ttl DURATION` | Freeze the deployment this long from now, renewed or not (e.g. `7d`; `none` clears) |
+| `--prune` | Remove pools not listed (a dry run of that part unless `--yes`) |
+| `--yes` | With `--prune`: actually remove them |
+| `--force` | `--prune` even with tasks queued |
+| `--allow-old-image` | Deploy images built before aegc 0.2 (their workers ignore limits and stop) |
 | `--dry-run` | Report what would change; change nothing |
+
+Durations are `<N>m`, `<N>h` or `<N>d`. Limits, lease and TTL are kept across redeploys unless
+given again. Without any limit, `deploy` prints a note. While the deployment isn't running, a
+redeploy keeps group minimums at 0. `deploy` refuses an image built with aegc before 0.2 unless
+`--allow-old-image` is given.
 
 Pool options:
 
 | Option | Default | Meaning |
 |---|---|---|
-| `max=N` | 4 | Maximum workers |
-| `min=N` | 0 | Minimum workers |
-| `vcpu=LO-HI` or `vcpu=N` | 2-16 | vCPU range per instance |
+| `max_vcpus=N` | 8 | Maximum vCPUs in the pool |
+| `min_vcpus=N` | 0 | Minimum vCPUs in the pool |
+| `vcpu=LO-HI` or `vcpu=N` | 2-8 | vCPU range per instance; HI at most `max_vcpus` (the default HI is lowered to fit) |
 | `mem=MiB` | 4096 | Minimum memory per instance |
 | `slots=N` or `slots=auto` | `auto` | Concurrent tasks per worker; `auto` is one per vCPU |
 | `idle=S` | 300 | Idle seconds before a worker leaves the group |
+| `disk=GiB` | 30 | Root gp3 volume size (30–16384) |
+| `throughput=MiBps` | 125 | Root volume throughput (125–1000) |
+| `walltime=S` | 39,600 | Default walltime for the pool's tasks |
+| `max_walltime=S` | 41,400 | Most walltime a task may request |
+| `lifetime=S` | 86,400 | Seconds (3,600–259,200) after which a worker stops claiming |
 | `on-demand` | Spot | Use on-demand instances |
+| `spot` | Spot | Use Spot instances (undoes `on-demand`) |
+| `max=N`, `min=N` | | v0.1 spelling, in workers: converted to `max_vcpus`/`min_vcpus` (× `vcpu` LO) with a warning |
 
 The env must have an image recorded by `aegc image build`. The pool is named
 `<env>-py<NNN>` from that image's Python version.
 
+## aegc stop
+
+```
+aegc stop DEPLOYMENT [--hard] [--yes]
+```
+
+Stop a deployment's spending now: set its state to `stopped` and every group's minimum to 0.
+Queued tasks fail with `AEGC_STOPPED`, running tasks finish, and workers leave their groups. See
+[Operations](../how-to/operations.md#stop-and-resume).
+
+| Option | Meaning |
+|---|---|
+| `--hard` | Also fail running tasks and terminate workers after 2 minutes (needs `--yes`) |
+| `--yes` | Confirm `--hard` |
+
+## aegc resume
+
+```
+aegc resume DEPLOYMENT
+```
+
+Resume a stopped, capped or expired deployment: set its state to `running`, restore each group's
+minimum, and push the lease forward.
+
+## aegc limits
+
+```
+aegc limits DEPLOYMENT [--max-usd-day N|none] [--max-usd-month N|none]
+            [--max-instance-hours-day N|none] [--on-cap {fail,kill}] [--resume]
+```
+
+Show or change a deployment's spend limits. With no options it prints them. Running endpoints pick
+up a change within a minute. `--resume` refuses while spend is still over a limit, and needs read
+access to the cost ledger. See [Spend limits](../concepts/cost.md#spend-limits).
+
+| Option | Meaning |
+|---|---|
+| `--max-usd-day N|none` | Cap on estimated $ per UTC day |
+| `--max-usd-month N|none` | Cap on estimated $ per UTC month |
+| `--max-instance-hours-day N|none` | Cap on instance-hours per UTC day |
+| `--on-cap {fail,kill}` | When a cap trips, let running tasks finish (`fail`, the default) or fail them (`kill`) |
+| `--resume` | Also end a capped state now |
+
+## aegc cost
+
+```
+aegc cost DEPLOYMENT [--since SINCE] [--by {pool,type}] [--actual]
+```
+
+Estimated spend from the cost ledger. See [Cost ledger](../concepts/cost.md#cost-ledger).
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--since` | `today` | `today`, `month`, or a duration such as `24h`, `7d` or `90m` |
+| `--by` | `pool` | Break the total down by `pool` or by instance `type` |
+| `--actual` | off | Also ask Cost Explorer (costs $0.01; needs the `aegc:deployment` tag active) |
+
 ## aegc destroy
 
 ```
-aegc destroy DEPLOYMENT [--yes] [--force]
+aegc destroy DEPLOYMENT [--yes] [--force] [--verify] [--no-verify]
 ```
 
-Delete everything aegc created for a deployment. See
+Delete everything aegc created for a deployment, then check that nothing remains. See
 [Operations](../how-to/operations.md#destroy-a-deployment).
 
 | Option | Meaning |
 |---|---|
 | `--yes` | Actually delete (default: dry run) |
 | `--force` | Proceed even with tasks queued or running |
+| `--verify` | Without `--yes`: only check that nothing remains (exit 1 if something does) |
+| `--no-verify` | With `--yes`: skip the check after deleting |
+
+It exits 1 if anything is reported as `remaining`.
+
+## aegc footprint
+
+```
+aegc footprint DEPLOYMENT
+```
+
+List what exists for a deployment: resources tagged with it (Resource Groups Tagging API), and
+queues, groups, launch templates and parameters with its names, marked `owned` or `look-alike`.
+Changes nothing.
 
 ## aegc status
 
 ```
-aegc status DEPLOYMENT
+aegc status DEPLOYMENT [--json]
 ```
 
-Per pool: tasks queued, running and dead-lettered; workers in service, desired and maximum; the last
-scaling activity. Then each result queue and the results waiting in it.
+The deployment's state (and why, if it isn't running); estimated spend now, today and this month,
+and the limits; the lease and TTL. Per pool: tasks queued, running and dead-lettered; workers in
+service, desired and maximum (in vCPUs); workers by type, their $/h, the oldest waiting task and the
+worst-case cost of running tasks; the last scaling activity. Then the vCPU quotas, and each result
+queue with the results waiting in it. See [Operations](../how-to/operations.md#check-status).
+
+| Option | Meaning |
+|---|---|
+| `--json` | Machine-readable output |
 
 ## aegc reap
 
@@ -135,18 +256,19 @@ Delete the deployment's result queues that are empty and haven't been modified f
 ## aegc iam-policy
 
 ```
-aegc iam-policy {worker,operator,deployer,builder} [--deployment DEPLOYMENT] [--account ACCOUNT]
+aegc iam-policy {worker,operator,deployer,bootstrap,builder} [--deployment DEPLOYMENT] [--account ACCOUNT]
 ```
 
 Print an IAM policy document as JSON. See [IAM policies](iam.md).
 
 | Argument / option | Default | Meaning |
 |---|---|---|
-| `worker` | | For worker instances |
-| `operator` | | For the endpoint's credentials |
-| `deployer` | | For `aegc bootstrap`, `deploy`, `destroy` and `reap` |
-| `builder` | | For `aegc image build` |
-| `--deployment` | `default` | Deployment the policy is scoped to (worker, operator) |
+| `worker` | | On worker instances |
+| `operator` | | The endpoint's credentials |
+| `deployer` | | `aegc deploy`, `destroy`, `stop`, `resume`, `reap` and `footprint` |
+| `bootstrap` | | `aegc bootstrap` and `unbootstrap` |
+| `builder` | | `aegc image build` |
+| `--deployment` | `default` | Deployment name (worker, operator) |
 | `--account` | the caller's | AWS account id |
 
 With both `--region` and `--account` given, it makes no AWS calls.

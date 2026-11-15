@@ -48,6 +48,7 @@ defaults.
 | `scale_interval_s` | `10.0` | Seconds between scaler passes |
 | `result_wait_s` | `20` | Long-poll wait on the result queue |
 | `inline_limit_bytes` | `700000` | Task bodies larger than this go to S3 |
+| `stall_fail_s` | `3600.0` | Seconds a pool may want capacity with no instance in service before this process's queued tasks for it fail with `AEGC_NO_CAPACITY` |
 | `label` | `"AWSEngine"` | Engine label |
 
 ## user_endpoint_config
@@ -71,25 +72,27 @@ fails a task with any other:
 |---|---|---|---|
 | `env` | string | the engine's `env` | Run on the pool for this env |
 | `pool` | string | | Run on this exact pool (e.g. `geospatial-py314`); overrides `env` |
-| `walltime_s` | integer, 1 to 41,400 | 39,600 | Kill the task after this many seconds |
+| `walltime_s` | integer, 1 to the pool's `max_walltime` (at most 41,400) | the pool's `walltime`, else 39,600 | Kill the task after this many seconds |
 
 ## Pool selection
 
 For each task the engine:
 
-1. fails the task if the deployment couldn't be loaded, or `resource_specification` has unknown keys
-   or an invalid `walltime_s`;
-2. with `pool`, uses that pool if it exists and its Python matches the submitter;
-3. otherwise takes the pools whose env is `resource_specification["env"]`, else the engine's `env`
-   (all pools if both are empty);
-4. keeps those whose image's Python minor matches the submitter (if known), and picks the first by
-   name;
-5. fails the task with an `AEGC_CONFIGURATION` error if nothing is left.
+1. fails the task with the state's code (`AEGC_BUDGET_EXCEEDED`, `AEGC_STOPPED` or `AEGC_EXPIRED`)
+   if the deployment isn't running;
+2. fails the task if the deployment couldn't be loaded, or `resource_specification` has unknown
+   keys;
+3. with `pool`, uses that pool if it exists and its Python matches the submitter;
+4. otherwise takes the pools whose env is `resource_specification["env"]`, else the engine's `env`
+   (all pools if both are empty), keeps those whose image's Python minor matches the submitter (if
+   known), and picks the first by name;
+5. checks `walltime_s` against the chosen pool's `max_walltime`, or applies its default `walltime`;
+6. fails the task with an `AEGC_CONFIGURATION` error if any of this fails.
 
 ## Pool settings
 
 Pools are set with `aegc deploy --pool` (see the [CLI](cli.md#aegc-deploy)) and stored in the
-manifest. Settings that `--pool` doesn't expose are fixed in v0.1:
+manifest. Settings that `--pool` doesn't expose are fixed:
 
 | Setting | Value |
 |---|---|
@@ -97,7 +100,8 @@ manifest. Settings that `--pool` doesn't expose are fixed in v0.1:
 | Instance filters | AWS-designed CPUs, burstable types excluded |
 | Spot allocation | `price-capacity-optimized`, capacity rebalance on |
 | AMI | `/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id`, resolved at deploy |
-| Root volume | 50 GiB gp3, 3,000 IOPS, 500 MiB/s, encrypted |
+| Capacity | `DesiredCapacityType=vcpu`: minimum, maximum and desired capacity are vCPUs |
+| Root volume | gp3, encrypted, deleted with the instance; `disk=` GiB (default 30) at `throughput=` MiB/s (default 125), 3,000 IOPS (4 × the throughput above 750 MiB/s) |
 | Instance metadata | IMDSv2 required, hop limit 2, instance tags enabled |
 | Scale-in protection | New instances protected; `AZRebalance` suspended |
 | Subnets | The default VPC's default subnets |
@@ -113,4 +117,10 @@ The launch template passes this to `aegc-worker run` as base64 JSON in `AEGC_WOR
 | `idle_timeout_s` | The pool's `idle` (300) |
 | `visibility_s` | 300; the heartbeat runs every `visibility_s / 3` = 100 s |
 | `max_deliveries` | 4 |
-| `aegc_version` | `0.1.0` |
+| `aegc_version` | The aegc version that deployed it |
+| `state_parameter` | `/aegc/<d>/state`, read every 60 s |
+| `max_lifetime_s` | The pool's `lifetime` (86,400; 3,600 to 259,200) |
+| `root_volume_gib`, `throughput_mibps` | The pool's `disk` and `throughput`, for the cost ledger |
+
+At start the worker adds the instance type, Availability Zone and lifecycle (Spot or on-demand)
+from instance metadata, for its [cost ledger](../concepts/cost.md#cost-ledger) record.

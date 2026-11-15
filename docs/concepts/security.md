@@ -12,14 +12,16 @@
 
 ## Identities
 
-aegc uses three IAM identities. `aegc iam-policy` prints each policy; the documents are in the
+`aegc iam-policy` prints each of aegc's policies; the documents are in the
 [IAM reference](../reference/iam.md).
 
 | Identity | Who uses it | Scope |
 |---|---|---|
-| **worker** role, `aegc-<d>-worker-<region>` | Worker instances, through an instance profile | The deployment's task queues (receive, delete, extend), its result queues (send), `payloads/<d>/tasks/*` (read) and `payloads/<d>/results/*` (write), pulls from `aegc/*` ECR repositories, its log group, and terminating instances in groups tagged with the deployment |
-| **operator** | The endpoint container's AWS credentials | Reading the deployment's manifest, sending tasks, creating and reading its own result queues, payloads, and `SetDesiredCapacity` on groups tagged with the deployment |
-| **deployer** | Whoever runs `aegc bootstrap`, `deploy`, `destroy` | Creates conditioned on the `aegc:managed=true` request tag, changes and deletes on the resource tag where the service supports it; IAM limited to the `/aegc/` path; roles passed only to EC2 and ECR |
+| **worker** role, `aegc-<d>-worker-<region>` | Worker instances, through an instance profile | The deployment's task queues (receive, delete, extend), its result queues (send), `payloads/<d>/tasks/*` (read) and `payloads/<d>/results/*` (write), pulls from `aegc/*` ECR repositories, its log group, terminating instances in groups tagged with the deployment, reading the deployment state, and writing `ledger/<d>/*` |
+| **operator** | The endpoint container's AWS credentials | Reading the deployment's parameters, sending tasks, creating and reading its own result queues, payloads, `SetDesiredCapacity` and `UpdateAutoScalingGroup` on groups tagged with the deployment, receiving and deleting on its task queues, writing its state, reading its ledger, prices and Cost Explorer, and renewing its lease |
+| **deployer** | Whoever runs `aegc deploy`, `destroy`, `stop`, `resume` | Creates conditioned on the `aegc:managed=true` request tag, changes and deletes on the resource tag where the service supports it; IAM limited to the `/aegc/` path; roles passed only to EC2 and EventBridge Scheduler |
+| **bootstrap** | Whoever runs `aegc bootstrap`, `unbootstrap` | The payload bucket, the pull-through cache and its template and role, `/aegc/bootstrap`; roles passed only to ECR |
+| **scheduler** role, `aegc-<d>-scheduler-<region>` | EventBridge Scheduler, when the lease or TTL fires | Writing the deployment's state parameter and updating groups tagged with the deployment |
 
 The endpoint container mounts `~/.aws` read-only and uses `AWS_PROFILE` if it's set. For anything
 beyond a trial, give it a profile with only the operator policy rather than an administrator
@@ -34,7 +36,12 @@ whole deployment:
 - read other tasks' large payloads under `payloads/<d>/tasks/`,
 - receive or delete messages from the deployment's task queues,
 - send messages, including forged results, to the deployment's result queues,
-- terminate the deployment's worker instances.
+- terminate the deployment's worker instances,
+- overwrite cost ledger records under `ledger/<d>/`, which makes `aegc cost` wrong and can hide
+  spend from the [spend limits](cost.md#spend-limits) or trip them early.
+
+Spend limits guard against runaway scaling and forgotten deployments, not against the code you run.
+Keep an AWS Budget on the account as well.
 
 Tasks that share a worker also share its container, its `/scratch` volume and its host network;
 each task runs in its own process, not in its own sandbox.
@@ -43,6 +50,11 @@ each task runs in its own process, not in its own sandbox.
 that deployment's worker role. Use separate deployments, and separate endpoints, for groups that
 shouldn't see each other's work. Globus Compute's own controls decide who may submit to an
 endpoint; aegc's endpoint template doesn't add any.
+
+That code can also do what the worker role allows (#32): read and write the deployment's payloads,
+post results, write cost ledger records, and set its groups' desired capacity (up to each pool's
+`max_vcpus`). Spend limits are enforced from the ledger, so they protect against mistakes, not
+against code that's trying to get around them.
 
 The worker only ever invokes Globus Compute's `execute_task` on a message; it never imports a
 dotted path named in a message.
@@ -56,7 +68,7 @@ The worker role has no access to S3 beyond the deployment's payload prefix. As a
   for example `s3fs.S3FileSystem(anon=True)`, `botocore.UNSIGNED` as the signature version in boto3,
   or `AWS_NO_SIGN_REQUEST=YES` for GDAL.
 - **Requester-pays data, private buckets and output buckets aren't reachable.** There is no
-  setting in v0.1 to grant the worker role more access. aegc doesn't manage policies you add to the
+  setting yet to grant the worker role more access. aegc doesn't manage policies you add to the
   role yourself, and a managed policy attached by hand makes `aegc destroy` fail when it deletes
   the role (it removes only inline policies).
 - **Outputs come back as results**, within Globus Compute's size limit.
@@ -80,7 +92,9 @@ This is a limitation, not a recommendation. Data-access grants are listed as gap
 - Worker images are pinned by digest in the launch template; a tag is never resolved at boot.
 - ECR repositories `aegc/<env>` have immutable tags and scan on push.
 - Bases come from quay.io through the `aegc-quay` pull-through cache. aegc pins the base tag you
-  name, but doesn't verify the upstream image signatures itself.
+  name, but doesn't verify the upstream image signatures itself. Only aarchsci and aarchbio bases
+  are supported; bringing your own image is tracked in
+  [#67](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/67).
 - The build fails if installing `globus-compute-endpoint` changes any package already in the base
   image, except `click`.
 
@@ -92,5 +106,6 @@ its name has aegc's prefix for that deployment **and** its tags say aegc created
 deployment. A resource with an aegc-style name but without the tags is refused or left alone, and
 reported as `kept`. Region-wide resources carry `aegc:deployment=_bootstrap`.
 
-`destroy`, `unbootstrap` and `reap` are dry runs unless you pass `--yes`. `bootstrap` and `deploy`
-accept `--dry-run`. See [Resources and tags](../reference/resources.md).
+`destroy`, `unbootstrap` and `reap` are dry runs unless you pass `--yes`, and `stop --hard` needs
+`--yes`. `bootstrap` and `deploy` accept `--dry-run`. `destroy` checks afterwards that nothing it
+owns remains, and `aegc footprint` lists what exists, including look-alikes aegc won't touch. See [Resources and tags](../reference/resources.md).

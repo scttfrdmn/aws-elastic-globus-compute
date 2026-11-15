@@ -4,6 +4,11 @@ A worker image is an [aarch.science](https://aarch.science/) environment with
 `globus-compute-endpoint` and the aegc worker added in the same Python environment. Workers run it
 by digest.
 
+!!! note "Only aarchsci and aarchbio bases"
+    `aegc image build` builds only from aarchsci environments and aarchbio tool images, and
+    `aegc deploy` only uses images recorded by it. Bringing your own arm64 image isn't supported
+    yet; [#67](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/67) tracks it.
+
 ## Build one
 
 Run from the root of the aegc source tree (or pass `--project-dir`):
@@ -26,8 +31,8 @@ The steps:
    `/opt/aarchsci/smoke.py` if it has one, and run `aegc-worker selftest`, which pushes a real packed
    task through `execute_task`.
 5. Read the image's Python minor version.
-6. Create the ECR repository `aegc/<env>` if needed (immutable tags, scan on push, a lifecycle
-   policy that keeps the 10 most recent images), push, and record the image at
+6. Create the ECR repository `aegc/<env>` if needed (immutable tags, scan on push, and the
+   [lifecycle policy](#old-images-and-in-use-tags)), push, and record the image at
    `/aegc/images/<env>` in SSM Parameter Store.
 
 The tag has the form `py<M.m>-gce<v>-aegc<v>-b<base>-w<wheelhash>`, for example
@@ -53,14 +58,27 @@ keeps running the image it was deployed with, so after a build, redeploy:
 
 ```sh
 aegc image build --env geospatial --base-tag <newer tag>
-aegc deploy e2e --pool geospatial:max=3
+aegc deploy e2e --pool geospatial
 ```
 
-New workers run the new image; running workers keep the old one until they drain.
+The pool keeps its other options. New workers run the new image; running workers keep the old one
+until they drain. Running endpoints pick up the redeploy within a minute.
 
 If the new image has a different Python minor version, the pool name changes too (for example
-`geospatial-py315`), and the redeploy creates a new pool. The old pool drops out of the manifest
-but isn't deleted until `aegc destroy`. Restart the endpoint after a redeploy.
+`geospatial-py315`), and the redeploy creates a new pool. The old pool is kept, with a warning; pass
+`--prune` to remove it.
+
+## Old images and in-use tags
+
+The repository's lifecycle policy keeps the 10 most recent images, removes untagged images after a
+day, and never removes an image that a deployment uses. `aegc deploy` tags each image it pins
+`inuse-<d>-<first 12 hex digits of the digest>` (adding a tag to the existing image; tags stay
+immutable) and removes the deployment's older `inuse-` tags. A priority-1 lifecycle rule keeps every
+image with an `inuse-` tag, however old. `aegc destroy` removes the deployment's tags, and the image
+then ages out normally. The policy is re-applied to existing repositories on every build and deploy.
+
+Protected images still count toward the 10, so many deployments on old images leave fewer slots for
+new builds.
 
 ## Things to know
 
@@ -70,8 +88,12 @@ but isn't deleted until `aegc destroy`. Restart the endpoint after a redeploy.
   Every aarchsci env fits; the longest, `earth-observation`, gives `earth-observation-py314`.
 - **Python must match the clients.** The aarchsci images run Python 3.14. Clients on another
   version can't use them.
-- **Old images expire.** The repository keeps the 10 most recent images. A deployment that still
-  points at an older digest can't start new workers once it's gone; redeploy after building.
+- **Old images expire, unless a deployment uses them.** See
+  [Old images and in-use tags](#old-images-and-in-use-tags).
+- **Rebuild images from before aegc 0.2.** `aegc deploy` refuses them unless given
+  `--allow-old-image`: their workers ignore spend limits, `aegc stop` and the lease.
+- **Only aarchsci and aarchbio bases**, for now
+  ([#67](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/67)).
 - **Images are big.** Science images are often several GB, which shows in cold-start time and ECR
   storage. The pull-through cache keeps base pulls in-region.
 - **Native arm64 builds.** On Apple Silicon the build is native. Elsewhere buildx needs QEMU, and

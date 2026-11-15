@@ -29,12 +29,35 @@ receive of that message is a *delivery*.
 | A task is delivered more than 4 times | The 5th delivery posts a `WORKER_LOST_REPEATEDLY` system failure instead of running it. The endpoint retries once, as a new attempt. | Up to 4 runs per attempt |
 | A large payload has expired from S3 (after 15 days) | `PAYLOAD_MISSING` system failure; the endpoint retries once, uploading the payload again. | — |
 | No pool matches (env, Python, walltime, unknown keys) | The task fails at once with an `AEGC_CONFIGURATION` error. No retry. | No |
+| The deployment is capped, stopped or expired when the task arrives | The engine fails it at once with `AEGC_BUDGET_EXCEEDED`, `AEGC_STOPPED` or `AEGC_EXPIRED`. No retry. | No |
+| The deployment becomes capped, stopped or expired while the task is queued | The engine fails its own queued tasks with the state's code and deletes their messages; a worker that still receives one fails it the same way. No retry. | No |
+| The deployment becomes capped, stopped or expired while the task runs | The task finishes and its result is delivered. With the state's `kill` flag (`aegc stop --hard`, `--on-cap kill`) the worker fails it at once with the state's code instead. No retry. | No |
+| A pool gets no instance in service for `stall_fail_s` (1 h) while tasks wait | The engine fails its queued tasks for that pool with `AEGC_NO_CAPACITY`, naming the last scaling error and the quota command, and deletes their messages. Tasks already started aren't affected. No retry. | No, except for a message the purge misses (below) |
+| The spend limits admit no worker while tasks wait and none is running, for 10 minutes | The engine fails its queued tasks for that pool with `AEGC_BUDGET_EXCEEDED`, naming the limits, and deletes their messages. No retry. | No, except for a message the purge misses (below) |
+| A worker reaches its lifetime (24 h by default) | It stops claiming, finishes its running tasks, and leaves the group (at the group's minimum, the group replaces it). Not a failure. | No |
 | The endpoint process stops with tasks in flight | Workers keep going and post to the result queue, which keeps messages for 14 days. The next process with the same endpoint id picks them up and writes them to `unacked_results/`, and Globus Compute republishes them. | No |
 
 *Retries once* is the template's `max_retries_on_system_failure: 1`: the endpoint resubmits the task
 as a new attempt after a system failure, and reports the failure if the retry fails too. In the
 worst case (every delivery of both attempts lost), a function can start 8 times before the task
 fails.
+
+## Final failures
+
+`AEGC_BUDGET_EXCEEDED`, `AEGC_STOPPED`, `AEGC_EXPIRED` and `AEGC_NO_CAPACITY`, like
+`AEGC_CONFIGURATION` and `AEGC_WALLTIME_EXCEEDED`, are ordinary task failures, not system
+failures, so the endpoint doesn't retry them. Each message says why the task failed and what to
+do, and comes back through the task's future like any other task failure. See
+[Troubleshooting](../how-to/troubleshooting.md#tasks-fail-because-of-the-deployment-state).
+
+When an engine fails its queued tasks, it removes their messages from the task queue in one sweep
+of up to 20 receives of 10 messages. It deletes only messages that carry its own result queue and
+task ids. Everyone else's stay hidden until the sweep ends and are then made visible again
+together, so each is received at most once by the sweep (every receive counts toward the
+dead-letter queue's limit). A message the sweep misses stays queued: if the deployment isn't
+running, the next worker to receive it fails it; after `AEGC_NO_CAPACITY`, or a failure because
+the limits admitted no worker, it can still run once a worker starts, and the engine drops that
+late result.
 
 The task queue's dead-letter queue (after 6 receives) is a backstop for messages a worker can't
 decode at all. `aegc status` shows how many are there.

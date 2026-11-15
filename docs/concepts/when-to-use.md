@@ -20,15 +20,15 @@ nothing needs an inbound port or a cluster to look after.
 
 ## Limits and weak spots
 
-These are the honest limits of v0.1. Numbers come from the live run in
+These are the current limits. Numbers come from the live run in
 [Performance](../reference/performance.md); the full table is in [Limits](../reference/limits.md).
 
 - **Per-task overhead.** 100 tiny tasks took 13.2 s on 3 warm workers. Every task makes several
   SQS round trips and starts a fresh process. Batch work so each task runs for at least about 10 s.
 - **Cold start.** From zero workers, the first result took 39 s (46 s on a second cold run). Larger
-  images take longer to pull. Set `min=` on a pool to keep workers warm, at the cost of paying for
+  images take longer to pull. Set `min_vcpus=` on a pool to keep workers warm, at the cost of paying for
   them.
-- **The endpoint runs on your machine.** In v0.1 the endpoint is a container on your laptop. Tasks
+- **The endpoint runs on your machine.** The endpoint is a container on your laptop. Tasks
   reach AWS only while it's running. Results produced while it's down wait in SQS for up to 14 days
   and are delivered when it comes back. A cloud-hosted endpoint is tracked in
   [#22](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/22).
@@ -44,9 +44,16 @@ These are the honest limits of v0.1. Numbers come from the live run in
 - **Workers can reach only aegc's own resources.** The worker role allows aegc's queues, its
   payload prefix, its image repositories and its log group, and nothing else. Reading open data
   works only with **unsigned** requests: a request signed with the worker's credentials is denied,
-  because the role has no S3 read permission outside the payload prefix. There is no way in v0.1 to
+  because the role has no S3 read permission outside the payload prefix. There is no way yet to
   grant access to requester-pays data, private buckets, or an output bucket. This is a real
   limitation; see [Security model](security.md#data-access).
+- **Only aarchsci and aarchbio images.** Worker images are built over
+  [aarch.science](https://aarch.science/) environments or [aarch.bio](https://aarch.bio/) tools.
+  Bringing your own arm64 image isn't supported yet
+  ([#67](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/67)).
+- **Spend limits are estimates.** They count instance time, volumes and IPv4 addresses from the
+  workers' own ledger, are checked only while an endpoint runs, and can be overshot by a few
+  minutes of spend plus running tasks. See [Spend limits](cost.md#spend-limits).
 - **No GPUs, no MPI, arm64 only.** Pools are Graviton CPU instances. Software that only ships for
   x86-64 won't run.
 - **Spot vCPU quota.** A pool can't grow past the account's Spot quota for standard instances. When

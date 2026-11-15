@@ -11,8 +11,8 @@ flowchart LR
             w1["Worker instance<br/>ECS AL2023 arm64 AMI<br/>aegc/&lt;env&gt;@digest<br/>aegc-worker"]
         end
         rq[["Result queue<br/>aegc-&lt;d&gt;-res-&lt;uep&gt;"]]
-        ssm[("SSM<br/>manifest")]
-        s3[("S3<br/>payloads")]
+        ssm[("SSM<br/>manifest, state")]
+        s3[("S3<br/>payloads, ledger")]
         ecr[("ECR<br/>images")]
     end
     engine -- "1 · send task" --> tq
@@ -20,8 +20,9 @@ flowchart LR
     w1 -- "3 · started, result" --> rq
     rq -- "4 · long poll" --> engine
     engine -. "scale out" .-> asg
-    engine -. "read at start" .-> ssm
-    w1 <-. "> 700 KB" .-> s3
+    engine -. "read" .-> ssm
+    w1 -. "read state" .-> ssm
+    w1 <-. "> 700 KB, ledger" .-> s3
     ecr -. "pull" .-> w1
 ```
 
@@ -41,29 +42,38 @@ submitter's Python minor version and the requested `env` to the engine.
 - `_submit` picks the pool and sends the task to its SQS queue *before returning*, because the
   endpoint acknowledges the task to Globus as soon as `submit` returns.
 - A scaler thread runs every 10 s. For each pool it reads the queue depth and the Auto Scaling
-  group, and raises desired capacity to `ceil(demand / slots)`, capped at the pool's maximum. It
-  only scales out; several endpoint processes can share a pool, and workers scale in themselves.
+  group and raises desired capacity to the vCPUs the waiting and running tasks need, capped at the
+  pool's `max_vcpus` and at what the [spend limits](cost.md#spend-limits) admit. It only scales out;
+  several endpoint processes can share a pool, and workers scale in themselves. The same thread
+  checks spend, re-reads the deployment state and manifest, and renews the lease.
 - A result thread long-polls the process's own result queue and resolves the matching futures.
 
 The engine reads the deployment's manifest (`/aegc/<d>/manifest` in SSM Parameter Store) when it
-starts. It is built to survive the endpoint's process management: `start` is fast and never raises
-(a misconfiguration fails tasks with a clear message instead), `shutdown` never touches AWS, and the
-status report only reads cached data.
+starts, then re-reads it every 60 s and switches to it when its content hash (`generation`)
+changes, so a redeploy or a change of limits reaches running endpoints within a minute. It reads
+the [deployment state](#deployment-state) every 30 s. It is built to survive the endpoint's process
+management: `start` is fast and never raises (a misconfiguration fails tasks with a clear message
+instead), `shutdown` never touches AWS, and the status report only reads cached data.
 
 **Queues.** Each pool has a task queue (visibility timeout 300 s, long polling) and a dead-letter
 queue. Each user endpoint process creates its own result queue, which keeps messages for 14 days.
 
 **Workers.** Each pool is an Auto Scaling group of Spot Graviton instances, chosen by attributes
 (vCPU and memory ranges, AWS-designed CPUs, no burstable types) with the `price-capacity-optimized`
-strategy. Instances run the stock ECS-optimized Amazon Linux 2023 arm64 AMI, resolved at deploy
+strategy, and sized in vCPUs (see [Capacity in vCPUs](#capacity-in-vcpus)). Instances run the stock ECS-optimized Amazon Linux 2023 arm64 AMI, resolved at deploy
 time. Their user data ([src/aegc/infra/userdata.py](../../src/aegc/infra/userdata.py)) disables the
 ECS agent, starts Docker, pulls the worker image by digest from ECR, and runs `aegc-worker run`
-under systemd. A watchdog timer terminates the instance if the worker stays down.
+under systemd. A watchdog timer terminates the instance if the worker stays down, or once the
+instance outlives its lifetime plus the pool's longest walltime plus 15 minutes; at the group's
+minimum, it terminates it without lowering desired capacity, so the group launches a replacement.
 
 **The worker agent** ([src/aegc/worker/agent.py](../../src/aegc/worker/agent.py)) runs one task per
 slot (by default one slot per vCPU). Each task runs Globus Compute's own `execute_task` in a fresh
 child process, forked from a server that has already imported Globus Compute, so a task starts in
-about 30 ms. The worker enforces walltime by killing the child's process group.
+about 30 ms. The worker enforces walltime by killing the child's process group. It also reads the
+deployment state every 60 s, stops claiming after its lifetime (24 hours by default; at the group's
+minimum it then terminates for a replacement), and writes
+its [cost ledger](cost.md#cost-ledger) record at start, every 5 minutes and at exit.
 
 **Payloads.** Task and result bodies up to 700,000 bytes travel inline in the SQS message, base64
 encoded. Larger bodies go to the region's payload bucket under `payloads/<d>/` and the message
@@ -99,7 +109,8 @@ sequenceDiagram
 ```
 
 1. The SDK submits a task to Globus. The endpoint receives it and calls `AWSEngine.submit()`.
-2. The engine resolves the pool from `resource_specification`, the endpoint's `env`, and the
+2. If the deployment isn't `running`, the task fails at once with the state's code. Otherwise the
+   engine resolves the pool from `resource_specification`, the endpoint's `env`, and the
    submitter's Python version. If nothing matches, the task fails at once with an explanation.
 3. The engine writes the payload to S3 if it's large, sends the task message to the pool's queue,
    and wakes the scaler, which raises the group's desired capacity.
@@ -114,6 +125,94 @@ sequenceDiagram
    every pool returns to zero.
 
 See [Delivery and idempotency](delivery.md) for what happens when something fails along the way.
+
+## Deployment state
+
+Each deployment has a state in `/aegc/<d>/state`, a small JSON document with the mode, the reason,
+when and by whom it was set, and for a cap, when it ends.
+
+```mermaid
+stateDiagram-v2
+    [*] --> running: aegc deploy
+    running --> capped: a spend limit is reached (engine)
+    running --> stopped: aegc stop
+    running --> expired: lease or TTL fires (EventBridge Scheduler)
+    capped --> running: end of the UTC day or month, aegc limits --resume, aegc resume
+    capped --> stopped: aegc stop
+    stopped --> running: aegc resume
+    expired --> running: aegc resume
+```
+
+| State | Set by | Failure code | Ends |
+|---|---|---|---|
+| `running` | `aegc deploy` (once), `aegc resume` | | |
+| `capped` | an engine, when estimated spend reaches a limit | `AEGC_BUDGET_EXCEEDED` | at the end of the limit's UTC day or month, or with `aegc limits --resume` or `aegc resume` |
+| `stopped` | `aegc stop` | `AEGC_STOPPED` | `aegc resume` |
+| `expired` | the lease or TTL schedules | `AEGC_EXPIRED` | `aegc resume` |
+
+While the state isn't `running`:
+
+- engines fail new tasks at once with the state's code and a message saying why and what to do;
+- each engine fails its own queued tasks the same way, removes their messages from the task
+  queues (leaving other processes' messages alone), and stops scaling out;
+- workers stop claiming, fail any task they still receive, finish their running tasks, and leave
+  their groups. With the state's `kill` flag (`aegc stop --hard`, or `--on-cap kill`), they fail
+  running tasks at once instead.
+
+These failures are final: the endpoint doesn't retry them. Workers read the state before their
+first claim, so a worker that boots into a halted deployment never starts a task.
+
+A redeploy never changes the state, and while the deployment isn't `running` it keeps every
+group's minimum at 0, so it doesn't launch workers that couldn't take tasks; `aegc resume` restores
+the minimums. When a cap ends at the end of its period, the engine restores them itself. A missing
+state parameter (a v0.1 deployment) reads as `running`.
+
+## Lease and TTL
+
+A deployment that nobody uses shouldn't run forever. `aegc deploy` gives each deployment a lease,
+48 hours by default (`--lease DURATION`, at least 3 hours; `--lease none` turns it off). It's a set of one-shot
+EventBridge Scheduler schedules in a schedule group `aegc-<d>`:
+
+- `lease-state` sets the state to `expired`, through Scheduler's universal target for
+  `ssm:PutParameter`;
+- `lease-<pool>`, one per pool, sets the group's minimum to 0 through
+  `autoscaling:UpdateAutoScalingGroup`, so workers kept by `min_vcpus` can leave too.
+
+They run as the role `aegc-<d>-scheduler-<region>`, which may only write the deployment's state
+parameter and update groups tagged with the deployment. No Lambda function is involved.
+
+Every running engine pushes the lease schedules forward while the deployment is `running` or
+`capped`, every hour (or every third of the lease, if that's shorter), so a deployment with an
+endpoint up never expires, and one capped until the end of the month doesn't expire meanwhile. If
+every endpoint stops (or loses its credentials) for the length of the lease, the schedules fire.
+`aegc resume` sets the state back to `running` and pushes the lease forward.
+
+`--ttl DURATION` (for example `--ttl 7d`) adds the same schedules under `ttl-*`, at a fixed time
+from the deploy. Nothing renews them, so the deployment expires then, endpoint or not, and tasks
+are told the TTL was reached. `--ttl none` removes them. Both settings are kept across redeploys and
+shown by `aegc status`; a TTL that has already passed isn't scheduled again.
+
+## Capacity in vCPUs
+
+Pools are sized in vCPUs, not instances: each group uses `DesiredCapacityType=vcpu`, and
+`max_vcpus=` (default 8) and `min_vcpus=` (default 0) are its maximum and minimum. Spot's
+`price-capacity-optimized` strategy can choose any size within the pool's `vcpu=` range (default
+2–8), so a group capped at 8 vCPUs can run four 2-vCPU workers or one 8-vCPU worker, but either way
+about the same capacity and cost. The largest worker size can't exceed `max_vcpus`: `deploy`
+refuses a `vcpu=` range that does, and narrows the default range to fit a small `max_vcpus` (for
+example `max_vcpus=4` gives `vcpu=2-4`).
+
+The scaler asks for the vCPUs that the pool's demand needs (queued plus running tasks): with
+`slots=auto`, one vCPU per task; with `slots=N`, one worker of the pool's smallest size per N tasks.
+Under spend limits, the scaler asks in whole workers of the smallest size (a 1-vCPU demand becomes
+a 2-vCPU worker) and admits whole workers. Auto Scaling can launch an instance larger than the
+vCPUs it still needs, so a group can end up somewhat above its desired capacity; a narrow `vcpu=`
+range keeps that small.
+
+Deployments made by v0.1 counted workers. Their groups keep scaling in workers until they're
+redeployed. The redeploy converts each pool at its largest size, the same bound v0.1 had
+(`max_workers` × the top of its `vcpu=` range), while `max=`/`min=` given on the command line are
+converted with the smallest size, with a warning.
 
 ## Python matching
 
@@ -149,5 +248,7 @@ the container, matches the aarchsci images.
   while tasks were still running on AWS
   ([globus/globus-compute#2233](https://github.com/globus/globus-compute/issues/2233)). An idle
   process costs a few SQS long polls; AWS capacity drains itself regardless.
+- **EventBridge Scheduler for the lease.** Its universal targets call SSM and Auto Scaling directly,
+  so the lease needs no Lambda function or always-on process.
 - **SQS limits shape the protocol.** A claim can't be extended past 12 hours, so walltime is capped
   at 41,400 s. Messages max out at 1 MiB, so large payloads go to S3.

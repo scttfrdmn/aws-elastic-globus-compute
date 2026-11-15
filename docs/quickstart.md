@@ -6,7 +6,8 @@ build one worker image, deploy a pool, run a Globus Compute endpoint in Docker o
 submit tasks, and tear the deployment down.
 
 It creates AWS resources that cost money while workers run. Workers terminate themselves about
-5 minutes after the queue empties; `aegc destroy` removes the rest. See [Cost](concepts/cost.md).
+5 minutes after the queue empties, `aegc stop` stops spending at any time, and `aegc destroy`
+removes the rest. See [Cost](concepts/cost.md).
 
 ## Prerequisites
 
@@ -17,9 +18,9 @@ It creates AWS resources that cost money while workers run. Workers terminate th
   wheel with `uv build`.
 - **AWS credentials** for an account and region with a default VPC. aegc places workers in the
   default VPC's default subnets. The examples use `us-west-2`. The credentials need the
-  [deployer](reference/iam.md#deployer) and [builder](reference/iam.md#builder) policies; an
-  administrator profile also works. Check your Spot vCPU quota for standard instances
-  (`max` workers × vCPUs per worker must fit).
+  [bootstrap](reference/iam.md#bootstrap), [deployer](reference/iam.md#deployer) and
+  [builder](reference/iam.md#builder) policies; an administrator profile also works. Check your
+  Spot vCPU quota for standard instances: each pool's `max_vcpus` must fit.
 - **A Globus account**, for `aegc endpoint login`.
 - **A clone of this repository.** aegc isn't on PyPI, and the build commands build the wheel from
   the source tree (`--project-dir`, default `.`). Run the commands below from the repository root.
@@ -66,13 +67,21 @@ Use an immutable base tag, never `latest`. See [Worker images](how-to/images.md)
 ## 3. Deploy a pool
 
 ```sh
-aegc deploy e2e --pool geospatial:max=3
+aegc deploy e2e --pool geospatial:max_vcpus=6 --max-usd-day 5
 ```
 
 `e2e` is the deployment name. This creates the worker IAM role, a no-ingress security group, the
 log group, and for the pool `geospatial-py314` a task queue with a dead-letter queue, a launch
-template and a Spot Auto Scaling group with up to 3 workers. The group starts at zero instances.
-See [Configuration](how-to/configuration.md) for the other pool options.
+template and a Spot Auto Scaling group of up to 6 vCPUs (three 2-vCPU workers). The group starts at
+zero instances. See [Configuration](how-to/configuration.md) for the other pool options.
+
+`--max-usd-day 5` is optional, but recommended. The endpoint adds workers only while their
+expected cost for the next hour fits in what's left of $5 for the UTC day, and once the estimate
+reaches $5, new tasks fail with `AEGC_BUDGET_EXCEEDED` until the day ends. The estimate covers instances, their volumes
+and IPv4 addresses, not every AWS charge; see [Spend limits](concepts/cost.md#spend-limits).
+
+The deployment also gets a 48-hour lease, which the running endpoint renews every hour. If no
+endpoint renews it, the deployment stops itself.
 
 ## 4. Run the endpoint
 
@@ -129,21 +138,35 @@ with Executor(
 aegc status e2e
 ```
 
-This shows, per pool, the queued, running and dead-lettered tasks, the workers in service and
-desired, the last scaling activity, and any results waiting in result queues. Workers leave the
+This shows the deployment's state (`running`), its estimated spend against the limit, when the
+lease expires, and per pool the queued, running and dead-lettered tasks, the workers by instance
+type, the last scaling activity, and any results waiting in result queues. `aegc cost e2e` shows
+today's estimated spend from the workers' cost ledger. Workers leave the
 group about 5 minutes after they go idle; in the live run the pool was back to zero 5.5 minutes
 after the last task.
 
-## 7. Tear down
+## 7. Stop or tear down
+
+To stop spending but keep the deployment:
+
+```sh
+aegc stop e2e       # running tasks finish, queued ones fail with AEGC_STOPPED, workers leave
+aegc resume e2e     # when you want it back
+```
+
+`aegc stop e2e --hard --yes` also fails running tasks and terminates the workers after 2 minutes.
+See [Operations](how-to/operations.md#stop-and-resume).
+
+To remove the deployment:
 
 ```sh
 ep stop
 aegc destroy e2e          # dry run: lists what would be deleted
-aegc destroy e2e --yes    # deletes it
+aegc destroy e2e --yes    # deletes it, then checks that nothing is left
 ```
 
 `destroy` refuses while tasks are queued or running unless you add `--force`. It deletes only
-resources tagged as belonging to `e2e`.
+resources tagged as belonging to `e2e`, then re-lists them and exits 1 if anything remains.
 
 The region bootstrap and the `aegc/geospatial` image stay, so the next deployment is quick. To
 remove the bootstrap as well, destroy every deployment first, then run `aegc unbootstrap` (a dry run)
