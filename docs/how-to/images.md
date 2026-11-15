@@ -229,8 +229,8 @@ aegc image list --env numpy
 ```
 
 ```
-3.13	pip	aegc 0.3.0.dev0	123456789012.dkr.ecr.us-west-2.amazonaws.com/aegc/numpy@sha256:...
-3.14	pip	aegc 0.3.0.dev0	123456789012.dkr.ecr.us-west-2.amazonaws.com/aegc/numpy@sha256:...
+3.13	pip	aegc 0.3.0	123456789012.dkr.ecr.us-west-2.amazonaws.com/aegc/numpy@sha256:...
+3.14	pip	aegc 0.3.0	123456789012.dkr.ecr.us-west-2.amazonaws.com/aegc/numpy@sha256:...
 ```
 
 The columns are the Python minor, the kind (`conda`, `pip` or `registered`), the aegc version in
@@ -304,7 +304,7 @@ new builds. An env's images for every Python minor share one repository, and so 
 ## Things to know
 
 - **Tags.** A build is tagged `py<M.m>-gce<v>-aegc<v>-b<base>-w<wheelhash>`, for example
-  `py3.14-gce4.21.0-aegc0.3.0.dev0-b2026.11.13.154112-w1a2b3c4d`. `<base>` is the aarchsci or
+  `py3.14-gce4.21.0-aegc0.3.0-b2026.11.13.154112-w1a2b3c4d`. `<base>` is the aarchsci or
   aarchbio tag, or the first 12 hex digits of a `--base` image's id. The wheel hash is the
   first 8 hex digits of the SHA-256 of the aegc wheel, so a code change gets a new tag. If the tag
   already exists, the build reuses the pushed image instead of pushing again.
