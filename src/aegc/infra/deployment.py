@@ -287,7 +287,14 @@ def ensure_log_group(c: Clients, spec: DeploymentSpec, report: Report, *, dry_ru
 
 
 def _queue_tags(c: Clients, url: str) -> dict[str, str]:
-    return dict(c.sqs.list_queue_tags(QueueUrl=url).get("Tags", {}))
+    """A queue's tags; {} if it's gone. ListQueues keeps returning a deleted queue for up to a
+    minute, so a listed queue can already be gone."""
+    try:
+        return dict(c.sqs.list_queue_tags(QueueUrl=url).get("Tags", {}))
+    except Exception as e:
+        if is_not_found(e):
+            return {}
+        raise
 
 
 def ensure_queue(

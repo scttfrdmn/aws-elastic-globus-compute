@@ -119,13 +119,17 @@ def status(
 def _result_queues(sqs: Any, deployment: str) -> list[str]:
     prefix = f"{naming.PREFIX}-{deployment}-res-"
     urls = paginate(sqs, "list_queues", "QueueUrls", page_size=1000, QueueNamePrefix=prefix)
-    return [
-        u
-        for u in urls
-        if naming.is_owned(
-            u.rsplit("/", 1)[-1], dict(sqs.list_queue_tags(QueueUrl=u).get("Tags", {})), deployment
-        )
-    ]
+    out = []
+    for u in urls:
+        try:
+            tags = dict(sqs.list_queue_tags(QueueUrl=u).get("Tags", {}))
+        except Exception as e:  # listed but already deleted (ListQueues lags)
+            if is_not_found(e):
+                continue
+            raise
+        if naming.is_owned(u.rsplit("/", 1)[-1], tags, deployment):
+            out.append(u)
+    return out
 
 
 def reap(
