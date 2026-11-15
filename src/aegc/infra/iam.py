@@ -250,8 +250,63 @@ def operator_policy(*, deployment: str, region: str, account: str, bucket: str) 
     }
 
 
+#: Statements only `aegc bootstrap` / `unbootstrap` need (the region-wide resources).
+BOOTSTRAP_ONLY = {"Bucket", "Ecr", "EcrDeleteAegcRepos"}
+#: Statements both policies need.
+SHARED = {"IamUnderAegcPath", "PassAegcRoles", "Parameters", "Identity"}
+
+
 def deployer_policy(*, region: str, account: str) -> dict[str, Any]:
-    """What ``aegc bootstrap / deploy / destroy`` need. A least-privilege starting point.
+    """What ``aegc deploy / destroy / stop / resume / reap / footprint`` need.
+
+    The region-wide resources (``aegc bootstrap``) are in :func:`bootstrap_policy`. Managed IAM
+    policies are limited to 6,144 characters, so they're split.
+    """
+    doc = _admin_policy(region=region, account=account)
+    a, r = account, region
+    keep = [st for st in doc["Statement"] if st["Sid"] not in BOOTSTRAP_ONLY]
+    for st in keep:
+        if st["Sid"] == "PassAegcRoles":
+            st["Condition"]["StringEquals"]["iam:PassedToService"] = ["ec2.amazonaws.com"]
+        if st["Sid"] == "Ec2Read":
+            st["Action"] = [
+                *st["Action"],
+                "ec2:DescribeInstances",
+                "ec2:DescribeVolumes",
+                "ec2:DescribeNetworkInterfaces",
+            ]
+    keep += [
+        {
+            "Sid": "EcrRead",
+            "Effect": "Allow",
+            "Action": ["ecr:DescribeRepositories", "ecr:ListTagsForResource"],
+            "Resource": f"arn:aws:ecr:{r}:{a}:repository/{naming.PREFIX}/*",
+        },
+        {
+            # aegc footprint (report only).
+            "Sid": "TaggedResources",
+            "Effect": "Allow",
+            "Action": "tag:GetResources",
+            "Resource": "*",
+        },
+    ]
+    return {"Version": "2012-10-17", "Statement": keep}
+
+
+def bootstrap_policy(*, region: str, account: str) -> dict[str, Any]:
+    """What ``aegc bootstrap / unbootstrap`` need: the payload bucket, the ECR pull-through
+    cache and its creation template and role, and ``/aegc/bootstrap``."""
+    doc = _admin_policy(region=region, account=account)
+    keep = [st for st in doc["Statement"] if st["Sid"] in BOOTSTRAP_ONLY | SHARED]
+    for st in keep:
+        if st["Sid"] == "PassAegcRoles":
+            st["Condition"]["StringEquals"]["iam:PassedToService"] = ["ecr.amazonaws.com"]
+    return {"Version": "2012-10-17", "Statement": keep}
+
+
+def _admin_policy(*, region: str, account: str) -> dict[str, Any]:
+    """Every statement the deployer and bootstrap policies are cut from. A least-privilege
+    starting point.
 
     Creates are conditioned on the request carrying ``aegc:managed=true``, deletes and updates on
     the resource carrying it, wherever the service supports tag conditions. IAM is limited to the
@@ -530,6 +585,19 @@ def deployer_policy(*, region: str, account: str) -> dict[str, Any]:
                 ],
             },
             {
+                # deploy tags the images it pins inuse-<d>-..., so the lifecycle keeps them (#27).
+                "Sid": "EcrInUseTags",
+                "Effect": "Allow",
+                "Action": [
+                    "ecr:BatchGetImage",
+                    "ecr:PutImage",
+                    "ecr:BatchDeleteImage",
+                    "ecr:DescribeImages",
+                    "ecr:PutLifecyclePolicy",
+                ],
+                "Resource": f"arn:aws:ecr:{r}:{a}:repository/{p}/*",
+            },
+            {
                 "Sid": "Identity",
                 "Effect": "Allow",
                 "Action": "sts:GetCallerIdentity",
@@ -593,7 +661,7 @@ def builder_policy(*, region: str, account: str) -> dict[str, Any]:
     }  # fmt: skip
 
 
-POLICIES = {"worker", "operator", "deployer", "builder"}
+POLICIES = {"worker", "operator", "deployer", "bootstrap", "builder"}
 
 
 def policy(kind: str, *, deployment: str, region: str, account: str) -> dict[str, Any]:
@@ -606,4 +674,6 @@ def policy(kind: str, *, deployment: str, region: str, account: str) -> dict[str
         return deployer_policy(region=region, account=account)
     if kind == "builder":
         return builder_policy(region=region, account=account)
+    if kind == "bootstrap":
+        return bootstrap_policy(region=region, account=account)
     raise ValueError(f"unknown policy {kind!r}; choose from {sorted(POLICIES)}")

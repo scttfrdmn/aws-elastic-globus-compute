@@ -14,7 +14,7 @@ always-on instance.
 | Item | When | Example price (us-west-2, 2026-11-14) |
 |---|---|---|
 | Worker instances | From launch until the worker terminates itself, per second | Spot; see the table below |
-| Worker root volume (50 GiB gp3, 3,000 IOPS, 500 MiB/s) | While the instance exists | $0.08 per GB-month storage plus $0.04 per MiB/s-month above the included 125 MiB/s: about **$0.026 per worker-hour** |
+| Worker root volume (30 GiB gp3, 3,000 IOPS, 125 MiB/s by default) | While the instance exists | $0.08 per GB-month storage; 3,000 IOPS and 125 MiB/s are included, and each MiB/s above that is $0.04 per month: about **$0.0033 per worker-hour** (v0.1's 50 GiB at 500 MiB/s was $0.026) |
 | Public IPv4 address per worker | While the instance exists | $0.005 per hour |
 | SQS requests | Every send, receive, delete, visibility change and attribute read; each 64 KB of a message counts as one request | $0.40 per million |
 | S3 payloads (bodies over 700 KB) | Until deleted after use, or expired after 15 days | $0.023 per GB-month, plus request charges |
@@ -38,8 +38,11 @@ available capacity as well as price, so it doesn't always pick the cheapest type
 | m8g.large | 2 | 8 GiB | 0.0898 | 0.026–0.049 |
 | c8g.xlarge | 4 | 8 GiB | 0.1595 | 0.064–0.107 |
 
-On a `.large` Spot worker, the root volume's provisioned throughput (about $0.021 of the $0.026 per
-hour) is a large share of the total. It's there to make image pulls fast.
+The root volume defaults to 30 GiB at 125 MiB/s, the gp3 baseline, which adds no throughput
+charge. v0.1 provisioned 500 MiB/s to make image pulls fast; on a `.large` Spot worker that cost
+about $0.021 an hour, a large share of the total. A pool can still ask for more with
+`disk=GiB,throughput=MiBps` (125–1000; each MiB/s above 125 adds about $0.000055 per worker-hour).
+How much 125 MiB/s slows the first image pull will be measured in the live validation.
 
 ## A worked example
 
@@ -47,10 +50,10 @@ Three `c8g.large` Spot workers run a 20-minute burst. Each lives for about 26 mi
 to boot, 20 minutes of work, and the 5-minute idle period before it leaves the group.
 
 - Worker-hours: 3 × 0.43 h ≈ 1.3 h.
-- Per worker-hour: about $0.035 (Spot) + $0.026 (volume) + $0.005 (IPv4) ≈ $0.066.
-- Total: about **$0.09**, plus a few cents of SQS requests.
+- Per worker-hour: about $0.035 (Spot) + $0.0033 (volume) + $0.005 (IPv4) ≈ $0.043.
+- Total: about **$0.06**, plus a few cents of SQS requests.
 
-The same run on demand would be about 1.3 × ($0.080 + $0.031) ≈ $0.14.
+The same run on demand would be about 1.3 × ($0.080 + $0.008) ≈ $0.11.
 
 ## While nothing runs
 

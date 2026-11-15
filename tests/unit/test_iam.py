@@ -155,6 +155,22 @@ def test_deployer_policy(aws: Callable[[str], Any]) -> None:
         got = decide(c, arn, "iam:CreateServiceLinkedRole", slr, **{"iam:AWSServiceName": svc})
         assert (got == "allowed") is want, svc
 
+    # In-use image tags (#27): aegc's image repositories only, and never deleting a repository.
+    repo = f"arn:aws:ecr:{REGION}:{ACCOUNT}:repository/aegc/geospatial"
+    for action in (
+        "ecr:BatchGetImage", "ecr:PutImage", "ecr:BatchDeleteImage", "ecr:DescribeImages",
+        "ecr:PutLifecyclePolicy",
+    ):  # fmt: skip
+        assert decide(c, arn, action, repo) == "allowed", action
+    for action, res in [
+        ("ecr:PutImage", f"arn:aws:ecr:{REGION}:{ACCOUNT}:repository/other/x"),
+        ("ecr:BatchDeleteImage", f"arn:aws:ecr:{REGION}:{ACCOUNT}:repository/other/x"),
+        ("ecr:BatchDeleteImage", f"arn:aws:ecr:{REGION}:{ACCOUNT}:repository/aegc-quay/aarchsci/x"),
+        ("ecr:PutLifecyclePolicy", f"arn:aws:ecr:{REGION}:{ACCOUNT}:repository/other/x"),
+        ("ecr:SetRepositoryPolicy", repo),
+    ]:
+        assert decide(c, arn, action, res) != "allowed", (action, res)
+
 
 def test_builder_policy(aws: Callable[[str], Any]) -> None:
     c, arn = principal(aws, iam.builder_policy(region=REGION, account=ACCOUNT))
@@ -190,3 +206,22 @@ def test_policy_dispatch() -> None:
         assert len(json.dumps(big, separators=(",", ":"))) < 6_144, kind
     with pytest.raises(ValueError):
         iam.policy("admin", deployment="dev", region=REGION, account=ACCOUNT)
+
+
+def test_bootstrap_and_deployer_split(aws: Callable[[str], Any]) -> None:
+    # Managed policies are limited to 6,144 characters, so the region-wide bootstrap actions
+    # live in their own policy.
+    bucket = f"arn:aws:s3:::{BUCKET}"
+    c, boot = principal(aws, iam.bootstrap_policy(region=REGION, account=ACCOUNT))
+    assert decide(c, boot, "s3:CreateBucket", bucket) == "allowed"
+    assert decide(c, boot, "ecr:CreatePullThroughCacheRule", "*") == "allowed"
+    assert decide(c, boot, "autoscaling:CreateAutoScalingGroup", "*") != "allowed"
+    c.delete_role_policy(RoleName="aegc-test", PolicyName="p")
+    c.put_role_policy(
+        RoleName="aegc-test",
+        PolicyName="p",
+        PolicyDocument=json.dumps(iam.deployer_policy(region=REGION, account=ACCOUNT)),
+    )
+    assert decide(c, boot, "s3:CreateBucket", bucket) != "allowed"
+    assert decide(c, boot, "tag:GetResources", "*") == "allowed"  # aegc footprint
+    assert decide(c, boot, "ec2:DescribeNetworkInterfaces", "*") == "allowed"  # destroy --verify

@@ -163,3 +163,134 @@ def test_existing_image(aws: Callable[[str], Any]) -> None:
     ecr = aws("ecr")
     images.ensure_repository(ecr, "geospatial", Report())
     assert images.existing_image(ecr, "geospatial", "py3.14-x") is None
+
+
+# --- in-use protection (#27) -------------------------------------------------------------------
+
+
+def push_fake(ecr: Any, env: str, tag: str, n: int) -> str:
+    """Put a distinct (empty) image manifest into aegc/<env>; returns ``<uri>@sha256:...``."""
+    manifest = json.dumps(
+        {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "mediaType": "application/vnd.docker.container.image.v1+json",
+                "size": n,
+                "digest": "sha256:" + f"{n:064x}",
+            },
+            "layers": [],
+        }
+    )
+    name = naming.image_repository(env)
+    digest = ecr.put_image(repositoryName=name, imageManifest=manifest, imageTag=tag)["image"][
+        "imageId"
+    ]["imageDigest"]
+    uri = ecr.describe_repositories(repositoryNames=[name])["repositories"][0]["repositoryUri"]
+    return f"{uri}@{digest}"
+
+
+def tags_of(ecr: Any, ref: str) -> set[str]:
+    name = ref.split("/", 1)[1].split("@")[0]
+    d = ecr.describe_images(repositoryName=name, imageIds=[{"imageDigest": ref.split("@")[1]}])
+    return set(d["imageDetails"][0].get("imageTags", []))
+
+
+def test_lifecycle_keeps_inuse_images_first() -> None:
+    rules = sorted(images.LIFECYCLE["rules"], key=lambda r: r["rulePriority"])
+    assert [r["rulePriority"] for r in rules] == [1, 2, 3]
+    keep = rules[0]["selection"]
+    assert keep["tagStatus"] == "tagged" and keep["tagPrefixList"] == ["inuse-"]
+    assert keep["countType"] == "imageCountMoreThan" and keep["countNumber"] >= 10_000
+    # AWS requires a tagStatus=any rule to have the highest rulePriority (evaluated last).
+    assert rules[-1]["selection"]["tagStatus"] == "any"
+
+
+def test_ensure_repository_reapplies_the_lifecycle(aws: Callable[[str], Any]) -> None:
+    ecr = aws("ecr")
+    images.ensure_repository(ecr, "geospatial", Report())
+    old = {"rules": [images.LIFECYCLE["rules"][2] | {"rulePriority": 1}]}  # a v0.1 repository
+    ecr.put_lifecycle_policy(repositoryName="aegc/geospatial", lifecyclePolicyText=json.dumps(old))
+    images.ensure_repository(ecr, "geospatial", Report())
+    text = ecr.get_lifecycle_policy(repositoryName="aegc/geospatial")["lifecyclePolicyText"]
+    assert json.loads(text) == images.LIFECYCLE
+
+
+def test_inuse_tags_are_exact_per_deployment() -> None:
+    ref = "r/aegc/geospatial@sha256:" + "0123456789ab" + "f" * 52
+    assert images.inuse_tag("dev", ref) == "inuse-dev-0123456789ab"
+    assert images._is_inuse_tag("inuse-dev-0123456789ab", "dev")
+    assert not images._is_inuse_tag("inuse-dev-x-0123456789ab", "dev")  # deployment dev-x
+    assert not images._is_inuse_tag("inuse-dev-0123456789ab", "de")
+    with pytest.raises(ValueError):
+        images.inuse_tag("dev", "r/aegc/geospatial:latest")
+
+
+def test_protect_and_release(aws: Callable[[str], Any]) -> None:
+    ecr = aws("ecr")
+    images.ensure_repository(ecr, "geospatial", Report())
+    one = push_fake(ecr, "geospatial", "build-1", 1)
+    two = push_fake(ecr, "geospatial", "build-2", 2)
+
+    r = Report()
+    tag = images.protect(ecr, "geospatial", one, "dev", report=r)
+    assert tag == images.inuse_tag("dev", one)
+    assert tags_of(ecr, one) == {"build-1", tag}  # an immutable repository accepts a new tag
+    assert images.protect(ecr, "geospatial", one, "dev", report=r) == tag  # idempotent
+    assert [a.outcome for a in r.actions] == ["created", "exists"]
+    prod = images.protect(ecr, "geospatial", one, "prod")
+    newer = images.protect(ecr, "geospatial", two, "dev")
+
+    dry = images.release(ecr, "geospatial", "dev", {newer}, dry_run=True)
+    assert dry == [tag] and tag in tags_of(ecr, one)
+    assert images.release(ecr, "geospatial", "dev", {newer}) == [tag]
+    assert tags_of(ecr, one) == {"build-1", prod}  # the image stays, and so does prod's tag
+    assert tags_of(ecr, two) == {"build-2", newer}
+    assert images.release(ecr, "geospatial", "dev") == [newer]
+    assert images.inuse_tags(ecr, "dev") == {} and images.inuse_tags(ecr, "prod") == {
+        "aegc/geospatial": [prod]
+    }
+    assert images.release(ecr, "no-such-env", "dev") == []
+
+
+def test_release_never_deletes_an_image(aws: Callable[[str], Any]) -> None:
+    ecr = aws("ecr")
+    images.ensure_repository(ecr, "geospatial", Report())
+    ref = push_fake(ecr, "geospatial", "build-1", 1)
+    tag = images.protect(ecr, "geospatial", ref, "dev")
+    ecr.batch_delete_image(repositoryName="aegc/geospatial", imageIds=[{"imageTag": "build-1"}])
+    r = Report()
+    assert images.release(ecr, "geospatial", "dev", report=r) == []
+    assert tags_of(ecr, ref) == {tag}
+    assert [a.outcome for a in r.actions] == ["kept"]
+
+
+def test_protect_refuses_missing_and_foreign(aws: Callable[[str], Any]) -> None:
+    ecr = aws("ecr")
+    uri = images.ensure_repository(ecr, "geospatial", Report())
+    with pytest.raises(RuntimeError, match="gone"):
+        images.protect(ecr, "geospatial", f"{uri}@sha256:" + "a" * 64, "dev")
+    with pytest.raises(ValueError, match="isn't in"):
+        images.protect(ecr, "geospatial", "quay.io/x/y@sha256:" + "a" * 64, "dev")
+    ecr.create_repository(repositoryName="aegc/other")  # untagged: not aegc's
+    with pytest.raises(images.OwnershipError):
+        images.protect(ecr, "other", f"{uri[: -len('geospatial')]}other@sha256:" + "a" * 64, "dev")
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="substrate gap (not filed): no StartLifecyclePolicyPreview, so the rule order can't be "
+    "evaluated here. AWS documents that an image matching a higher-priority rule's tag selection "
+    "can't be expired by a lower-priority one.",
+)
+def test_lifecycle_preview_keeps_old_inuse_image(aws: Callable[[str], Any]) -> None:
+    ecr = aws("ecr")
+    images.ensure_repository(ecr, "geospatial", Report())
+    old = push_fake(ecr, "geospatial", "build-0", 100)
+    images.protect(ecr, "geospatial", old, "dev")
+    for n in range(1, 13):  # 12 newer builds: the old one is past "keep the 10 most recent"
+        push_fake(ecr, "geospatial", f"build-{n}", 100 + n)
+    ecr.start_lifecycle_policy_preview(repositoryName="aegc/geospatial")
+    preview = ecr.get_lifecycle_policy_preview(repositoryName="aegc/geospatial")
+    expired = {r["imageDigest"] for r in preview["previewResults"]}
+    assert old.split("@")[1] not in expired and len(expired) == 2

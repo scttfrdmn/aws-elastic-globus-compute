@@ -1,15 +1,17 @@
 import json
+import time
 from collections.abc import Callable
 from typing import Any
 
 import pytest
 
-from aegc import naming
+from aegc import images, naming
 from aegc.awsutil import paginate
 from aegc.infra import OwnershipError, Report, deployment
 from aegc.infra.deployment import Clients, DeploymentSpec, PoolSpec
 from tests.conftest import ACCOUNT, REGION
-from tests.substrate_gaps import launch_on_substrate
+from tests.substrate_gaps import launch_on_substrate, no_network_interfaces
+from tests.unit.test_images import push_fake, tags_of
 
 IMAGE = f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/aegc/geospatial@sha256:" + "b" * 64
 POOL = PoolSpec(name="sci-py314", env="geospatial", python_minor="3.14", image=IMAGE, max_workers=3)
@@ -20,7 +22,7 @@ ASG = "aegc-dev-sci-py314"
 def env(aws: Callable[[str], Any]) -> tuple[Clients, DeploymentSpec]:
     c = Clients(
         iam=aws("iam"),
-        ec2=aws("ec2"),
+        ec2=no_network_interfaces(aws("ec2")),  # substrate gap: no DescribeNetworkInterfaces
         autoscaling=aws("autoscaling"),
         sqs=aws("sqs"),
         logs=aws("logs"),
@@ -136,14 +138,15 @@ def test_deploy_creates_everything(env: tuple[Clients, DeploymentSpec]) -> None:
         ":aegc-dev-sci-py314-dlq"
     )
 
-    # Launch template: stock AMI via SSM, gp3 at 500 MB/s, and the content hash we compare.
+    # Launch template: stock AMI via SSM, 30 GiB gp3 at 125 MiB/s (#33), and the content hash.
     version = c.ec2.describe_launch_template_versions(
         LaunchTemplateName="aegc-dev-sci-py314", Versions=["$Default"]
     )["LaunchTemplateVersions"][0]
     data = version["LaunchTemplateData"]
     ami = c.ssm.get_parameter(Name=deployment.AMI_PARAMETER)["Parameter"]["Value"]
     assert data["ImageId"] == ami and ami.startswith("ami-")
-    assert data["BlockDeviceMappings"][0]["Ebs"]["Throughput"] == 500
+    ebs = data["BlockDeviceMappings"][0]["Ebs"]
+    assert (ebs["VolumeSize"], ebs["Throughput"], ebs["Iops"]) == (30, 125, 3000)
     assert version["VersionDescription"].startswith("aegc ")
 
     # Auto Scaling group: Spot, protected, rebalance suspended, tagged, in the default subnets.
@@ -312,6 +315,7 @@ def test_destroy_dry_run_then_delete_leaves_foreign_resources(
     assert done[("security group", "aegc-dev-workers")] == "deleted"
     assert done[("iam role", naming.worker_role("dev", REGION))] == "deleted"
     assert done[("ssm parameter", "/aegc/dev/manifest")] == "deleted"
+    assert "remaining" not in done.values() and "remaining" not in dry.values()
     assert group(c) is None
     assert instance_states(c, workers) <= {"shutting-down", "terminated"}
     left = sorted(c.sqs.list_queues(QueueNamePrefix="aegc-dev").get("QueueUrls", []))
@@ -378,3 +382,141 @@ def test_destroy_finds_groups_past_the_first_page(env: tuple[Clients, Deployment
     assert group(c) is None
     left = list(paginate(c.autoscaling, "describe_auto_scaling_groups", "AutoScalingGroups"))
     assert len(left) == 55  # the unrelated groups are untouched
+
+
+# --- root volume (#33) -------------------------------------------------------------------------
+
+
+def test_root_volume_size_and_throughput() -> None:
+    def ebs(pool: PoolSpec) -> dict[str, Any]:
+        data = deployment.launch_template_data(
+            DeploymentSpec(
+                deployment="dev", account=ACCOUNT, region=REGION, bucket="b", pools=(pool,)
+            ),
+            pool,
+            ami="ami-1",
+            sg="sg-1",
+            profile_arn="arn:aws:iam::1:instance-profile/aegc/x",
+            task_queue_url="https://sqs/q",
+        )
+        return dict(data["BlockDeviceMappings"][0]["Ebs"])
+
+    assert (ebs(POOL)["VolumeSize"], ebs(POOL)["Throughput"], ebs(POOL)["Iops"]) == (30, 125, 3000)
+    fast = PoolSpec(**{**POOL.__dict__, "root_volume_gib": 100, "throughput_mibps": 500})
+    assert (ebs(fast)["VolumeSize"], ebs(fast)["Throughput"], ebs(fast)["Iops"]) == (100, 500, 3000)
+    # gp3 allows 0.25 MiB/s per IOPS: past 750 MiB/s the IOPS rise with it.
+    top = PoolSpec(**{**POOL.__dict__, "throughput_mibps": 1000})
+    assert (ebs(top)["Throughput"], ebs(top)["Iops"]) == (1000, 4000)
+    for bad in ({"throughput_mibps": 124}, {"throughput_mibps": 1001}, {"root_volume_gib": 20}):
+        with pytest.raises(ValueError, match=r"disk=|throughput="):
+            PoolSpec(**{**POOL.__dict__, **bad})
+
+
+# --- ECR in-use tags (#27) ---------------------------------------------------------------------
+
+
+def test_deploy_protects_pinned_images_and_destroy_releases_them(
+    env: tuple[Clients, DeploymentSpec], aws: Callable[[str], Any]
+) -> None:
+    c, spec = env
+    c.ecr = aws("ecr")
+    images.ensure_repository(c.ecr, "geospatial", Report())
+    one = push_fake(c.ecr, "geospatial", "build-1", 1)
+    two = push_fake(c.ecr, "geospatial", "build-2", 2)
+    first = PoolSpec(**{**POOL.__dict__, "image": one})
+    spec = DeploymentSpec(**{**spec.__dict__, "pools": (first,)})
+
+    assert deployment.deploy(c, spec, dry_run=True) and tags_of(c.ecr, one) == {"build-1"}
+    r = outcomes(deployment.deploy(c, spec))
+    tag1 = images.inuse_tag("dev", one)
+    assert r[("ecr image tag", f"aegc/geospatial:{tag1}")] == "created"
+    assert tags_of(c.ecr, one) == {"build-1", tag1}
+    prod = images.protect(c.ecr, "geospatial", one, "prod")  # another deployment pins it too
+
+    # Redeploy on a newer image: it's protected, and dev's old tag goes (prod's stays).
+    second = PoolSpec(**{**POOL.__dict__, "image": two})
+    r = outcomes(deployment.deploy(c, DeploymentSpec(**{**spec.__dict__, "pools": (second,)})))
+    tag2 = images.inuse_tag("dev", two)
+    assert r[("ecr image tag", f"aegc/geospatial:{tag1}")] == "deleted"
+    assert tags_of(c.ecr, one) == {"build-1", prod}
+    assert tags_of(c.ecr, two) == {"build-2", tag2}
+
+    dry = outcomes(deployment.destroy(c, deployment="dev", region=REGION))
+    assert dry[("ecr image tag", f"aegc/geospatial:{tag2}")] == "would-delete"
+    assert tag2 in tags_of(c.ecr, two)
+    done = deployment.destroy(
+        c, deployment="dev", region=REGION, dry_run=False, wait_s=5, poll_s=0.1
+    )
+    assert outcomes(done)[("ecr image tag", f"aegc/geospatial:{tag2}")] == "deleted"
+    assert deployment.remaining(done) == []
+    assert tags_of(c.ecr, two) == {"build-2"} and tags_of(c.ecr, one) == {"build-1", prod}
+
+
+# --- destroy verification (#43) ----------------------------------------------------------------
+
+
+def test_destroy_reports_what_remains(env: tuple[Clients, DeploymentSpec]) -> None:
+    c, spec = env
+    deployment.deploy(c, spec)
+    owned_tags = [{"ResourceType": "volume", "Tags": naming.tag_list(naming.tags("dev", "x"))}]
+    # A leftover destroy doesn't delete: an owned volume outside any group.
+    vol = c.ec2.create_volume(
+        AvailabilityZone=f"{REGION}a", Size=1, VolumeType="gp3", TagSpecifications=owned_tags
+    )["VolumeId"]
+    foreign = c.ec2.create_volume(AvailabilityZone=f"{REGION}a", Size=1)["VolumeId"]  # untagged
+    # An extra owned parameter under /aegc/dev/ (e.g. a later version's): destroy deletes it too.
+    c.ssm.put_parameter(
+        Name="/aegc/dev/extra", Value="1", Type="String",
+        Tags=naming.tag_list(naming.tags("dev", "x")),
+    )  # fmt: skip
+    c.ssm.put_parameter(Name="/aegc/dev/stray", Value="1", Type="String")  # untagged: kept
+
+    dry = deployment.destroy(c, deployment="dev", region=REGION)
+    assert deployment.remaining(dry) == []  # a dry run doesn't verify (or change anything)
+    assert outcomes(dry)[("ssm parameter", "/aegc/dev/extra")] == "would-delete"
+    assert c.ssm.get_parameter(Name="/aegc/dev/extra")["Parameter"]["Value"] == "1"
+
+    # wait_s is generous, but an available volume won't go by itself, so it doesn't wait.
+    t0 = time.monotonic()
+    done = deployment.destroy(
+        c, deployment="dev", region=REGION, dry_run=False, wait_s=30, poll_s=0.1
+    )
+    assert time.monotonic() - t0 < 10
+    r = outcomes(done)
+    assert r[("ssm parameter", "/aegc/dev/extra")] == "deleted"
+    assert r[("ssm parameter", "/aegc/dev/stray")] == "kept"
+    assert r[("ebs volume", vol)] == "remaining"
+    assert ("ebs volume", foreign) not in r  # not ours, so not our leftover either
+    assert [a.name for a in done.actions if a.outcome == "remaining"] == [vol]
+
+    # verify_destroyed on its own re-checks later, and changes nothing.
+    again = deployment.verify_destroyed(c, deployment="dev", region=REGION, wait_s=0)
+    assert [a.name for a in again.actions] == [vol]
+    c.ec2.delete_volume(VolumeId=vol)
+    assert deployment.verify_destroyed(c, deployment="dev", region=REGION, wait_s=0).actions == []
+    assert c.ec2.describe_volumes(VolumeIds=[foreign])["Volumes"]
+
+
+def test_verify_lists_every_kind_before_destroy(env: tuple[Clients, DeploymentSpec]) -> None:
+    c, spec = env
+    deployment.deploy(c, spec)
+    launch_on_substrate(c.autoscaling, ASG)  # substrate#1497
+    c.autoscaling.set_desired_capacity(AutoScalingGroupName=ASG, DesiredCapacity=1)
+    kinds = {a.resource for a in deployment.verify_destroyed(
+        c, deployment="dev", region=REGION, wait_s=0
+    ).actions}  # fmt: skip
+    assert kinds == {
+        "ec2 instance", "ebs volume", "auto scaling group", "launch template", "security group",
+        "sqs queue", "log group", "ssm parameter", "iam role", "iam instance profile",
+    }  # fmt: skip
+
+
+@pytest.mark.xfail(
+    strict=True, reason="substrate gap (not filed): no DescribeNetworkInterfaces (InvalidAction)"
+)
+def test_verify_sees_worker_network_interfaces(aws: Callable[[str], Any]) -> None:
+    ec2 = aws("ec2")
+    eni = ec2.describe_network_interfaces(
+        Filters=[{"Name": "tag:aegc:deployment", "Values": ["dev"]}]
+    )
+    assert eni["NetworkInterfaces"] == []

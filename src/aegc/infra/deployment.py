@@ -21,7 +21,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from aegc import __version__, naming
+from aegc import __version__, images, naming
 from aegc.awsutil import error_code, is_not_found, paginate
 from aegc.infra import Outcome, OwnershipError, Report, iam, userdata
 
@@ -31,6 +31,11 @@ TASK_VISIBILITY_S = 300
 RETENTION_S = 14 * 24 * 3600
 MAX_RECEIVE_COUNT = 6  # the worker gives up at 4 deliveries; the DLQ is a backstop
 LOG_RETENTION_DAYS = 14
+#: gp3 limits aegc accepts. The ECS-optimized AL2023 AMI's snapshot is 30 GiB, so the root can't
+#: be smaller. gp3 allows 0.25 MiB/s per provisioned IOPS, so above 750 MiB/s IOPS go up too.
+ROOT_GIB_RANGE = (30, 16384)
+THROUGHPUT_RANGE = (125, 1000)
+BASE_IOPS = 3000
 
 
 @dataclass(frozen=True)
@@ -47,13 +52,20 @@ class PoolSpec:
     spot: bool = True
     slots: str = "auto"
     allowed_instance_types: tuple[str, ...] = DEFAULT_INSTANCE_TYPES
-    root_volume_gib: int = 50
+    root_volume_gib: int = 30
     idle_timeout_s: int = 300
+    throughput_mibps: int = 125  # gp3 root volume; 125 MiB/s is included in the GiB price
 
     def __post_init__(self) -> None:
         naming.validate_name("pool", self.name)
         if not 0 <= self.min_workers <= self.max_workers:
             raise ValueError("need 0 <= min_workers <= max_workers")
+        lo, hi = ROOT_GIB_RANGE
+        if not lo <= self.root_volume_gib <= hi:
+            raise ValueError(f"root volume (disk=) must be {lo}-{hi} GiB")
+        lo, hi = THROUGHPUT_RANGE
+        if not lo <= self.throughput_mibps <= hi:
+            raise ValueError(f"gp3 throughput (throughput=) must be {lo}-{hi} MiB/s")
 
 
 @dataclass(frozen=True)
@@ -81,6 +93,7 @@ class Clients:
     sqs: Any
     logs: Any
     ssm: Any
+    ecr: Any = None  # optional: without it, deploy and destroy leave ECR in-use tags alone
 
 
 def _retry(fn: Callable[[], Any], *, codes: set[str], attempts: int, delay_s: float) -> Any:
@@ -386,8 +399,8 @@ def launch_template_data(
                 "Ebs": {
                     "VolumeSize": pool.root_volume_gib,
                     "VolumeType": "gp3",
-                    "Throughput": 500,
-                    "Iops": 3000,
+                    "Throughput": pool.throughput_mibps,
+                    "Iops": max(BASE_IOPS, 4 * pool.throughput_mibps),
                     "Encrypted": True,
                     "DeleteOnTermination": True,
                 },
@@ -651,6 +664,7 @@ def read_manifest(ssm: Any, deployment: str) -> dict[str, Any]:
 def deploy(c: Clients, spec: DeploymentSpec, *, dry_run: bool = False) -> Report:
     """Create or reconcile a deployment and its pools. Safe to run repeatedly."""
     report = Report()
+    inuse = _protect_images(c, spec, report, dry_run=dry_run)
     profile_arn = ensure_worker_role(c, spec, report, dry_run=dry_run)
     vpc, subnets = resolve_network(c.ec2, spec)
     if not subnets:
@@ -692,6 +706,9 @@ def deploy(c: Clients, spec: DeploymentSpec, *, dry_run: bool = False) -> Report
         dry_run=dry_run,
     )
     ensure_state(c, spec, report, dry_run=dry_run)
+    if inuse is not None:
+        for env, keep in inuse.items():
+            images.release(c.ecr, env, spec.deployment, keep, report=report)
     return report
 
 
@@ -719,6 +736,28 @@ def ensure_state(c: Clients, spec: DeploymentSpec, report: Report, *, dry_run: b
     report.add("ssm parameter", name, "created")
 
 
+def _protect_images(
+    c: Clients, spec: DeploymentSpec, report: Report, *, dry_run: bool
+) -> dict[str, set[str]] | None:
+    """Tag each pool's pinned image ``inuse-<d>-...`` (#27). Returns ``{env: tags to keep}``.
+
+    Includes envs the previous manifest used, so a redeploy that drops one releases its tags.
+    """
+    if c.ecr is None or dry_run:
+        return None
+    d = spec.deployment
+    keep: dict[str, set[str]] = {}
+    try:
+        keep = {str(p["env"]): set() for p in read_manifest(c.ssm, d).get("pools", {}).values()}
+    except Exception as e:
+        if not is_not_found(e):
+            raise
+    for pool in spec.pools:
+        tag = images.protect(c.ecr, pool.env, pool.image, d, report=report)
+        keep.setdefault(pool.env, set()).add(tag)
+    return keep
+
+
 # --- destroy -----------------------------------------------------------------------------------
 
 
@@ -731,17 +770,28 @@ def destroy(
     force: bool = False,
     wait_s: float = 600,
     poll_s: float = 10,
+    verify: bool = True,
 ) -> Report:
     """Delete everything aegc created for ``deployment``. Dry run unless ``dry_run=False``.
 
     Refuses while tasks are queued or in flight unless ``force``. Order: Auto Scaling groups
     (forced, and waited for), launch templates, security group, queues, instance profile and role,
-    log group, manifest. Payload objects expire through the bucket's lifecycle rule.
+    log group, the deployment's ECR in-use tags, and its parameters (``/aegc/<d>/...``). Payload
+    objects expire through the bucket's lifecycle rule.
+
+    After deleting, ``verify`` re-lists everything (see :func:`verify_destroyed`) and reports
+    what's left as ``remaining``.
     """
     d = naming.validate_name("deployment", deployment)
     report = Report()
     verb: Outcome = "would-delete" if dry_run else "deleted"
     prefix = f"{naming.PREFIX}-{d}-"
+    try:
+        envs = sorted({str(p["env"]) for p in read_manifest(c.ssm, d).get("pools", {}).values()})
+    except Exception as e:
+        if not is_not_found(e):
+            raise
+        envs = []
 
     # Queues first, to check for in-flight work before deleting anything.
     queues = [
@@ -838,22 +888,156 @@ def destroy(
             c.logs.delete_log_group(logGroupName=log_name)
         report.add("log group", log_name, verb)
 
-    param = naming.deployment_manifest_parameter(d)
-    try:
-        tags = naming.tag_dict(
-            c.ssm.list_tags_for_resource(ResourceType="Parameter", ResourceId=param)["TagList"]
+    if c.ecr is not None:
+        for env in envs:
+            images.release(c.ecr, env, d, report=report, dry_run=dry_run)
+
+    for name, tags in _owned_parameters(c, d):
+        if not naming.is_owned(f"{naming.PREFIX}-{d}", tags, d):
+            report.add("ssm parameter", name, "kept", "not tagged as aegc's")
+            continue
+        if not dry_run:
+            c.ssm.delete_parameter(Name=name)
+        report.add("ssm parameter", name, verb)
+
+    if verify and not dry_run:
+        report.actions.extend(
+            verify_destroyed(c, deployment=d, region=region, wait_s=wait_s, poll_s=poll_s).actions
         )
-        if naming.is_owned(f"{naming.PREFIX}-{d}", tags, d):
-            if not dry_run:
-                c.ssm.delete_parameter(Name=param)
-            report.add("ssm parameter", param, verb)
-        else:
-            report.add("ssm parameter", param, "kept", "not tagged as aegc's")
-    except Exception as e:
-        # SSM reports a missing parameter to ListTagsForResource as InvalidResourceId.
-        if not (is_not_found(e) or error_code(e) == "InvalidResourceId"):
-            raise
     return report
+
+
+def _owned_parameters(c: Clients, d: str) -> list[tuple[str, dict[str, str]]]:
+    """Every parameter under ``/aegc/<d>/`` with its tags (ownership is the caller's check)."""
+    out = []
+    for p in list(
+        paginate(
+            c.ssm, "get_parameters_by_path", "Parameters", Path=f"/{naming.PREFIX}/{d}",
+            Recursive=True,
+        )
+    ):  # fmt: skip
+        name = str(p["Name"])
+        try:
+            tags = naming.tag_dict(
+                c.ssm.list_tags_for_resource(ResourceType="Parameter", ResourceId=name)["TagList"]
+            )
+        except Exception as e:
+            # SSM reports a missing parameter to ListTagsForResource as InvalidResourceId.
+            if is_not_found(e) or error_code(e) == "InvalidResourceId":
+                continue
+            raise
+        out.append((name, tags))
+    return out
+
+
+#: Instance and volume states that mean "still there" (terminated and deleted are gone).
+_LIVE_INSTANCE = ["pending", "running", "shutting-down", "stopping", "stopped"]
+_LIVE_VOLUME = ["creating", "available", "in-use", "deleting", "error"]
+#: States that resolve on their own after a group is deleted, so are worth waiting out. A running
+#: instance or an available volume outside any group stays: waiting for it would only delay.
+_SETTLING = {"pending", "shutting-down", "stopping", "creating", "in-use", "deleting"}
+
+
+def _leftover_ec2(c: Clients, d: str) -> list[tuple[str, str, str]]:
+    owned = _owned_ec2_filters(d)
+    left = [
+        ("ec2 instance", i["InstanceId"], i["State"]["Name"])
+        for r in paginate(
+            c.ec2, "describe_instances", "Reservations",
+            Filters=[*owned, {"Name": "instance-state-name", "Values": _LIVE_INSTANCE}],
+        )
+        for i in r.get("Instances", [])
+    ]  # fmt: skip
+    left += [
+        ("ebs volume", v["VolumeId"], v["State"])
+        for v in paginate(
+            c.ec2, "describe_volumes", "Volumes",
+            Filters=[*owned, {"Name": "status", "Values": _LIVE_VOLUME}],
+        )
+    ]  # fmt: skip
+    left += [
+        ("network interface", n["NetworkInterfaceId"], n.get("Status", ""))
+        for n in paginate(c.ec2, "describe_network_interfaces", "NetworkInterfaces", Filters=owned)
+    ]
+    return left
+
+
+def verify_destroyed(
+    c: Clients, *, deployment: str, region: str, wait_s: float = 600, poll_s: float = 10
+) -> Report:
+    """Re-list everything ``destroy`` is responsible for; each thing still there is ``remaining``.
+
+    Changes nothing. Instances, volumes and network interfaces tagged with the deployment take a
+    while to go after their group is deleted, so this waits up to ``wait_s`` while any of them is
+    still terminating, detaching or deleting. Then it
+    checks the Auto Scaling groups, launch templates, security group, queues, log group,
+    ``/aegc/<d>/...`` parameters, worker role and instance profile, and (given an ECR client) the
+    deployment's in-use image tags. An empty report means the deployment is gone.
+    """
+    d = naming.validate_name("deployment", deployment)
+    prefix = f"{naming.PREFIX}-{d}-"
+    report = Report()
+    deadline = time.monotonic() + wait_s
+    while (left := _leftover_ec2(c, d)) and time.monotonic() < deadline:
+        if not any(k == "network interface" or st in _SETTLING for k, _, st in left):
+            break
+        time.sleep(poll_s)
+    for kind, rid, state in left:
+        report.add(kind, rid, "remaining", state)
+
+    for g in paginate(c.autoscaling, "describe_auto_scaling_groups", "AutoScalingGroups"):
+        name = g["AutoScalingGroupName"]
+        if name.startswith(prefix) and naming.is_owned(name, naming.tag_dict(g.get("Tags")), d):
+            report.add("auto scaling group", name, "remaining")
+    for lt in paginate(
+        c.ec2, "describe_launch_templates", "LaunchTemplates", Filters=_owned_ec2_filters(d)
+    ):
+        if lt["LaunchTemplateName"].startswith(prefix):
+            report.add("launch template", lt["LaunchTemplateName"], "remaining")
+    for g in paginate(
+        c.ec2, "describe_security_groups", "SecurityGroups",
+        Filters=[{"Name": "group-name", "Values": [naming.security_group(d)]},
+                 *_owned_ec2_filters(d)],
+    ):  # fmt: skip
+        report.add("security group", naming.security_group(d), "remaining", g["GroupId"])
+    for u in paginate(c.sqs, "list_queues", "QueueUrls", page_size=1000, QueueNamePrefix=prefix):
+        if naming.is_owned(u.rsplit("/", 1)[-1], _queue_tags(c, u), d):
+            report.add("sqs queue", u.rsplit("/", 1)[-1], "remaining")
+    log_name = naming.log_group(d)
+    for g in paginate(c.logs, "describe_log_groups", "logGroups", logGroupNamePrefix=log_name):
+        if g["logGroupName"] == log_name:
+            tags = c.logs.list_tags_for_resource(resourceArn=g["arn"].removesuffix(":*"))["tags"]
+            if naming.is_owned(f"{naming.PREFIX}-{d}", tags, d):
+                report.add("log group", log_name, "remaining")
+    for name, tags in _owned_parameters(c, d):
+        if naming.is_owned(f"{naming.PREFIX}-{d}", tags, d):
+            report.add("ssm parameter", name, "remaining")
+
+    role = naming.worker_role(d, region)
+    checks: list[tuple[str, Callable[[], Any]]] = [
+        (
+            "iam instance profile",
+            lambda: c.iam.list_instance_profile_tags(InstanceProfileName=role),
+        ),
+        ("iam role", lambda: c.iam.list_role_tags(RoleName=role)),
+    ]
+    for kind, list_tags in checks:
+        try:
+            if naming.is_owned(role, naming.tag_dict(list_tags()["Tags"]), d):
+                report.add(kind, role, "remaining")
+        except Exception as e:
+            if not is_not_found(e):
+                raise
+    if c.ecr is not None:
+        for repo, tags in images.inuse_tags(c.ecr, d).items():
+            for t in tags:
+                report.add("ecr image tag", f"{repo}:{t}", "remaining")
+    return report
+
+
+def remaining(report: Report) -> list[str]:
+    """The ``remaining`` entries of a destroy or verify report, as printable lines."""
+    return [str(a) for a in report.actions if a.outcome == "remaining"]
 
 
 def _wait_gone(c: Clients, name: str, *, wait_s: float, poll_s: float) -> None:

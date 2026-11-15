@@ -6,6 +6,29 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **ECR in-use tags:** `deploy` tags each image it pins `inuse-<deployment>-<digest12>` (adding a
+  tag with `PutImage` and the existing manifest; the repository stays immutable), and removes that
+  deployment's older `inuse-` tags. `destroy` removes all of them. A new priority-1 lifecycle rule
+  keeps every image with an `inuse-` tag, so an older digest a deployment still uses is never
+  expired by "keep the 10 most recent". The lifecycle is re-applied to existing repositories on
+  every build and deploy. The deployer policy gains `EcrInUseTags` on `aegc/*` (#27).
+- **Root volume options:** pools take `disk=GiB` (30–16384) and `throughput=MiBps` (125–1000; IOPS
+  rise above 3,000 past 750 MiB/s, as gp3 requires) (#33).
+- **`destroy` verification:** after deleting, `aegc destroy <d> --yes` re-lists the deployment's
+  instances, volumes and network interfaces (waiting while they terminate), groups, launch
+  templates, security group, queues, log group, `/aegc/<d>/` parameters, worker role, instance
+  profile and in-use image tags, reports anything left as `remaining`, and exits 1.
+  `--no-verify` skips it; `--verify` without `--yes` only re-checks (#43).
+- **`aegc footprint <d>`:** a report of what exists for a deployment, from the Resource Groups
+  Tagging API plus a name-prefix scan (queues, groups, launch templates, parameters) that also
+  finds untagged look-alikes. It changes nothing (#43).
+
+### Changed
+- **Cheaper root volume:** 30 GiB at 125 MiB/s by default (was 50 GiB at 500 MiB/s), about
+  $0.0033 per worker-hour instead of $0.026 (#33).
+- `destroy` deletes every aegc-owned parameter under `/aegc/<d>/`, not only the manifest.
+
 ## [0.1.0] - 2026-11-15
 
 First release: Globus Compute tasks on ephemeral Spot Graviton workers, from an endpoint that runs
