@@ -48,8 +48,8 @@ Check the pool in `aegc status`:
 - **`desired` > 0 but nothing in service:** look at the last scaling activity. Common causes:
   the account's Spot vCPU quota for standard instances, no Spot capacity for the allowed types, or
   instance profile propagation right after a first deploy. After 15 minutes like this the engine
-  pauses scale-out for 10 minutes. Raising the quota, widening `vcpu=`, or using `on-demand`
-  usually helps.
+  pauses scale-out for 10 minutes. `aegc status` shows the quota and usage; a new account's Spot
+  default is 5 vCPUs. Raising the quota, widening `vcpu=`, or using `on-demand` usually helps.
 - **Instances start but the worker doesn't:** check `/aegc/<d>` for a log stream from the instance.
   With none, the boot failed (Docker, ECR login or the image pull). The boot script terminates the
   instance on failure, and the watchdog does if the worker stays down. A common cause is an image

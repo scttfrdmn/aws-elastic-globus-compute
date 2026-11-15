@@ -69,6 +69,9 @@ class Agent:
     wait_s: int = 20
     notice_poll_s: float = 5.0
     heartbeat_file_s: float = 30.0
+    #: The host watchdog's heartbeat file is touched only while the claim loop is making progress:
+    #: a loop pass takes at most one long poll plus botocore's retries (5 x (10 s + 30 s)).
+    loop_stale_s: float = 300.0
     stats: Stats = field(default_factory=Stats)
 
     def __post_init__(self) -> None:
@@ -78,6 +81,8 @@ class Agent:
         self._draining = threading.Event()  # stop claiming; finish in-flight
         self._drain_reason = ""
         self._rebalance_seen = False
+        self._loop_tick = time.monotonic()
+        self._loop_stale_logged = False
         self._pool = ThreadPoolExecutor(
             max_workers=self.config.slot_count, thread_name_prefix="aegc-slot"
         )
@@ -98,6 +103,7 @@ class Agent:
         cycles = 0
         try:
             while not self._stop.is_set():
+                self._loop_tick = time.monotonic()
                 if self._draining.is_set():
                     if not self._busy():
                         break
@@ -359,12 +365,31 @@ class Agent:
             self.extend_visibility()
             now = time.monotonic()
             if now >= next_file:
-                try:
-                    hb.parent.mkdir(parents=True, exist_ok=True)
-                    hb.touch()
-                except OSError as e:
-                    log.warning("couldn't touch heartbeat file: %s", e)
+                self._touch_heartbeat_file(hb, now)
                 next_file = now + self.heartbeat_file_s
+
+    def _touch_heartbeat_file(self, hb: Path, now: float) -> bool:
+        """Tell the host watchdog we're alive, but only if the claim loop is.
+
+        This thread keeps running if the claim loop wedges; touching the file regardless would hide
+        the wedge from the watchdog and keep the instance (and its cost) forever.
+        """
+        if now - self._loop_tick > self.loop_stale_s:
+            if not self._loop_stale_logged:
+                log.error(
+                    "claim loop hasn't run for %d s; letting the watchdog replace this instance",
+                    now - self._loop_tick,
+                )
+                self._loop_stale_logged = True
+            return False
+        self._loop_stale_logged = False
+        try:
+            hb.parent.mkdir(parents=True, exist_ok=True)
+            hb.touch()
+            return True
+        except OSError as e:
+            log.warning("couldn't touch heartbeat file: %s", e)
+            return False
 
     def _notice_loop(self) -> None:
         while not self._stop.wait(self.notice_poll_s):

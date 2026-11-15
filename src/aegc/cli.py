@@ -156,6 +156,8 @@ def parse_pool(text: str) -> dict[str, Any]:
 
 
 def _deploy(args: argparse.Namespace) -> int:
+    from dataclasses import asdict
+
     from aegc import awsutil, images, naming
     from aegc.infra import deployment
 
@@ -184,8 +186,26 @@ def _deploy(args: argparse.Namespace) -> int:
         bucket=naming.bucket_name(account, region),
         pools=tuple(pools),
     )
+    errors = _quota_preflight(sess, [asdict(p) for p in pools])
+    if errors and not args.dry_run:
+        raise SystemExit("aegc: " + "\naegc: ".join(errors))
     print(deployment.deploy(_clients(sess), spec, dry_run=args.dry_run))  # type: ignore[arg-type]
     return 0
+
+
+def _quota_preflight(sess: object, pools: list[dict[str, Any]]) -> list[str]:
+    """Print vCPU quota warnings; return the errors (pools that can never launch a worker)."""
+    from aegc import awsutil, quotas
+
+    checks = quotas.check(
+        pools,
+        sq=awsutil.client(sess, "service-quotas"),  # type: ignore[arg-type]
+        cw=awsutil.client(sess, "cloudwatch"),  # type: ignore[arg-type]
+    )
+    for c in checks:
+        for w in c.warnings:
+            print(f"warning: {w}", file=sys.stderr)
+    return [e for c in checks for e in c.errors]
 
 
 def _destroy(args: argparse.Namespace) -> int:
@@ -216,6 +236,8 @@ def _status(args: argparse.Namespace) -> int:
         autoscaling=awsutil.client(sess, "autoscaling"),  # type: ignore[arg-type]
         deployment=args.deployment,
         region=region,
+        sq=awsutil.client(sess, "service-quotas"),  # type: ignore[arg-type]
+        cw=awsutil.client(sess, "cloudwatch"),  # type: ignore[arg-type]
     )
     print(st.render())
     return 0

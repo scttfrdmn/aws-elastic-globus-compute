@@ -23,6 +23,9 @@ deployment e2e (us-west-2)
   as an exhausted Spot quota.
 - **result queue** lines list each user endpoint process's queue. Results that stay there mean that
   endpoint process isn't running.
+- **vCPU quota** lines compare the account's Spot (or on-demand) vCPU quota and current usage with
+  what the deployment's pools can ask for (every pool at `max`, each worker at its largest size),
+  with a warning and the `aws service-quotas` command to raise it when it falls short.
 
 ## Run the endpoint
 

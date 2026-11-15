@@ -6,10 +6,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from aegc import naming
+from aegc import naming, quotas
 from aegc.awsutil import is_not_found, paginate
 from aegc.infra import Outcome, Report
 from aegc.infra.deployment import read_manifest
+from aegc.quotas import QuotaCheck
 
 #: Result queues untouched this long, and empty, belong to endpoint processes that are gone.
 RESULT_QUEUE_IDLE_S = 14 * 24 * 3600
@@ -35,6 +36,7 @@ class DeploymentStatus:
     region: str
     pools: list[PoolStatus] = field(default_factory=list)
     result_queues: dict[str, int] = field(default_factory=dict)  # name -> waiting results
+    quotas: list[QuotaCheck] = field(default_factory=list)
 
     def render(self) -> str:
         lines = [f"deployment {self.deployment} ({self.region})"]
@@ -46,6 +48,9 @@ class DeploymentStatus:
             )
             if p.last_activity:
                 lines.append(f"    last scaling activity: {p.last_activity}")
+        for q in self.quotas:
+            lines.append(q.render())
+            lines.extend(f"    warning: {m}" for m in (*q.errors, *q.warnings))
         for name, n in sorted(self.result_queues.items()):
             note = "  (undelivered; if this persists, the endpoint is stopped)" if n else ""
             lines.append(f"  result queue {name}: {n} result(s){note}")
@@ -63,7 +68,14 @@ def _counts(sqs: Any, url: str) -> tuple[int, int]:
 
 
 def status(
-    *, ssm: Any, sqs: Any, autoscaling: Any, deployment: str, region: str
+    *,
+    ssm: Any,
+    sqs: Any,
+    autoscaling: Any,
+    deployment: str,
+    region: str,
+    sq: Any | None = None,
+    cw: Any | None = None,
 ) -> DeploymentStatus:
     m = read_manifest(ssm, deployment)
     out = DeploymentStatus(deployment=deployment, region=region)
@@ -92,6 +104,10 @@ def status(
                 a = acts[0]
                 ps.last_activity = f"{a.get('StatusCode', '')}: {a.get('Description', '')}".strip()
         out.pools.append(ps)
+    if sq is not None and cw is not None:
+        out.quotas = quotas.check(
+            [{"name": n, **p} for n, p in m.get("pools", {}).items()], sq=sq, cw=cw
+        )
     for url in _result_queues(sqs, deployment):
         visible, inflight = _counts(sqs, url)
         out.result_queues[url.rsplit("/", 1)[-1]] = visible + inflight

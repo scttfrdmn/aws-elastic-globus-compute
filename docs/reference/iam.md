@@ -207,13 +207,24 @@ Auto Scaling groups.
       "Effect": "Allow",
       "Action": "sqs:ListQueues",
       "Resource": "*"
+    },
+    {
+      "Sid": "VcpuQuotaPreflight",
+      "Effect": "Allow",
+      "Action": [
+        "servicequotas:GetServiceQuota",
+        "servicequotas:GetAWSDefaultServiceQuota",
+        "cloudwatch:GetMetricData"
+      ],
+      "Resource": "*"
     }
   ]
 }
 ```
 
 `sqs:ListQueues` has no resource-level scoping; `aegc status` uses it to find the deployment's
-result queues by name prefix.
+result queues by name prefix. The `VcpuQuotaPreflight` statement (Service Quotas and CloudWatch
+reads, also in the deployer policy) lets `status` and `deploy` check the account's vCPU quota.
 
 ## deployer
 
@@ -426,6 +437,16 @@ limited to the `/aegc/` path, and roles can be passed only to EC2 and ECR.
       "Sid": "ListQueues",
       "Effect": "Allow",
       "Action": "sqs:ListQueues",
+      "Resource": "*"
+    },
+    {
+      "Sid": "VcpuQuotaPreflight",
+      "Effect": "Allow",
+      "Action": [
+        "servicequotas:GetServiceQuota",
+        "servicequotas:GetAWSDefaultServiceQuota",
+        "cloudwatch:GetMetricData"
+      ],
       "Resource": "*"
     },
     {

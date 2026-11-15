@@ -55,6 +55,8 @@ in Docker on your machine.
     rebalance recommendation is only logged, since capacity rebalance replaces the instance. An
     idle worker leaves its group and decrements desired capacity, staying up if the group is at
     its minimum. Each claim and outcome is logged with its duration.
+  - The host watchdog's heartbeat file is touched only while the claim loop is making progress, so
+    a wedged worker is replaced instead of running (and billing) indefinitely.
   - `aegc-worker selftest` runs a probe task through `execute_task` (#10).
 - **`AWSEngine`:** a Globus Compute endpoint engine.
   - `_submit` resolves the pool from `env` and the submitter's Python minor (or an explicit
@@ -97,19 +99,23 @@ in Docker on your machine.
   - `aegc destroy` (dry run unless `--yes`).
   - `aegc status`: per pool, the queued, running and dead-lettered tasks, the worker count, the last
     scaling activity, and results waiting for a stopped endpoint.
+  - A vCPU quota preflight in `deploy` and `status`. It compares the account's Spot (or on-demand)
+    vCPU quota and current usage with what the pools can ask for, and warns with the command to
+    request more. A pool whose smallest worker can never fit is refused. New accounts get 5 Spot
+    vCPUs.
   - `aegc reap`: removes aegc-owned result queues that are empty and idle for 14 days. Live engines
     refresh theirs daily (#14).
 - **Documentation for v0.1:** a quickstart; concepts (architecture, when to use aegc and its
   limits, delivery and idempotency, the security model, cost with example prices); how-to guides
   (configuration, worker images, operations, troubleshooting); and reference pages for the CLI,
   endpoint configuration and `resource_specification` keys, limits, IAM policies, resources and
-  tags, and the live performance results (#16).
-
+  tags, and the live performance results (#16). The cost page covers the Spot quota, which cost
+  allocation tags to activate, and `aegc destroy <d> --force --yes` as the emergency stop.
 - **Tests** run against [substrate](https://github.com/scttfrdmn/substrate) (pinned v0.126.0,
   `make tools`), an AWS emulator, instead of moto: real Auto Scaling, ECR pull-through
-  cache, SQS, S3, IAM policy simulation and default VPC. One workaround remains: substrate has no
-  Graviton instance types, so tests that need running workers retarget the group at `m5`
-  (substrate#1497).
+  cache, SQS, S3, IAM policy simulation, Service Quotas and default VPC. One workaround remains:
+  substrate has no Graviton instance types, so tests that need running workers retarget the group
+  at `m5` (substrate#1497). Strict xfails mark the open gaps (substrate#1471, #1497, #1498).
 
 ### Validated
 Live in us-west-2 with the `geospatial` image (Python 3.14), recorded in #15 and #16:

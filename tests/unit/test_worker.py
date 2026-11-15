@@ -272,6 +272,19 @@ def test_interruption_releases_inflight(rig: Rig) -> None:
     assert a.stats.released == 1
 
 
+def test_watchdog_heartbeat_needs_a_live_claim_loop(rig: Rig, tmp_path: Path) -> None:
+    # The heartbeat thread outlives a wedged claim loop; it must stop vouching for it so the host
+    # watchdog replaces the instance instead of paying for it indefinitely.
+    a = rig.agent()
+    hb = tmp_path / "hb"
+    now = time.monotonic()
+    a._loop_tick = now
+    assert a._touch_heartbeat_file(hb, now) and hb.exists()
+    hb.unlink()
+    assert not a._touch_heartbeat_file(hb, now + a.loop_stale_s + 1)
+    assert not hb.exists()
+
+
 @pytest.mark.timeout(60)
 def test_rebalance_keeps_working(rig: Rig, caplog: pytest.LogCaptureFixture) -> None:
     # Auto Scaling's capacity rebalance replaces the instance; the worker keeps claiming until

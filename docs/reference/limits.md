@@ -45,7 +45,7 @@ services'.
 | User data size | 16 KiB (EC2 limit) |
 | Default pool | `max` 4, `min` 0, 2–16 vCPU, at least 4096 MiB, Spot, one slot per vCPU |
 | Instances | Graviton (arm64) only; no GPUs |
-| Spot capacity | your account's Spot vCPU quota for standard instances |
+| Spot capacity | your account's Spot vCPU quota for standard instances (`L-34B43A08`; AWS's default is 5), checked by `aegc deploy` and `aegc status` |
 
 ## Names
 

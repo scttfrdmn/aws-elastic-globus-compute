@@ -8,6 +8,18 @@ from aegc import naming
 
 WORKER_POLICY = "aegc-worker"
 
+#: The vCPU quota preflight in `aegc deploy` and `aegc status` (none of these take resources).
+VCPU_QUOTA_STATEMENT: dict[str, Any] = {
+    "Sid": "VcpuQuotaPreflight",
+    "Effect": "Allow",
+    "Action": [
+        "servicequotas:GetServiceQuota",
+        "servicequotas:GetAWSDefaultServiceQuota",
+        "cloudwatch:GetMetricData",
+    ],
+    "Resource": "*",
+}
+
 
 def ec2_trust_policy() -> dict[str, Any]:
     return {
@@ -173,6 +185,7 @@ def operator_policy(*, deployment: str, region: str, account: str, bucket: str) 
                 "Action": "sqs:ListQueues",
                 "Resource": "*",
             },
+            VCPU_QUOTA_STATEMENT,
         ],
     }
 
@@ -362,6 +375,7 @@ def deployer_policy(*, region: str, account: str) -> dict[str, Any]:
                 "Resource": f"arn:aws:sqs:{r}:{a}:{p}-*",
             },
             {"Sid": "ListQueues", "Effect": "Allow", "Action": "sqs:ListQueues", "Resource": "*"},
+            VCPU_QUOTA_STATEMENT,
             {
                 "Sid": "Logs",
                 "Effect": "Allow",

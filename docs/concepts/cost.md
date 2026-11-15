@@ -19,7 +19,7 @@ always-on instance.
 | SQS requests | Every send, receive, delete, visibility change and attribute read; each 64 KB of a message counts as one request | $0.40 per million |
 | S3 payloads (bodies over 700 KB) | Until deleted after use, or expired after 15 days | $0.023 per GB-month, plus request charges |
 | ECR storage | Worker images in `aegc/<env>` (the 10 most recent builds are kept) and the cached bases in `aegc-quay/…` | $0.10 per GB-month |
-| CloudWatch Logs | Worker logs, kept 14 days | $0.50 per GB ingested |
+| CloudWatch Logs | Worker logs, kept 14 days. **Your tasks' stdout and stderr go here too**, so a chatty task costs more than aegc's own few lines per task | $0.50 per GB ingested |
 | Data transfer | Task and result bytes between your machine and AWS | Internet data transfer out applies to results; traffic between workers and S3, SQS and ECR in the region is free |
 
 SSM parameters are standard-tier. Auto Scaling has no charge of its own.
@@ -69,6 +69,21 @@ The same run on demand would be about 1.3 × ($0.080 + $0.031) ≈ $0.14.
 - Don't set `min=` unless you need warm workers; `min` workers run all the time.
 - Batch tiny tasks: per-task overhead costs worker time (see
   [When to use aegc](when-to-use.md#limits-and-weak-spots)).
-- aegc doesn't create AWS Budgets or cost alarms. Set a budget on the account yourself.
-- `aegc destroy <d> --yes` removes a deployment completely. Images and the region bootstrap stay
-  until you remove them.
+- Check the Spot vCPU quota. A new account's default is **5 vCPUs**, enough for two `.large`
+  workers. `aegc deploy` and `aegc status` compare it with what your pools can ask for, warn when
+  scale-out would stop short, and print the `aws service-quotas` command to request more. A pool
+  whose smallest worker doesn't fit is refused.
+- aegc doesn't create AWS Budgets or cost alarms in 0.1. Set a budget on the account yourself.
+- To see aegc's spend in Cost Explorer, activate these
+  [cost allocation tags](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/activating-tags.html)
+  once they appear in the Billing console (a day or so after the first deployment):
+  `aegc:deployment`, `aegc:pool`, `aegc:role`, and the AWS-generated `aws:autoscaling:groupName`.
+  Activation isn't retroactive.
+
+## Stopping spend now
+
+`aegc destroy <d> --force --yes` is the emergency stop in 0.1. It deletes the Auto Scaling groups
+(terminating their instances, including any running tasks) and the rest of the deployment, even
+with tasks queued. Lowering a group's desired capacity by hand isn't enough: workers are protected
+from scale-in. Images and the region bootstrap stay until you remove them (see
+[Operations](../how-to/operations.md#removing-everything)).
