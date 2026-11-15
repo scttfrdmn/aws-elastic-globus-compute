@@ -1216,8 +1216,9 @@ def verify_destroyed(
         from aegc import lease
 
         try:
-            c.scheduler.get_schedule_group(Name=lease.group_name(d))
-            report.add("schedule group", lease.group_name(d), "remaining")
+            g = c.scheduler.get_schedule_group(Name=lease.group_name(d))
+            if g.get("State") != "DELETING":  # DeleteScheduleGroup completes asynchronously
+                report.add("schedule group", lease.group_name(d), "remaining")
         except Exception as e:
             if not is_not_found(e):
                 raise

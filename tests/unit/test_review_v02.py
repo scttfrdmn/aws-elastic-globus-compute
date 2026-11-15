@@ -329,3 +329,16 @@ def test_live_1_no_refusal_right_after_resume(engine_env: Env) -> None:
         assert len(queued(engine_env)) == 1  # sent, not refused
     finally:
         e.shutdown()
+
+
+def test_live_2_footprint_ignores_deleted_resources(aws: Callable[[str], Any]) -> None:
+    # Found live: the tagging index lists terminated instances and deleted volumes/ENIs for a
+    # while, so a clean teardown looked like 15 leftovers.
+    from aegc import ops
+
+    ec2 = aws("ec2")
+    v = ec2.create_volume(AvailabilityZone=f"{REGION}a", Size=1)["VolumeId"]
+    assert ops._still_exists(ec2, "ebs volume", v)
+    ec2.delete_volume(VolumeId=v)
+    assert not ops._still_exists(ec2, "ebs volume", v)
+    assert ops._still_exists(ec2, "sqs queue", "anything")  # other kinds aren't checked here

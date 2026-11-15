@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from aegc import naming, quotas
-from aegc.awsutil import is_not_found, paginate
+from aegc.awsutil import error_code, is_not_found, paginate
 from aegc.infra import Outcome, Report
 from aegc.infra.deployment import _owned_ec2_filters, read_manifest
 from aegc.quotas import QuotaCheck
@@ -329,6 +329,7 @@ class Footprint:
     deployment: str
     region: str
     items: dict[tuple[str, str], FootprintItem] = field(default_factory=dict)
+    stale: int = 0  # tagging-index entries for resources that no longer exist
 
     def add(
         self, kind: str, key: str, name: str, *, owned: bool, found_by: str, detail: str = ""
@@ -356,6 +357,11 @@ class Footprint:
         for i in sorted(self.items.values(), key=lambda i: (not i.owned, i.kind, i.name)):
             lines.append(f"  {i}")
         lines.append(f"  {len(self.owned)} owned, {len(self.look_alikes)} look-alike(s)")
+        if self.stale:
+            lines.append(
+                f"  ({self.stale} tagging-index entr{'y' if self.stale == 1 else 'ies'} for "
+                "resources that no longer exist: the index lags deletions)"
+            )
         return "\n".join(lines)
 
 
@@ -407,6 +413,27 @@ def _owned_by_name_and_tags(kind: str, name: str, tags: dict[str, str], d: str) 
     return naming.is_owned(name, tags, d)
 
 
+def _still_exists(ec2: Any, kind: str, key: str) -> bool:
+    """For EC2 instances, volumes and network interfaces found through the tagging index:
+    whether they still exist (terminated instances and deleted volumes/ENIs linger there)."""
+    try:
+        if kind == "ec2 instance":
+            r = ec2.describe_instances(InstanceIds=[key])["Reservations"]
+            states = [i["State"]["Name"] for res in r for i in res["Instances"]]
+            return any(s != "terminated" for s in states)
+        if kind == "ebs volume":
+            return bool(ec2.describe_volumes(VolumeIds=[key])["Volumes"])
+        if kind == "network interface":
+            return bool(
+                ec2.describe_network_interfaces(NetworkInterfaceIds=[key])["NetworkInterfaces"]
+            )
+    except Exception as e:
+        if is_not_found(e) or "NotFound" in error_code(e):
+            return False
+        raise
+    return True
+
+
 def footprint(
     *,
     tagging: Any,
@@ -436,6 +463,9 @@ def footprint(
         TagFilters=[{"Key": naming.TAG_DEPLOYMENT, "Values": [d]}],
     ):
         kind, key = _arn_resource(m["ResourceARN"])
+        if not _still_exists(ec2, kind, key):
+            out.stale += 1  # gone; the tagging index lags deletions (minutes to hours)
+            continue
         tags = naming.tag_dict(m.get("Tags", []))
         out.add(kind, key, key, owned=_owned_by_name_and_tags(kind, key, tags, d), found_by="tags")
 
