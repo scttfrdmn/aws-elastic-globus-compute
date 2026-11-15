@@ -509,7 +509,7 @@ def deploy_grants(
                 bucket=naming.bucket_name(account, region),
             )
             room = iam.INLINE_POLICY_LIMIT - iam.policy_size(worker)
-            iam.grants_policy(grants, deployment=deployment, budget=room)
+            iam.grants_policy(grants, deployment=deployment, budget=room, account=account)
     except ValueError as e:
         raise SystemExit(f"aegc: {e}") from None
     return grants
@@ -799,7 +799,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="check an image you built (with aegc and globus-compute-endpoint) and record it",
     )
     r.add_argument("--env", required=True, help="the environment's name")
-    r.add_argument("--image", required=True, help="linux/arm64 image, pinned (repo@sha256:...)")
+    r.add_argument(
+        "--image",
+        required=True,
+        help="linux/arm64 image: repo@sha256:..., an immutable tag, or a local image",
+    )
     r.set_defaults(func=_image_register)
     fg = img.add_parser("forget", help="drop an environment's image for one Python minor")
     fg.add_argument("--env", required=True)
