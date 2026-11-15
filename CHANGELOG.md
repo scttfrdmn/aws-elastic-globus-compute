@@ -6,6 +6,23 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **Worker data-access grants:** `aegc deploy <d> --grant read=s3://bucket/prefix --grant
+  write=s3://bucket/prefix` (repeatable) lets every task in the deployment read or write under
+  your own S3 prefixes, through the worker role's inline policy `aegc-grants`. Read grants allow
+  `GetObject`, `GetObjectVersion` and `ListBucket` for keys under the prefix; write grants allow
+  `PutObject` and multipart uploads. `s3://bucket/` (with the slash) means the whole bucket.
+  Wildcards, invalid bucket names and aegc's own bucket are refused, and so are more grants than
+  fit in IAM's 10,240 inline-policy characters. The grants are kept in the manifest and across
+  redeploys; `--grant` replaces them and `--grant none` removes them. Requester-pays buckets need
+  no extra IAM: pass `RequestPayer='requester'` (#53).
+- **`aegc.outputs`**, for results larger than Globus Compute's ~10 MB limit: inside a task,
+  `outputs.put(data_or_path, name=None, prefix=None)` uploads to
+  `<write grant prefix>/<task uuid>/<name>` (multipart for large files) and returns the `s3://`
+  URI; `outputs.get`, `outputs.download` and `outputs.uri_to_https` (plain or presigned) read it
+  back. Without a write grant it raises `PermissionError`, naming the `--grant` to add. Workers
+  export `AEGC_TASK_UUID` to each task (#54).
+
 ## [0.2.0] - 2026-11-15
 
 Spend safety: aegc spends real money, so 0.2 adds limits it enforces, a kill switch, a lease, a

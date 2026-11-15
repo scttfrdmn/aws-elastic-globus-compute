@@ -35,6 +35,11 @@ class WorkerConfig:
     size_class: str = ""  # aegc.sizes; empty: one task per vCPU
     task_cpus: int = 1
     task_memory_gib: float = 0
+    #: The deployment's data-access grants, ``{"access", "bucket", "prefix"}`` each (#53).
+    grants: tuple[dict[str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "grants", tuple(dict(g) for g in self.grants))
 
     @property
     def slot_count(self) -> int:

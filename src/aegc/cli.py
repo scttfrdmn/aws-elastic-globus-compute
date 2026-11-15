@@ -385,6 +385,9 @@ def _deploy(args: argparse.Namespace) -> int:
         limits=limits.to_dict(),
         lease_s=lease_s,
         ttl_at=ttl_at,
+        grants=deploy_grants(
+            args.grant, prev, deployment=args.deployment, account=account, region=region
+        ),
     )
     errors = _quota_preflight(sess, [asdict(p) for p in pools])
     if errors and not args.dry_run:
@@ -409,6 +412,37 @@ def _deploy(args: argparse.Namespace) -> int:
             )
     print(report)
     return 0
+
+
+def deploy_grants(
+    given: list[str] | None, prev: dict[str, Any], *, deployment: str, account: str, region: str
+) -> tuple[Any, ...]:
+    """The grants for a deploy: ``--grant`` values replace the previous manifest's, none given
+    keeps them (like the limits and the lease), and ``--grant none`` clears them."""
+    from aegc import naming
+    from aegc.infra import iam
+
+    try:
+        if not given:
+            grants = tuple(iam.Grant.from_dict(g) for g in prev.get("grants") or [])
+        elif "none" in given:
+            if len(given) > 1:
+                raise ValueError("--grant none clears the grants; don't combine it with others")
+            grants = ()
+        else:
+            grants = tuple(dict.fromkeys(iam.Grant.parse(g) for g in given))
+        if grants:  # all of the worker role's inline policies share 10,240 characters
+            worker = iam.worker_policy(
+                deployment=deployment,
+                region=region,
+                account=account,
+                bucket=naming.bucket_name(account, region),
+            )
+            room = iam.INLINE_POLICY_LIMIT - iam.policy_size(worker)
+            iam.grants_policy(grants, deployment=deployment, budget=room)
+    except ValueError as e:
+        raise SystemExit(f"aegc: {e}") from None
+    return grants
 
 
 def _version(text: str) -> tuple[int, ...]:
@@ -723,6 +757,12 @@ def build_parser() -> argparse.ArgumentParser:
         "options not given keep their last values.",
     )  # fmt: skip
     _limit_args(dp)
+    dp.add_argument(
+        "--grant", action="append", metavar="read|write=s3://BUCKET/PREFIX|none",
+        help="let every task in the deployment read or write under an S3 prefix of yours "
+        "(repeatable; s3://BUCKET/ is the whole bucket). Replaces the previous grants; without "
+        "--grant a redeploy keeps them, and --grant none removes them.",
+    )  # fmt: skip
     dp.add_argument(
         "--lease", metavar="DURATION",
         help="freeze the deployment if no endpoint renews it for this long (default 48h; "

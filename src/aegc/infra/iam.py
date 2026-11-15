@@ -2,11 +2,176 @@
 
 from __future__ import annotations
 
-from typing import Any
+import json
+import re
+from dataclasses import dataclass
+from typing import Any, Literal
 
 from aegc import naming
 
 WORKER_POLICY = "aegc-worker"
+#: The worker role's inline policy for the user's data-access grants (#53).
+GRANTS_POLICY = "aegc-grants"
+#: IAM limits the inline policies of one role to 10,240 characters in total, whitespace not counted.
+INLINE_POLICY_LIMIT = 10_240
+
+_BUCKET_RE = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
+_IP_RE = re.compile(r"\d+\.\d+\.\d+\.\d+")
+#: aegc's own buckets (`aegc-<account>-<region>`): workers already have what they need there.
+_AEGC_BUCKET_RE = re.compile(rf"{naming.PREFIX}-\d{{12}}-[a-z0-9-]+")
+#: Characters IAM treats as wildcards or variables in resources and StringLike conditions.
+_WILDCARDS = ("*", "?", "${")
+
+Access = Literal["read", "write"]
+
+
+@dataclass(frozen=True)
+class Grant:
+    """Worker access to ``s3://bucket/prefix``. aegc references the bucket; it never creates,
+    changes or deletes it. The prefix is literal: ``out`` also covers ``outside/``, so end it with
+    ``/`` for a folder. An empty prefix is the whole bucket."""
+
+    access: Access
+    bucket: str
+    prefix: str = ""
+
+    def __post_init__(self) -> None:
+        if self.access not in ("read", "write"):
+            raise ValueError(f"grant access must be read or write, not {self.access!r}")
+        b = self.bucket
+        if any(w in b for w in _WILDCARDS) or any(w in self.prefix for w in _WILDCARDS):
+            raise ValueError(f"grants can't use wildcards: {self.uri}")
+        if (
+            not _BUCKET_RE.fullmatch(b)
+            or ".." in b
+            or _IP_RE.fullmatch(b)
+            or b.startswith(("xn--", "sthree-"))
+            or b.endswith(("-s3alias", "--ol-s3", "--x-s3", "--table-s3"))
+        ):
+            raise ValueError(f"not a valid general purpose S3 bucket name: {b!r}")
+        if _AEGC_BUCKET_RE.fullmatch(b):
+            raise ValueError(
+                f"{b} is aegc's own bucket; workers already have exactly what they need there"
+            )
+        if len(self.prefix.encode()) > 1024:
+            raise ValueError("a grant prefix is an S3 key prefix: at most 1,024 bytes")
+
+    @property
+    def uri(self) -> str:
+        return f"s3://{self.bucket}/{self.prefix}"
+
+    def covers(self, bucket: str, key: str) -> bool:
+        return bucket == self.bucket and key.startswith(self.prefix)
+
+    def to_dict(self) -> dict[str, str]:
+        return {"access": self.access, "bucket": self.bucket, "prefix": self.prefix}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> Grant:
+        return cls(access=d["access"], bucket=str(d["bucket"]), prefix=str(d.get("prefix", "")))
+
+    @classmethod
+    def parse(cls, text: str) -> Grant:
+        """``read=s3://bucket/prefix`` or ``write=s3://bucket/prefix``. ``s3://bucket/`` (with
+        the slash) grants the whole bucket; ``s3://bucket`` is refused as ambiguous."""
+        access, sep, uri = text.partition("=")
+        if not sep or access not in ("read", "write"):
+            raise ValueError(f"a grant is read=s3://bucket/prefix or write=s3://...: {text!r}")
+        bucket, prefix = split_s3_uri(uri)
+        if prefix is None:
+            raise ValueError(
+                f"{uri} has no prefix: give s3://{bucket}/PREFIX, or s3://{bucket}/ to grant "
+                "the whole bucket"
+            )
+        return cls(access=access, bucket=bucket, prefix=prefix)  # type: ignore[arg-type]
+
+
+def split_s3_uri(uri: str) -> tuple[str, str | None]:
+    """``s3://bucket/key`` -> ``(bucket, key)``; ``s3://bucket`` -> ``(bucket, None)``."""
+    if not uri.startswith("s3://"):
+        raise ValueError(f"not an s3:// URI: {uri!r}")
+    bucket, sep, key = uri.removeprefix("s3://").partition("/")
+    if not bucket:
+        raise ValueError(f"no bucket in {uri!r}")
+    return bucket, (key if sep else None)
+
+
+def policy_size(doc: dict[str, Any]) -> int:
+    """A policy's size as IAM counts it (no whitespace)."""
+    return len(json.dumps(doc, separators=(",", ":")))
+
+
+def grants_policy(
+    grants: tuple[Grant, ...] | list[Grant],
+    *,
+    deployment: str,
+    budget: int = INLINE_POLICY_LIMIT,
+) -> dict[str, Any]:
+    """The inline policy ``aegc-grants``: worker access to the user's own S3 prefixes.
+
+    - read: ``s3:GetObject`` and ``s3:GetObjectVersion`` under each prefix, and ``s3:ListBucket``
+      on its bucket for keys under it (the ``s3:prefix`` condition; none for a whole bucket);
+    - write: ``s3:PutObject``, ``s3:AbortMultipartUpload`` and ``s3:ListMultipartUploadParts``
+      under each prefix (multipart uploads need all three).
+
+    Every task in the deployment can use every grant: a grant extends the deployment's trust
+    domain. Requester-pays buckets need no extra IAM; the reader passes ``RequestPayer='requester'``
+    (``s3.get_object(..., RequestPayer="requester")``, ``ExtraArgs={"RequestPayer": "requester"}``
+    for ``download_file``), and this account pays for the requests and transfer. Buckets encrypted
+    with a customer managed KMS key also need ``kms:Decrypt`` (read) or ``kms:GenerateDataKey``
+    (write) on that key, which aegc doesn't grant.
+
+    ``budget`` is the room left in the role's 10,240 inline characters; too many grants raise
+    ``ValueError``.
+    """
+    gs = list(dict.fromkeys(grants))
+    if not gs:
+        raise ValueError("no grants: delete the aegc-grants policy instead")
+    reads = [g for g in gs if g.access == "read"]
+    writes = [g for g in gs if g.access == "write"]
+    statements: list[dict[str, Any]] = []
+    if reads:
+        statements.append(
+            {
+                "Sid": "GrantRead",
+                "Effect": "Allow",
+                "Action": ["s3:GetObject", "s3:GetObjectVersion"],
+                "Resource": [f"arn:aws:s3:::{g.bucket}/{g.prefix}*" for g in reads],
+            }
+        )
+        for i, bucket in enumerate(dict.fromkeys(g.bucket for g in reads)):
+            prefixes = [g.prefix for g in reads if g.bucket == bucket]
+            st: dict[str, Any] = {
+                "Sid": f"GrantList{i}",
+                "Effect": "Allow",
+                "Action": "s3:ListBucket",
+                "Resource": f"arn:aws:s3:::{bucket}",
+            }
+            if "" not in prefixes:  # a whole-bucket grant lists without a prefix too
+                st["Condition"] = {"StringLike": {"s3:prefix": [f"{p}*" for p in prefixes]}}
+            statements.append(st)
+    if writes:
+        statements.append(
+            {
+                "Sid": "GrantWrite",
+                "Effect": "Allow",
+                "Action": [
+                    "s3:PutObject",
+                    "s3:AbortMultipartUpload",
+                    "s3:ListMultipartUploadParts",
+                ],
+                "Resource": [f"arn:aws:s3:::{g.bucket}/{g.prefix}*" for g in writes],
+            }
+        )
+    doc = {"Version": "2012-10-17", "Statement": statements}
+    if (size := policy_size(doc)) > budget:
+        raise ValueError(
+            f"deployment {deployment}'s {len(gs)} grants need a {size}-character IAM policy, but "
+            f"the worker role has room for {budget} (IAM allows {INLINE_POLICY_LIMIT} in all of a "
+            "role's inline policies); use fewer, broader prefixes"
+        )
+    return doc
+
 
 #: The vCPU quota preflight in `aegc deploy` and `aegc status` (none of these take resources).
 VCPU_QUOTA_STATEMENT: dict[str, Any] = {

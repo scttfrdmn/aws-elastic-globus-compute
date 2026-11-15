@@ -58,6 +58,7 @@ def _child(
 ) -> None:
     os.setsid()  # its own process group, so walltime kills reach anything it starts
     os.environ["GC_TASK_TIMEOUT"] = str(walltime_s)
+    os.environ["AEGC_TASK_UUID"] = task_uuid  # aegc.outputs keys outputs by task
     from globus_compute_endpoint.engines.helper import execute_task
 
     packed = execute_task(
