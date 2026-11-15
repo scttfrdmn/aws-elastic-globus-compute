@@ -24,6 +24,8 @@ Each prints a report, one line per resource, with an outcome: `created`, `exists
 | [`bootstrap`](#aegc-bootstrap) | Create the region-wide resources (once per region) |
 | [`unbootstrap`](#aegc-unbootstrap) | Remove the region-wide resources (dry run by default) |
 | [`image build`](#aegc-image-build) | Build, push and record a worker image for an environment |
+| [`image register`](#aegc-image-register) | Check an image you built (with aegc and `globus-compute-endpoint`) and record it |
+| [`image list`](#aegc-image-list) | An environment's recorded images, one per Python minor |
 | [`deploy`](#aegc-deploy) | Create or update a deployment and its worker pools |
 | [`stop`](#aegc-stop) | Stop a deployment's spending now (kill switch) |
 | [`resume`](#aegc-resume) | Resume a stopped, capped or expired deployment |
@@ -66,31 +68,70 @@ worker image repositories or image records.
 ## aegc image build
 
 ```
-aegc image build --env ENV --base-tag BASE_TAG [--source {aarchsci,aarchbio}]
-                 [--gce-version GCE_VERSION] [--no-push] [--direct] [--project-dir PROJECT_DIR]
+aegc image build --env ENV (--base-tag BASE_TAG | --base REF) [--source {aarchsci,aarchbio}]
+                 [--python PATH] [--gce-version GCE_VERSION] [--no-push] [--direct]
+                 [--project-dir PROJECT_DIR]
 ```
 
-Build, test, push and record a worker image for an environment. See
+Build, test, push and record a worker image for an environment, from an aarchsci env or aarchbio
+tool (`--base-tag`) or from any `linux/arm64` image (`--base`). Give exactly one of the two. See
 [Worker images](../how-to/images.md).
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--env ENV` | required | aarchsci env or aarchbio tool, e.g. `geospatial` |
-| `--base-tag BASE_TAG` | required | Immutable base tag, e.g. `2026.11.13.154112` |
-| `--source` | `aarchsci` | `aarchsci` or `aarchbio` |
+| `--env ENV` | required | With `--base-tag`, the aarchsci env or aarchbio tool, e.g. `geospatial`; with `--base`, any name of yours |
+| `--base-tag BASE_TAG` | | Immutable aarchsci/aarchbio tag, e.g. `2026.11.13.154112`; `latest` is refused |
+| `--base REF` | | Any `linux/arm64` image with Python 3.11 or later, pinned: `repo@sha256:...` or an immutable tag; `latest` and untagged references are refused |
+| `--source` | `aarchsci` | With `--base-tag`: `aarchsci` or `aarchbio` |
+| `--python PATH` | `python3` | With a non-conda `--base`: the base's Python |
 | `--gce-version` | `4.21.0` | `globus-compute-endpoint` version |
-| `--no-push` | off | Build and test locally only |
-| `--direct` | off | Pull the base from quay.io, not the ECR cache |
+| `--no-push` | off | Build and test locally only; record nothing |
+| `--direct` | off | Pull an aarchsci/aarchbio base from quay.io, not the ECR cache |
 | `--project-dir` | `.` | aegc source tree to build the wheel from |
 
-Prints the pinned image (`<registry>/aegc/<env>@sha256:…`), or the local tag with `--no-push`.
+A `--base` with `/opt/conda/bin/python` and `micromamba` is built with
+[templates/worker/Dockerfile](../../src/aegc/templates/worker/Dockerfile), like aarchsci; any
+other with [templates/worker/Dockerfile.pip](../../src/aegc/templates/worker/Dockerfile.pip).
+The image is recorded at `/aegc/images/<env>` under its Python minor, replacing only that minor's
+record. Prints the pinned image (`<registry>/aegc/<env>@sha256:…`), or the local tag with
+`--no-push`.
+
+## aegc image register
+
+```
+aegc image register --env ENV --image IMAGE [--python PYTHON]
+```
+
+Check an image you built and record it. The image must be pinned, `linux/arm64`, have aegc 0.2 or
+later and `globus-compute-endpoint` in its Python, and pass `aegc-worker selftest`. `register`
+pulls it, copies it into `aegc/<env>` and records it as kind `registered`. See
+[Register an image you built](../how-to/images.md#register-an-image-you-built).
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--env ENV` | required | The environment's name; `<env>-py314` must be a valid pool name |
+| `--image IMAGE` | required | The image, pinned: `repo@sha256:...` (or a tag other than `latest`) |
+| `--python PYTHON` | `python3` | Its Python |
+
+Prints the pinned `aegc/<env>` image.
+
+## aegc image list
+
+```
+aegc image list --env ENV
+```
+
+Print an environment's recorded images, one line per Python minor: the minor, the kind (`conda`,
+`pip` or `registered`), the aegc version in the image, and the pinned image, separated by tabs.
+Fails with `aegc: no image recorded for env 'x'` if there's none.
 
 ## aegc deploy
 
 ```
 aegc deploy DEPLOYMENT --pool POOL [--pool POOL ...]
             [--max-usd-day N|none] [--max-usd-month N|none] [--max-instance-hours-day N|none]
-            [--on-cap {fail,kill}] [--lease DURATION] [--ttl DURATION]
+            [--on-cap {fail,kill}] [--grant read|write=s3://BUCKET/PREFIX|none ...]
+            [--lease DURATION] [--ttl DURATION]
             [--prune] [--yes] [--force] [--allow-old-image] [--dry-run]
 ```
 
@@ -105,6 +146,8 @@ keep their last values. See [Configure pools](../how-to/configuration.md).
 | `--max-usd-month N|none` | Cap on estimated $ per UTC month |
 | `--max-instance-hours-day N|none` | Cap on instance-hours per UTC day |
 | `--on-cap {fail,kill}` | When a cap trips, let running tasks finish (`fail`, the default) or fail them (`kill`) |
+| `--grant read|write=s3://BUCKET/PREFIX` | Let every task in the deployment read or write under an S3 prefix of yours; repeatable. `s3://BUCKET/` is the whole bucket. Replaces the previous grants; see [Read and write your data](../how-to/data.md) |
+| `--grant none` | Remove the grants |
 | `--lease DURATION` | Freeze the deployment if no endpoint renews it for this long (default `48h`, at least `3h`; `none` disables); running endpoints renew hourly |
 | `--ttl DURATION` | Freeze the deployment this long from now, renewed or not (e.g. `7d`; `none` clears) |
 | `--prune` | Remove pools not listed (a dry run of that part unless `--yes`) |
@@ -113,8 +156,8 @@ keep their last values. See [Configure pools](../how-to/configuration.md).
 | `--allow-old-image` | Deploy images built before aegc 0.2 (their workers ignore limits and stop) |
 | `--dry-run` | Report what would change; change nothing |
 
-Durations are `<N>m`, `<N>h` or `<N>d`. Limits, lease and TTL are kept across redeploys unless
-given again. Without any limit, `deploy` prints a note. While the deployment isn't running, a
+Durations are `<N>m`, `<N>h` or `<N>d`. Limits, grants, lease and TTL are kept across redeploys
+unless given again. Without any limit, `deploy` prints a note. While the deployment isn't running, a
 redeploy keeps group minimums at 0. `deploy` refuses an image built with aegc before 0.2 unless
 `--allow-old-image` is given.
 
@@ -126,7 +169,8 @@ Pool options:
 | `min_vcpus=N` | 0 | Minimum vCPUs in the pool |
 | `vcpu=LO-HI` or `vcpu=N` | 2-8 | vCPU range per instance; HI at most `max_vcpus` (the default HI is lowered to fit) |
 | `mem=MiB` | 4096 | Minimum memory per instance |
-| `slots=N` or `slots=auto` | `auto` | Concurrent tasks per worker; `auto` is one per vCPU |
+| `size=CLASS` | none | `small`, `medium`, `mem`, `large` or `whole`: what one task gets ([size classes](configuration.md#size-classes)); adds `-<size>` to the pool name |
+| `slots=N` or `slots=auto` | `auto` | Concurrent tasks per worker; `auto` is one per vCPU, or what the size class fits |
 | `idle=S` | 300 | Idle seconds before a worker leaves the group |
 | `disk=GiB` | 30 | Root gp3 volume size (30–16384) |
 | `throughput=MiBps` | 125 | Root volume throughput (125–1000) |
@@ -135,10 +179,13 @@ Pool options:
 | `lifetime=S` | 86,400 | Seconds (3,600–259,200) after which a worker stops claiming |
 | `on-demand` | Spot | Use on-demand instances |
 | `spot` | Spot | Use Spot instances (undoes `on-demand`) |
+| `python=3.NN` | every minor | Deploy only the env's image for this Python minor |
 | `max=N`, `min=N` | | v0.1 spelling, in workers: converted to `max_vcpus`/`min_vcpus` (× `vcpu` LO) with a warning |
 
-The env must have an image recorded by `aegc image build`. The pool is named
-`<env>-py<NNN>` from that image's Python version.
+The env must have an image recorded by `aegc image build` or `aegc image register`. Each `--pool`
+makes one pool per recorded Python minor (or just `python=`'s), named `<env>-py<NNN>` from the
+image's Python version, plus `-<size>` with `size=`: for example `geospatial-py314` and
+`geospatial-py314-mem`.
 
 ## aegc stop
 
@@ -267,7 +314,7 @@ Print an IAM policy document as JSON. See [IAM policies](iam.md).
 | `operator` | | The endpoint's credentials |
 | `deployer` | | `aegc deploy`, `destroy`, `stop`, `resume`, `reap` and `footprint` |
 | `bootstrap` | | `aegc bootstrap` and `unbootstrap` |
-| `builder` | | `aegc image build` |
+| `builder` | | `aegc image build`, `register` and `list` |
 | `--deployment` | `default` | Deployment name (worker, operator) |
 | `--account` | the caller's | AWS account id |
 
@@ -313,4 +360,4 @@ Runs inside worker images; you don't normally call it yourself.
 | Command | What it does |
 |---|---|
 | `aegc-worker run` | Claim and run tasks until drained. Reads its configuration from `AEGC_WORKER_CONFIG_B64` (set by the user data). SIGTERM releases in-flight tasks and exits; SIGUSR1 simulates a Spot interruption |
-| `aegc-worker selftest` | Run a probe task through `execute_task` in this image's Python; used by `aegc image build` |
+| `aegc-worker selftest` | Run a probe task through `execute_task` in this image's Python; used by `aegc image build` and `aegc image register` |

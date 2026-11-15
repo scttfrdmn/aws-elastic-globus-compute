@@ -5,7 +5,7 @@ come back to the client as task failures carry a code:
 
 | Code | Meaning | Retried | See |
 |---|---|---|---|
-| `AEGC_CONFIGURATION` | The task can't be placed (env, Python, walltime, keys) | No | [below](#other-configuration-errors) |
+| `AEGC_CONFIGURATION` | The task can't be placed (env, Python, size, walltime, keys) | No | [below](#other-configuration-errors) |
 | `AEGC_WALLTIME_EXCEEDED` | The task ran past its walltime and was killed | No | [below](#task-exceeded-its-walltime) |
 | `AEGC_BUDGET_EXCEEDED` | The deployment reached a spend limit, or the limits admit no worker | No | [below](#aegc_budget_exceeded) |
 | `AEGC_STOPPED` | Someone ran `aegc stop` | No | [below](#aegc_stopped) |
@@ -25,8 +25,11 @@ from a matching Python version.
 **Cause:** Globus Compute serializes functions with the client's Python, so workers must run the
 same minor version. The client is on 3.13 and the only image for `geospatial` runs 3.14.
 
-**Fix:** submit from Python 3.14 (for example `uv venv --python 3.14`). The aarchsci images run
-3.14, and each env has one image. With `resource_specification={"pool": ...}` the message reads
+**Fix:** submit from Python 3.14 (for example `uv venv --python 3.14`), or give the env an image
+for 3.13 and redeploy: build one from a 3.13 base with `aegc image build --env geospatial --base
+REF`, or register one, then `aegc deploy <d> --pool geospatial` adds `geospatial-py313` next to
+`geospatial-py314`. See [Several Python minors per env](images.md#several-python-minors-per-env).
+With `resource_specification={"pool": ...}` the message reads
 `pool '<name>' runs Python 3.14, but this client is Python 3.13` instead.
 
 ## Other configuration errors
@@ -39,7 +42,10 @@ These fail the task at once, without a retry, as `AEGC_CONFIGURATION`:
 | `AWS setup failed:` | The engine couldn't create AWS clients or its result queue at start (often credentials) | See [Credentials in the endpoint](#credentials-in-the-endpoint); restart the endpoint |
 | `no pool for env 'x' in 'd'; envs: [...]` | No pool in the deployment has that env | Check `user_endpoint_config` / `resource_specification`, or deploy a pool for the env |
 | `no pool 'x' in deployment 'd'` | `resource_specification={"pool": "x"}` names a pool that doesn't exist | Use a name from `aegc status` |
-| `unsupported resource_specification keys [...]` | Keys other than `env`, `pool`, `walltime_s` | Remove them |
+| `unsupported resource_specification keys [...]` | Keys other than `env`, `pool`, `walltime_s`, `size`, `cpus`, `memory_gib`. A "did you mean" hint follows for `vcpus`, `memory` and similar | Remove or rename them. If `size`, `cpus` or `memory_gib` is refused, the endpoint runs an older engine: `aegc endpoint build`, then `stop` and `start` |
+| `resource_specification cpus must be a positive number` (or `memory_gib`) | Zero, negative or not a number | Pass a number above 0 |
+| `no size='mem' pool for env 'x'; available: ...` | No pool of that size class for the env and the client's Python | Deploy one with `--pool x:size=mem`, or ask for another size |
+| `no pool for env 'x' gives a task N vCPUs and M GiB; available: ...` | Every pool's tasks get less than `cpus` or `memory_gib` | Deploy a larger [size class](configuration.md#size-classes), or ask for less |
 | `walltime_s must be between 1 and N` | Walltime out of range; N is the pool's `max_walltime`, at most 41,400 | Split the task, lower `walltime_s`, or redeploy the pool with a higher `max_walltime=` |
 
 Running engines re-read the manifest every minute, so a fixed deployment takes effect without a
@@ -188,12 +194,35 @@ Each of these is retried once before the client sees it. See
 `walltime_s` in `resource_specification` (at most the pool's `max_walltime`, 41,400 at most), raise
 the pool's default with `walltime=`, or split the work.
 
-## Reading open data fails with Access Denied
+## Reading S3 data fails with Access Denied
 
-Workers have no S3 permissions outside aegc's payload prefix, so signed requests to other buckets
-are denied, even public ones. Use unsigned requests, for example `s3fs.S3FileSystem(anon=True)`,
-`botocore.UNSIGNED` in boto3, or `AWS_NO_SIGN_REQUEST=YES` for GDAL. Private and requester-pays
-buckets can't be read yet. See [Security model](../concepts/security.md#data-access).
+Workers have no S3 permissions outside aegc's payload prefix and the deployment's grants, so signed
+requests to other buckets are denied, even public ones.
+
+- **Open data:** use unsigned requests, for example `s3fs.S3FileSystem(anon=True)`,
+  `botocore.UNSIGNED` in boto3, or `AWS_NO_SIGN_REQUEST=YES` for GDAL.
+- **Your own buckets:** grant the prefix, `aegc deploy <d> --grant read=s3://bucket/prefix/`.
+  Remember that `--grant` replaces the deployment's grants, so list them all.
+- **Requester-pays buckets:** grant the prefix and pass `RequestPayer="requester"` (boto3) or
+  `AWS_REQUEST_PAYER=requester` (GDAL). Without it, S3 denies the request.
+- **Reading back what tasks wrote:** a write grant doesn't allow reads; add a read grant on the
+  same prefix.
+- **Another account's bucket, or a KMS key:** the bucket policy must allow the worker role, and a
+  customer managed key must allow `kms:Decrypt`.
+
+See [Read and write your data](data.md).
+
+## aegc.outputs fails
+
+- **`PermissionError: no write grant: deploy with ...`:** the deployment has no write grant, or the
+  worker booted before you added it (workers read their grants at boot). Add
+  `--grant write=s3://bucket/prefix/`; new workers pick it up.
+- **`PermissionError: s3://... isn't inside a write grant (...)`:** `prefix=` points outside every
+  write grant. Use one of the grants listed, or add one.
+- **`ModuleNotFoundError: No module named 'aegc.outputs'`:** the worker image was built with an
+  older aegc. Rebuild it from the current source tree.
+- **An object containing a path, not the file:** `outputs.put("/scratch/x")` uploads the string.
+  Pass a `pathlib.Path`.
 
 ## Credentials in the endpoint
 
@@ -222,7 +251,20 @@ failed` meanwhile.
 - **`deployment name ... must be 1-20 chars`** (or `pool name ... 1-40`): names are lowercase
   letters, digits and hyphens, start with a letter, and don't end in or contain double hyphens.
   Pool names are `<env>-py<NNN>`, so envs can be up to 34 characters.
-- **`no image recorded for env 'x'`:** run `aegc image build --env x ...` first.
+- **`no image recorded for env 'x'`:** run `aegc image build --env x ...` or
+  `aegc image register --env x ...` first.
+- **`no 'x' image for Python 3.12; have 3.13, 3.14`:** `python=` names a minor the env has no
+  image for. Check `aegc image list --env x`.
+- **`unknown size class 'huge'; one of: ...`:** use `small`, `medium`, `mem`, `large` or `whole`.
+- **`size=large gives each task 8 vCPUs, so workers need at least that many: vcpu=4-8 is too
+  small`:** raise the low end of `vcpu=`, or leave `vcpu=` out and `deploy` picks it.
+- **`pool name ... must be 1-40 chars ... (with size=medium, env names can be at most 27
+  characters)`:** use a shorter env name for sized pools.
+- **Grant errors:** `a grant is read=s3://bucket/prefix or write=s3://...`, `s3://x has no prefix:
+  give s3://x/PREFIX, or s3://x/ to grant the whole bucket`, `grants can't use wildcards`,
+  `not a valid general purpose S3 bucket name`, `... is aegc's own bucket`, `--grant none clears
+  the grants; don't combine it with others`, and `deployment d's N grants need a ...-character IAM
+  policy, but the worker role has room for ...`: fix the `--grant` values; nothing was changed.
 - **`no default VPC in this region`:** aegc needs the region's default VPC.
 - **`max_vcpus=N is smaller than one worker`** or **`vcpu=LO-HI allows workers larger than
   max_vcpus=N`:** no worker may be larger than the pool; lower the top of `vcpu=` or raise
@@ -248,3 +290,29 @@ failed` meanwhile.
   `aegc destroy <d> --verify` later to check again, and `aegc footprint <d>` to see everything.
 - **`--hard fails running tasks; add --yes to confirm`** from `stop`: add `--yes`.
 - **`deployments still exist: ...`** from `unbootstrap`: destroy them first.
+
+## Building or registering images
+
+- **`give either --base REF or --base-tag TAG (with --source)`**, or argparse's `one of the
+  arguments --base-tag --base is required`: give exactly one.
+- **`pin the base image (...): use repo@sha256:... or an immutable tag, not latest or no tag`**
+  (or `pin the image` from `register`): use a digest or a dated tag.
+- **`aegc workers need Python >= 3.11`** during a `--base` build: the base's Python is too old, or
+  `--python` names the wrong one.
+- **pip can't resolve the install** during a `--base` build: the base pins a package at a version
+  `globus-compute-endpoint` can't use. Change the base, or build the image yourself and register it.
+- **`base env modified outside allowlist: ...`** during a conda build: installing
+  `globus-compute-endpoint` would change a package in the base.
+- **`<image> is amd64, not arm64: workers are Graviton`** from `register`: build with
+  `--platform linux/arm64`.
+- **`<image> has aegc 0.1.0; workers need aegc 0.2 or later`** from `register`: install the
+  current aegc wheel in the image.
+- **`register` fails with a Docker error** (a failed `docker pull`, or `selftest` failing): the
+  output above the traceback says which step. Check that you're logged in to the image's
+  registry, and that `aegc-worker selftest` passes in `docker run --rm <image> aegc-worker selftest`.
+- **Workers of a registered image never run tasks**, and the instances are replaced: check that
+  the image runs as uid 57439 (or root) and that its entrypoint runs its arguments; see
+  [Register an image you built](images.md#register-an-image-you-built).
+- **A rebuild changed nothing** (`... already exists (same aegc code and base); reusing it`): the
+  base reference and the aegc code are unchanged. If the base's contents changed under the same
+  tag, give it a new tag.

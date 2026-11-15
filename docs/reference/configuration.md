@@ -26,7 +26,7 @@ engine:
 | `amqp_port` | `5671` | AMQPS on 443 had cut connections and a reconnect race ([globus/globus-compute#2232](https://github.com/globus/globus-compute/issues/2232)). `configure` also adds it to the endpoint's `config.yaml`. |
 | `engine.type` | `AWSEngine` | Resolvable through the `.pth` hook installed with aegc. |
 | `engine.env` | from `user_endpoint_config`, else the `--env` given to `configure` | Default env for this process's tasks. |
-| `engine.python_minor` | the submitter's Python, e.g. `"3.14"` | Selects the worker image. |
+| `engine.python_minor` | the submitter's Python, e.g. `"3.14"` | Selects the pool for the env's image of that minor. |
 | `engine.max_retries_on_system_failure` | `1` | One resubmission after a worker system failure. |
 
 The endpoint's `user_environment.yaml` sets `AWS_REGION`, and `AWS_PROFILE` if one was given.
@@ -71,8 +71,14 @@ fails a task with any other:
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `env` | string | the engine's `env` | Run on the pool for this env |
-| `pool` | string | | Run on this exact pool (e.g. `geospatial-py314`); overrides `env` |
+| `pool` | string | | Run on this exact pool (e.g. `geospatial-py314`); overrides `env`, `size`, `cpus` and `memory_gib` |
 | `walltime_s` | integer, 1 to the pool's `max_walltime` (at most 41,400) | the pool's `walltime`, else 39,600 | Kill the task after this many seconds |
+| `size` | `small`, `medium`, `mem`, `large` or `whole` | | Run on a pool of this [size class](#size-classes); a pool without one counts as `small`. Overrides `cpus` and `memory_gib` |
+| `cpus` | positive number | | vCPUs the task needs: run on the cheapest pool whose tasks get at least this many |
+| `memory_gib` | positive number | | GiB the task needs: run on the cheapest pool whose tasks get at least this much |
+
+Common misspellings get a hint in the error: `vcpus`, `num_cores` and `cores` for `cpus`;
+`memory`, `mem` and `mem_per_worker` for `memory_gib`.
 
 ## Pool selection
 
@@ -84,10 +90,38 @@ For each task the engine:
    keys;
 3. with `pool`, uses that pool if it exists and its Python matches the submitter;
 4. otherwise takes the pools whose env is `resource_specification["env"]`, else the engine's `env`
-   (all pools if both are empty), keeps those whose image's Python minor matches the submitter (if
-   known), and picks the first by name;
-5. checks `walltime_s` against the chosen pool's `max_walltime`, or applies its default `walltime`;
-6. fails the task with an `AEGC_CONFIGURATION` error if any of this fails.
+   (all pools if both are empty), and keeps those whose image's Python minor matches the submitter
+   (if known);
+5. from those, with `size`, picks the first by name of that class; otherwise keeps the pools whose
+   tasks get at least `cpus` vCPUs and `memory_gib` GiB (both 0 if not given) and picks the
+   cheapest: the fewest vCPUs held per task (for `whole`, the top of `vcpu=`), then the least
+   memory per task, then the name;
+6. checks `walltime_s` against the chosen pool's `max_walltime`, or applies its default `walltime`;
+7. fails the task with an `AEGC_CONFIGURATION` error if any of this fails.
+
+## Size classes
+
+A pool's `size=` option ([src/aegc/sizes.py](../../src/aegc/sizes.py)) sets what one task gets.
+How to use them is in [Size classes](../how-to/configuration.md#size-classes).
+
+| Class | vCPUs per task | GiB per task | `MemoryGiBPerVCpu` minimum | Slots with `slots=auto` |
+|---|---|---|---|---|
+| (none) | 1 | about 2 (not a slot limit) | not set | one per vCPU |
+| `small` | 1 | 2 | not set | min(vCPUs, ⌊GiB ÷ 1.8⌋) |
+| `medium` | 2 | 8 | 4 | min(⌊vCPUs ÷ 2⌋, ⌊GiB ÷ 7.2⌋) |
+| `mem` | 2 | 16 | 8 | min(⌊vCPUs ÷ 2⌋, ⌊GiB ÷ 14.4⌋) |
+| `large` | 8 | 32 | 4 | min(⌊vCPUs ÷ 8⌋, ⌊GiB ÷ 28.8⌋) |
+| `whole` | the instance's | the instance's | not set | 1 |
+
+`GiB` is the memory the worker sees, a little under the instance's nominal size; the divisor is
+the class's memory × 0.9. Slots are always at least 1. `slots=N` overrides the count.
+
+For a sized pool, `deploy` sets the pool's `size_class`, `task_cpus`, `task_memory_gib` and
+`memory_gib_per_vcpu_min` in the manifest, adds `MemoryGiBPerVCpu` to the group's instance
+requirements (when the class sets one), and raises the low end of `vcpu=` to the class's vCPUs if
+`vcpu=` isn't given. For pool selection, a task in a `whole` pool is sure to get the low end of
+`vcpu=` and `mem=`. The scaler asks for the class's vCPUs per task (`whole`: the top of `vcpu=`).
+Pools without `size=` keep their launch template and user data unchanged.
 
 ## Pool settings
 
@@ -97,7 +131,7 @@ manifest. Settings that `--pool` doesn't expose are fixed:
 | Setting | Value |
 |---|---|
 | Allowed instance types | `c8g.*`, `m8g.*`, `r8g.*`, `c9g.*`, `m9g.*`, `r9g.*`, `c7g.*`, `m7g.*` |
-| Instance filters | AWS-designed CPUs, burstable types excluded |
+| Instance filters | AWS-designed CPUs, burstable types excluded; `MemoryGiBPerVCpu` from the [size class](#size-classes), if any |
 | Spot allocation | `price-capacity-optimized`, capacity rebalance on |
 | AMI | `/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id`, resolved at deploy |
 | Capacity | `DesiredCapacityType=vcpu`: minimum, maximum and desired capacity are vCPUs |
@@ -113,7 +147,9 @@ The launch template passes this to `aegc-worker run` as base64 JSON in `AEGC_WOR
 | Key | Value |
 |---|---|
 | `deployment`, `pool`, `region`, `task_queue_url`, `bucket` | From the deployment |
-| `slots` | The pool's `slots` (`auto` = the instance's CPU count) |
+| `slots` | The pool's `slots` (`auto` = the instance's CPU count, or what the size class fits) |
+| `size_class`, `task_cpus`, `task_memory_gib` | The pool's [size class](#size-classes); only for sized pools |
+| `grants` | The deployment's [grants](../how-to/data.md), `{access, bucket, prefix}` each; only when there are any. `aegc.outputs` reads the write grants from here |
 | `idle_timeout_s` | The pool's `idle` (300) |
 | `visibility_s` | 300; the heartbeat runs every `visibility_s / 3` = 100 s |
 | `max_deliveries` | 4 |

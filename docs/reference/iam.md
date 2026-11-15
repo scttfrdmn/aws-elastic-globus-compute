@@ -18,11 +18,12 @@ the command makes no AWS calls. The tests check these documents with the IAM pol
 | [operator](#operator) | The credentials the endpoint container runs with | `AWSEngine`; also `aegc cost`, `aegc limits --resume` and the spend lines of `aegc status` |
 | [deployer](#deployer) | The credentials you run `aegc deploy`, `destroy`, `stop`, `resume`, `limits`, `status`, `reap` and `footprint` with | The `aegc` CLI |
 | [bootstrap](#bootstrap) | The credentials you run `aegc bootstrap` and `unbootstrap` with | The `aegc` CLI |
-| [builder](#builder) | The credentials you run `aegc image build` with | The `aegc` CLI |
+| [builder](#builder) | The credentials you run `aegc image build`, `register` and `list` with | The `aegc` CLI |
 
-`aegc deploy` also creates two roles of its own, shown at the end: the
-[scheduler role](#scheduler-role) for the deployment lease, and (from `aegc bootstrap`) the
-[ECR creation template role](#ecr-creation-template-role).
+With [grants](../how-to/data.md), `aegc deploy` adds a second inline policy to the worker role,
+[`aegc-grants`](#aegc-grants), for your own S3 prefixes. It also creates two roles of its own,
+shown at the end: the [scheduler role](#scheduler-role) for the deployment lease, and (from
+`aegc bootstrap`) the [ECR creation template role](#ecr-creation-template-role).
 
 ## Why five
 
@@ -37,7 +38,7 @@ Sizes of the documents below, without whitespace:
 
 | Policy | Characters | Limit |
 |---|---|---|
-| worker | 1,619 | 10,240 (inline role policy) |
+| worker | 1,900 | 10,240 for all of the role's inline policies, `aegc-grants` included |
 | operator | 3,059 | 6,144 |
 | deployer | 5,767 | 6,144 |
 | bootstrap | 2,311 | 6,144 |
@@ -51,7 +52,8 @@ What a worker may do: consume the deployment's task queues, post to its result q
 payloads and write result payloads under `payloads/<d>/`, pull `aegc/*` images, write to its log
 group, terminate itself in an Auto Scaling group tagged with the deployment, read the deployment's
 state, and write its cost ledger record under `ledger/<d>/`. Nothing else; in particular no S3
-access outside those prefixes, so tasks must read open data unsigned.
+access outside those prefixes, so tasks read open data unsigned, and reach your own buckets only
+through [grants](#aegc-grants).
 
 `ShrinkToLeave` exists because a vCPU-weighted group refuses a decrement larger than its desired
 capacity (desired 1 vCPU, a 2-vCPU worker): the worker lowers desired by its own weight, then
@@ -184,6 +186,81 @@ The role trusts EC2:
   ]
 }
 ```
+
+## aegc-grants
+
+The worker role's second inline policy, for the deployment's
+[grants](../how-to/data.md): `aegc deploy --grant read=...` and `--grant write=...`. It exists only
+while the deployment has grants: `deploy` puts it after `aegc-worker`, `--grant none` deletes it,
+and `aegc destroy` deletes it with the role. `aegc iam-policy` doesn't print it; it depends on the
+grants. For
+
+```sh
+aegc deploy e2e --pool geospatial \
+  --grant read=s3://my-lab-data/inputs/ --grant write=s3://my-lab-results/runs/
+```
+
+it is:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "GrantRead",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:GetObjectVersion"
+      ],
+      "Resource": [
+        "arn:aws:s3:::my-lab-data/inputs/*"
+      ]
+    },
+    {
+      "Sid": "GrantList0",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::my-lab-data",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "inputs/*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "GrantWrite",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:AbortMultipartUpload",
+        "s3:ListMultipartUploadParts"
+      ],
+      "Resource": [
+        "arn:aws:s3:::my-lab-results/runs/*"
+      ]
+    }
+  ]
+}
+```
+
+- All read grants share one `GrantRead` statement, and all write grants one `GrantWrite`. Each
+  bucket with read grants gets a `GrantList<n>` statement, conditioned on its prefixes; a
+  whole-bucket grant (`s3://bucket/`) drops the condition.
+- Write grants don't allow `GetObject`, `DeleteObject` or listing.
+- Grants can't contain `*`, `?` or `${`, so the only wildcard is the `*` aegc appends to each
+  prefix.
+- IAM counts all of a role's inline policies against 10,240 characters, without whitespace.
+  `aegc-worker` takes about 1,900, and `deploy` refuses grants that don't fit in the rest, before
+  it changes anything. The policy above is 497 characters.
+- Requester-pays buckets need nothing more. Buckets in another account must also allow the worker
+  role in their bucket policy, and buckets encrypted with a customer managed KMS key need
+  `kms:Decrypt` or `kms:GenerateDataKey` on the key, which aegc doesn't add.
+
+The [deployer](#deployer) policy already allows `iam:PutRolePolicy` and `iam:DeleteRolePolicy` on roles
+under `/aegc/`, so grants need no extra permissions to deploy.
 
 ## operator
 
@@ -879,9 +956,11 @@ repositories, and `/aegc/bootstrap`. Roles can be passed only to ECR.
 
 ## builder
 
-What `aegc image build` needs: pull a base image through the `aegc-quay` pull-through cache (the
-first pull of a base creates its cache repository), create and push to `aegc/<env>` repositories,
-and record images under `/aegc/images/`. The cache repositories are read-only to it.
+What `aegc image build`, `aegc image register` and `aegc image list` need: pull a base image
+through the `aegc-quay` pull-through cache (the first pull of a base creates its cache repository),
+create and push to `aegc/<env>` repositories, and read and record images under `/aegc/images/`.
+The cache repositories are read-only to it. A `--base` or `register` image from another registry
+is pulled with your own Docker login there, not with this policy.
 
 ```json
 {

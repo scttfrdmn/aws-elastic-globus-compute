@@ -29,9 +29,10 @@ flowchart LR
 - **Every connection is outbound.** The endpoint talks to Globus over AMQPS and to AWS APIs over
   HTTPS. Workers talk to AWS APIs. Nothing connects in to the laptop, and the workers' security group
   has no ingress rules.
-- **Containers on stock AMIs.** Worker images are thin layers over the arm64 environments from
-  [aarch.science](https://aarch.science/), with `globus-compute-endpoint` and the aegc worker added.
-  Images are pinned by digest.
+- **Containers on stock AMIs.** Worker images are thin layers over any arm64 image with Python
+  3.11 or later, such as the environments from [aarch.science](https://aarch.science/) and
+  [aarch.bio](https://aarch.bio/) or your own, with `globus-compute-endpoint` and the aegc worker
+  added. Images are pinned by digest. See [Build or bring worker images](how-to/images.md).
 - **Managed with boto3.** No CloudFormation. Every resource is tagged when it's created, and aegc
   only deletes resources that carry its tags. Destructive commands are dry runs unless you pass
   `--yes`.
@@ -42,7 +43,9 @@ submit host, which needs tunnels or exposed ports.
 
 !!! note "Status"
     An early 0.x release: v0.2.0 adds spend limits, `aegc stop`, a deployment lease and the cost
-    ledger to v0.1.0. Expect more changes before later 0.x versions.
+    ledger to v0.1.0. These pages describe the main branch, which adds bring-your-own images,
+    several Python minors per env, data-access grants, `aegc.outputs` and size classes (not yet
+    released). Expect more changes before later 0.x versions.
     Work is tracked in the repository's
     [issues](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues) and
     [milestones](https://github.com/scttfrdmn/aws-elastic-globus-compute/milestones).

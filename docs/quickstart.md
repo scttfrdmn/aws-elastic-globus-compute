@@ -62,7 +62,12 @@ smoke test and `aegc-worker selftest`, reads the image's Python version, pushes 
 `aegc/geospatial`, and records the pinned digest at `/aegc/images/geospatial`. That [aarchsci](https://aarch.science/) build
 runs Python 3.14.
 
-Use an immutable base tag, never `latest`. See [Worker images](how-to/images.md).
+Use an immutable base tag, never `latest`.
+
+aarchsci is just the quickest start. Any `linux/arm64` image with Python 3.11 or later works:
+`aegc image build --env myenv --base python:3.13-slim@sha256:...` builds from one, and
+`aegc image register` brings in an image you built yourself. See
+[Build or bring worker images](how-to/images.md).
 
 ## 3. Deploy a pool
 
@@ -110,8 +115,10 @@ host and Python, then 10 squares (`-n` changes the count). The first result wait
 in the live run that took 39 s from zero workers.
 
 From your own code, use the Globus Compute SDK with the endpoint id. **Your Python minor version
-must match a worker image** (3.14 here); a 3.13 client gets an error instead of a result. See
-[Troubleshooting](how-to/troubleshooting.md#python-version-mismatch).
+must match a worker image** (3.14 here); a 3.13 client gets an error instead of a result, unless
+you add a 3.13 image to the env (see
+[Several Python minors per env](how-to/images.md#several-python-minors-per-env) and
+[Troubleshooting](how-to/troubleshooting.md#python-version-mismatch)).
 
 ```python
 from globus_compute_sdk import Executor
@@ -131,6 +138,10 @@ with Executor(
 
 `amqp_port=5671` avoids dropped AMQPS connections on port 443
 ([globus/globus-compute#2232](https://github.com/globus/globus-compute/issues/2232)).
+
+Next steps: [size classes](how-to/configuration.md#size-classes) for tasks that need more than
+1 vCPU and 2 GiB, and [grants and `aegc.outputs`](how-to/data.md) for reading your own buckets
+and returning results larger than 10 MB.
 
 ## 6. Watch it
 

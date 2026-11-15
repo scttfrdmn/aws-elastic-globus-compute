@@ -57,7 +57,8 @@ nav:
       - Cost: concepts/cost.md
   - How-to:
       - Configure pools and endpoints: how-to/configuration.md
-      - Build worker images: how-to/images.md
+      - Build or bring worker images: how-to/images.md
+      - Read and write your data: how-to/data.md
       - Operate a deployment: how-to/operations.md
       - Troubleshooting: how-to/troubleshooting.md
   - Reference:

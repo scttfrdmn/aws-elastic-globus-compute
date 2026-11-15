@@ -8,11 +8,12 @@ nothing needs an inbound port or a cluster to look after.
 
 - **Fan-out from a laptop.** Submit hundreds or thousands of functions; a pool scales out to its
   maximum, then back to zero about 5 minutes after the work stops.
-- **Compute next to open data.** Workers run in the AWS region, so they can read public datasets
-  there (for example Sentinel-2 COGs in us-west-2) without moving them, as long as the reads are
-  unsigned (see below).
-- **Pinned, reproducible environments.** Every worker runs a science image pinned by digest, built
-  over a dated [aarchsci](https://aarch.science/) release.
+- **Compute next to data.** Workers run in the AWS region, so they can read public datasets there
+  (for example Sentinel-2 COGs in us-west-2) without moving them, unsigned, and your own or
+  requester-pays buckets through [grants](../how-to/data.md).
+- **Pinned, reproducible environments.** Every worker runs an image pinned by digest: a dated
+  [aarchsci](https://aarch.science/) or [aarchbio](https://aarch.bio/) release, or any arm64 image
+  of your own ([Worker images](../how-to/images.md)).
 - **Mixed Globus Compute setups.** The same function can go to a campus endpoint or to an aegc
   endpoint; only the endpoint id changes.
 - **Spot pricing.** Pools use Spot by default. An interrupted task is released at once and rerun
@@ -32,25 +33,21 @@ These are the current limits. Numbers come from the live run in
   reach AWS only while it's running. Results produced while it's down wait in SQS for up to 14 days
   and are delivered when it comes back. A cloud-hosted endpoint is tracked in
   [#22](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/22).
-- **Python 3.14 only, for now.** The submitter's Python minor version must match a worker image, and
-  the aarchsci images run 3.14. Each env has one recorded image, so one Python version, at a time.
-  A 3.13 client gets an error, not a result.
+- **Python must match.** The submitter's Python minor version must match a worker image. The
+  aarchsci images run 3.14; for other minors, build or register an image per minor (an env can
+  have several). A client on a minor with no image gets an error, not a result.
 - **Walltime is capped at 41,400 s (11.5 h)**; the default is 39,600 s (11 h). SQS can't hold a
   claim past 12 hours. Longer tasks are tracked in
   [#19](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/19).
 - **Payload size.** Globus Compute itself limits task and result sizes (about 10 MB). aegc's S3
-  offload only covers the hop between the endpoint and the workers. Return references to large
-  outputs, not the outputs.
-- **Workers can reach only aegc's own resources.** The worker role allows aegc's queues, its
-  payload prefix, its image repositories and its log group, and nothing else. Reading open data
-  works only with **unsigned** requests: a request signed with the worker's credentials is denied,
-  because the role has no S3 read permission outside the payload prefix. There is no way yet to
-  grant access to requester-pays data, private buckets, or an output bucket. This is a real
-  limitation; see [Security model](security.md#data-access).
-- **Only aarchsci and aarchbio images.** Worker images are built over
-  [aarch.science](https://aarch.science/) environments or [aarch.bio](https://aarch.bio/) tools.
-  Bringing your own arm64 image isn't supported yet
-  ([#67](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/67)).
+  offload only covers the hop between the endpoint and the workers. Write large outputs to S3 with
+  [`aegc.outputs`](../how-to/data.md#return-large-outputs) and return the URI.
+- **Workers reach only what you grant.** The worker role allows aegc's queues, its payload prefix,
+  its image repositories and its log group. Open data is read with **unsigned** requests; your own
+  buckets, requester-pays data and output buckets need a `--grant` per prefix. Grants are shared by
+  every task in the deployment; see [Security model](security.md#data-access).
+- **Images must be arm64 with Python 3.11 or later.** Any such image works as a base, or as a
+  registered image with aegc in it; see [Worker images](../how-to/images.md).
 - **Spend limits are estimates.** They count instance time, volumes and IPv4 addresses from the
   workers' own ledger, are checked only while an endpoint runs, and can be overshot by a few
   minutes of spend plus running tasks. See [Spend limits](cost.md#spend-limits).
@@ -58,9 +55,10 @@ These are the current limits. Numbers come from the live run in
   x86-64 won't run.
 - **Spot vCPU quota.** A pool can't grow past the account's Spot quota for standard instances. When
   it's exhausted the group stays below its desired capacity; `aegc status` shows the scaling error.
-- **Simple pools.** One pool per env in a deployment, chosen by env and Python version.
-  `resource_specification` accepts only `env`, `pool` and `walltime_s`; there are no size classes
-  yet ([#18](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/18)).
+- **Fixed size classes.** Tasks get 1 vCPU and 2 GiB by default, or one of five
+  [size classes](../how-to/configuration.md#size-classes) up to 8 vCPUs and 32 GiB, or a whole
+  instance. Each class is its own pool, and `resource_specification` picks one by `size`, or by
+  `cpus` and `memory_gib`. There's no per-task memory enforcement: tasks on a worker share it.
 - **At-least-once delivery.** A task can run more than once (after a lost worker or a Spot
   interruption, for example). Write functions so a rerun is harmless. See
   [Delivery and idempotency](delivery.md).
@@ -77,5 +75,4 @@ These are the current limits. Numbers come from the live run in
   is proposed in [#21](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/21).
 - **GPU, MPI or tightly coupled jobs:** use an HPC cluster's Globus Compute endpoint, or AWS
   ParallelCluster or Batch.
-- **Private or requester-pays data in S3:** wait for data-access grants, or copy the data out first.
 - **Tasks longer than 11.5 hours:** split them, or wait for #19.

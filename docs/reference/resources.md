@@ -1,8 +1,8 @@
 # Resources and tags
 
 Everything aegc creates in AWS, with its name, its `aegc:role` tag, and what creates and deletes
-it. `<d>` is the deployment, `<pool>` the pool (`<env>-py<NNN>`), `<account>` and `<region>` the
-account and region.
+it. `<d>` is the deployment, `<pool>` the pool (`<env>-py<NNN>`, or `<env>-py<NNN>-<size>` with a
+[size class](configuration.md#size-classes)), `<account>` and `<region>` the account and region.
 
 ## Tags
 
@@ -48,14 +48,19 @@ policy, and two lifecycle rules: `aegc-expire-payloads` expires `payloads/` afte
 `aegc-expire-ledger` expires `ledger/` after 400 days. A bucket bootstrapped by v0.1 gets the ledger
 rule the next time you run `aegc bootstrap`.
 
-## Images: aegc image build
+## Images: aegc image build and register
 
 Not deleted by any aegc command.
 
 | Resource | Name | `aegc:role` |
 |---|---|---|
 | ECR repository (immutable tags, scan on push, keeps 10 images plus those tagged `inuse-`) | `aegc/<env>` | `image-repo` |
-| SSM parameter: `{env, python_minor, image, tag, base, gce_version, aegc_version, built_at}` | `/aegc/images/<env>` | `image-record` |
+| SSM parameter: `{"records": {<minor>: {env, python_minor, image, tag, base, gce_version, aegc_version, built_at, base_kind, python}}}`, one record per Python minor | `/aegc/images/<env>` | `image-record` |
+
+`base_kind` is `conda`, `pip` or `registered`, and `python` the interpreter the worker runs. A
+record written by aegc 0.2 or earlier (a single record, without `records`) still reads, and the
+next build or registration converts it. `aegc image register` pushes your image into the same
+repository; the image you registered from is left where it was.
 
 ## Deployment: aegc deploy
 
@@ -63,7 +68,7 @@ Deleted by `aegc destroy`.
 
 | Resource | Name | `aegc:role` |
 |---|---|---|
-| IAM role, path `/aegc/`, inline policy `aegc-worker`, trusts EC2 | `aegc-<d>-worker-<region>` | `worker-role` |
+| IAM role, path `/aegc/`, inline policies `aegc-worker` and, with [grants](../how-to/data.md), `aegc-grants`; trusts EC2 | `aegc-<d>-worker-<region>` | `worker-role` |
 | IAM instance profile, path `/aegc/` | `aegc-<d>-worker-<region>` | `worker-role` |
 | EC2 security group, no ingress, in the default VPC | `aegc-<d>-workers` | `sg` |
 | CloudWatch log group, 14-day retention | `/aegc/<d>` | `logs` |
@@ -107,6 +112,12 @@ a redeploy with no changes adds no version.
 |---|---|---|---|
 | S3 objects (the [cost ledger](../concepts/cost.md#cost-ledger), one JSON record per instance) | `ledger/<d>/<yyyy-mm-dd>/<instance-id>.json`, dated by the instance's boot (UTC) | — | the 400-day lifecycle rule; not `aegc destroy` |
 
+## Tasks: aegc.outputs
+
+| Resource | Name | Deleted by |
+|---|---|---|
+| S3 objects in your bucket, under a write grant | `<grant prefix>/<task uuid>/<name>` | you; aegc never deletes them, and never creates, changes or deletes the buckets it's granted |
+
 ## On your machine: aegc endpoint
 
 | Resource | Name |
@@ -120,10 +131,11 @@ a redeploy with no changes adds no version.
 `/aegc/<d>/manifest` is JSON written at the end of each `aegc deploy`. It holds the deployment,
 region, account, bucket, instance profile ARN, security group and subnets; for each pool its
 settings (env, Python, image digest, `min_vcpus`/`max_vcpus` and `capacity_type: vcpu`, sizes,
-slots, idle timeout, volume, walltimes, lifetime, instance types) and the URLs and names of its
-queues, launch template and group; `limits` (`max_usd_day`, `max_usd_month`,
-`max_instance_hours_day`, `on_cap`); `lease` (`lease_s`, `ttl_at`); and `generation`, a hash of
-the rest, which engines compare to notice a redeploy. `aegc limits` rewrites it. `AWSEngine` and
+slots, idle timeout, volume, walltimes, lifetime, instance types, and the size class:
+`size_class`, `task_cpus`, `task_memory_gib`, `memory_gib_per_vcpu_min`) and the URLs and names
+of its queues, launch template and group; `limits` (`max_usd_day`, `max_usd_month`,
+`max_instance_hours_day`, `on_cap`); `lease` (`lease_s`, `ttl_at`); `grants`
+(`{access, bucket, prefix}` each); and `generation`, a hash of the rest, which engines compare to notice a redeploy. `aegc limits` rewrites it. `AWSEngine` and
 `aegc status` read it.
 
 ## State

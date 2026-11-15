@@ -7,6 +7,31 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Bring your own worker image:** `aegc image build --env NAME --base REF` builds a worker image
+  from any pinned `linux/arm64` image with Python 3.11 or later, not only aarchsci and aarchbio.
+  micromamba/conda bases use `templates/worker/Dockerfile`; others use the new
+  `templates/worker/Dockerfile.pip`, which pip-installs `globus-compute-endpoint` and aegc with
+  the base's packages as constraints, puts `aegc-worker` on `PATH`, and runs as uid 57439.
+  `--python PATH` names the base's Python. `aegc image register --env NAME --image REF@sha256:...`
+  records an image you built yourself, after checking that it's arm64 and pinned, has aegc 0.2 or
+  later, and passes `aegc-worker selftest`; it's copied into `aegc/<env>`. `aegc image list --env
+  NAME` shows an env's images (#67).
+- **Several Python minors per env:** `/aegc/images/<env>` keeps one record per Python minor, and a
+  build or registration replaces only its own. `aegc deploy --pool env` makes one pool per minor
+  (`<env>-py313`, `<env>-py314`) and each client's tasks go to the pool for its Python;
+  `python=3.13` deploys just one. Records written by 0.2 still read (#58).
+- **Size classes:** the pool option `size=small|medium|mem|large|whole` gives each task 1 vCPU and
+  2 GiB, 2 and 8, 2 and 16, 8 and 32, or a whole instance. It names the pool
+  `<env>-py<NNN>-<size>`, sets `MemoryGiBPerVCpu` for instance selection, raises the low end of
+  `vcpu=` to fit a task, and sets the workers' slots from both vCPUs and memory. Tasks choose with
+  `resource_specification={"size": ...}`, or `{"cpus": N, "memory_gib": M}` for the cheapest pool
+  that fits; `vcpus`, `memory` and similar get a "did you mean" hint. Pools without `size=` keep
+  their name, launch template and user data. Sized pools need worker images, and the size keys
+  an endpoint image, built from this release. Workers record the host's vCPUs in the cost ledger,
+  not their slot count (#18).
+- Docs: a how-to for bringing your own image and for several Python minors, a how-to for grants
+  and `aegc.outputs`, size classes in the configuration guide and reference, and the
+  `aegc-grants` policy in the IAM reference.
 - **Worker data-access grants:** `aegc deploy <d> --grant read=s3://bucket/prefix --grant
   write=s3://bucket/prefix` (repeatable) lets every task in the deployment read or write under
   your own S3 prefixes, through the worker role's inline policy `aegc-grants`. Read grants allow

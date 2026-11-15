@@ -17,7 +17,7 @@
 
 | Identity | Who uses it | Scope |
 |---|---|---|
-| **worker** role, `aegc-<d>-worker-<region>` | Worker instances, through an instance profile | The deployment's task queues (receive, delete, extend), its result queues (send), `payloads/<d>/tasks/*` (read) and `payloads/<d>/results/*` (write), pulls from `aegc/*` ECR repositories, its log group, terminating instances in groups tagged with the deployment, reading the deployment state, and writing `ledger/<d>/*` |
+| **worker** role, `aegc-<d>-worker-<region>` | Worker instances, through an instance profile | The deployment's task queues (receive, delete, extend), its result queues (send), `payloads/<d>/tasks/*` (read) and `payloads/<d>/results/*` (write), pulls from `aegc/*` ECR repositories, its log group, terminating instances in groups tagged with the deployment, reading the deployment state, and writing `ledger/<d>/*`; plus, with grants, reading or writing under your granted S3 prefixes (`aegc-grants`) |
 | **operator** | The endpoint container's AWS credentials | Reading the deployment's parameters, sending tasks, creating and reading its own result queues, payloads, `SetDesiredCapacity` and `UpdateAutoScalingGroup` on groups tagged with the deployment, receiving and deleting on its task queues, writing its state, reading its ledger, prices and Cost Explorer, and renewing its lease |
 | **deployer** | Whoever runs `aegc deploy`, `destroy`, `stop`, `resume` | Creates conditioned on the `aegc:managed=true` request tag, changes and deletes on the resource tag where the service supports it; IAM limited to the `/aegc/` path; roles passed only to EC2 and EventBridge Scheduler |
 | **bootstrap** | Whoever runs `aegc bootstrap`, `unbootstrap` | The payload bucket, the pull-through cache and its template and role, `/aegc/bootstrap`; roles passed only to ECR |
@@ -38,7 +38,9 @@ whole deployment:
 - send messages, including forged results, to the deployment's result queues,
 - terminate the deployment's worker instances,
 - overwrite cost ledger records under `ledger/<d>/`, which makes `aegc cost` wrong and can hide
-  spend from the [spend limits](cost.md#spend-limits) or trip them early.
+  spend from the [spend limits](cost.md#spend-limits) or trip them early,
+- read everything under the deployment's read grants, and overwrite anything under its write
+  grants (see [Data access](#data-access)).
 
 Spend limits guard against runaway scaling and forgotten deployments, not against the code you run.
 Keep an AWS Budget on the account as well.
@@ -61,20 +63,34 @@ dotted path named in a message.
 
 ## Data access
 
-The worker role has no access to S3 beyond the deployment's payload prefix. As a result:
+Without grants, the worker role has no access to S3 beyond the deployment's payload prefix:
 
 - **Open data must be read unsigned.** A signed request from the worker role is denied even for a
   public bucket, because the role's own policy doesn't allow it. Use anonymous access in your code,
   for example `s3fs.S3FileSystem(anon=True)`, `botocore.UNSIGNED` as the signature version in boto3,
   or `AWS_NO_SIGN_REQUEST=YES` for GDAL.
-- **Requester-pays data, private buckets and output buckets aren't reachable.** There is no
-  setting yet to grant the worker role more access. aegc doesn't manage policies you add to the
-  role yourself, and a managed policy attached by hand makes `aegc destroy` fail when it deletes
-  the role (it removes only inline policies).
-- **Outputs come back as results**, within Globus Compute's size limit.
+- **Your own buckets, and requester-pays data, need a grant.**
+  `aegc deploy <d> --grant read=s3://bucket/prefix` and `--grant write=s3://bucket/prefix` add the
+  inline policy [`aegc-grants`](../reference/iam.md#aegc-grants) to the worker role. Read grants
+  allow getting and listing objects under the prefix; write grants allow putting them, multipart
+  included, but not reading or deleting. See [Read and write your data](../how-to/data.md).
+- **Large outputs** go to a write grant with [`aegc.outputs`](../how-to/data.md#return-large-outputs),
+  and only their `s3://` URI comes back through Globus Compute.
 
-This is a limitation, not a recommendation. Data-access grants are listed as gap G1 in
-[#16](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/16).
+**A grant extends the deployment's trust domain.** It's granted to the worker role, and every task
+in the deployment runs with that role, so every task can use every grant, whoever submitted it.
+Anyone who can submit to the deployment's endpoints can read all of a read grant and overwrite
+anything under a write grant, including other tasks' outputs. Grant the narrowest prefixes that do
+the job, keep data some submitters mustn't see in a separate deployment, and consider S3
+Versioning on buckets you grant writes to.
+
+Grants are checked before anything changes: no wildcards or policy variables, valid general
+purpose bucket names, not aegc's own bucket, and no more than fit in the role's inline policies.
+aegc refers to granted buckets but never creates, changes or deletes them or their policies.
+
+aegc doesn't manage policies you add to the worker role yourself. `aegc deploy` rewrites
+`aegc-worker` and `aegc-grants` on every run, and a managed policy attached by hand makes
+`aegc destroy` fail when it deletes the role (it removes only inline policies). Use grants instead.
 
 ## Data at rest and in transit
 
@@ -91,12 +107,16 @@ This is a limitation, not a recommendation. Data-access grants are listed as gap
 
 - Worker images are pinned by digest in the launch template; a tag is never resolved at boot.
 - ECR repositories `aegc/<env>` have immutable tags and scan on push.
-- Bases come from quay.io through the `aegc-quay` pull-through cache. aegc pins the base tag you
-  name, but doesn't verify the upstream image signatures itself. Only aarchsci and aarchbio bases
-  are supported; bringing your own image is tracked in
-  [#67](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/67).
-- The build fails if installing `globus-compute-endpoint` changes any package already in the base
-  image, except `click`.
+- aarchsci and aarchbio bases come from quay.io through the `aegc-quay` pull-through cache. Other
+  bases (`aegc image build --base`) and registered images (`aegc image register`) are pulled from
+  their own registries with your Docker login, then copied into `aegc/<env>`; workers pull only
+  from ECR. aegc pins the reference you give, but doesn't verify upstream image signatures itself.
+  You're responsible for what's in an image you bring.
+- The conda build fails if installing `globus-compute-endpoint` changes any package already in the
+  base image, except `click`. The pip build installs with the base's packages as constraints, so
+  it fails rather than change them.
+- `aegc image register` checks that an image is arm64 and pinned, has aegc 0.2 or later, and
+  passes `aegc-worker selftest`. It doesn't inspect what else the image contains or does.
 
 ## Ownership: delete only what aegc created
 

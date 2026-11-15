@@ -13,9 +13,14 @@ endpoint (laptop container) ─ AWSEngine ─▶ SQS tasks ◀── Graviton wo
 
 - **Every connection is outbound.** The endpoint and the workers both talk to AWS APIs; nothing dials
   in to the laptop.
-- **Containers on stock AMIs.** Worker images are thin layers over the signed arm64 images from
-  [aarch.science](https://aarch.science/) and [aarch.bio](https://aarch.bio/), with
-  `globus-compute-endpoint` added. Each image is selected to match the submitter's Python version.
+- **Containers on stock AMIs.** Worker images are thin layers over any `linux/arm64` image with
+  Python 3.11 or later: the signed images from [aarch.science](https://aarch.science/) and
+  [aarch.bio](https://aarch.bio/), `python:3.13-slim`, or your own, with `globus-compute-endpoint`
+  added. An env can have an image per Python minor, and each task goes to the one matching its
+  submitter's Python.
+- **Your data, any size.** Grants let tasks read and write your own S3 prefixes (requester-pays
+  included), `aegc.outputs` returns results over Globus Compute's 10 MB limit as `s3://` URIs, and
+  size classes give tasks up to 8 vCPUs and 32 GiB, or a whole instance.
 - **Managed with boto3.** Every resource is tagged when it's created, and the tool only ever deletes
   resources that carry its tags.
 
@@ -27,7 +32,8 @@ endpoint (laptop container) ─ AWSEngine ─▶ SQS tasks ◀── Graviton wo
 ## Status
 
 Early release (0.x): v0.2.0 adds spend limits, stop and resume, a deployment lease and a cost
-ledger to v0.1.0. Work is tracked in this repo's issues, milestones and project board.
+ledger to v0.1.0. The main branch adds bring-your-own images, several Python minors per env,
+data-access grants, `aegc.outputs` and size classes, not yet released. Work is tracked in this repo's issues, milestones and project board.
 
 Sister projects:
 - [aws-elastic-gcs](https://github.com/scttfrdmn/aws-elastic-gcs): elastic Globus Connect Server.

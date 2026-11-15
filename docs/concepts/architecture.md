@@ -68,7 +68,8 @@ instance outlives its lifetime plus the pool's longest walltime plus 15 minutes;
 minimum, it terminates it without lowering desired capacity, so the group launches a replacement.
 
 **The worker agent** ([src/aegc/worker/agent.py](../../src/aegc/worker/agent.py)) runs one task per
-slot (by default one slot per vCPU). Each task runs Globus Compute's own `execute_task` in a fresh
+slot (by default one slot per vCPU; a [size class](../how-to/configuration.md#size-classes)
+gives each task more). Each task runs Globus Compute's own `execute_task` in a fresh
 child process, forked from a server that has already imported Globus Compute, so a task starts in
 about 30 ms. The worker enforces walltime by killing the child's process group. It also reads the
 deployment state every 60 s, stops claiming after its lifetime (24 hours by default; at the group's
@@ -79,9 +80,12 @@ its [cost ledger](cost.md#cost-ledger) record at start, every 5 minutes and at e
 encoded. Larger bodies go to the region's payload bucket under `payloads/<d>/` and the message
 carries a pointer with a SHA-256 checksum.
 
-**Images.** Worker images live in ECR as `aegc/<env>`, built by `aegc image build` over an
-[aarchsci](https://aarch.science/) environment (or an [aarchbio](https://aarch.bio/) tool image). Bases are pulled through the `aegc-quay` ECR pull-through cache, so pulls stay
-in-region.
+**Images.** Worker images live in ECR as `aegc/<env>`, one per Python minor. `aegc image build`
+makes them over an [aarchsci](https://aarch.science/) environment, an
+[aarchbio](https://aarch.bio/) tool image, or any arm64 image with Python 3.11 or later, and
+`aegc image register` brings in one you built. aarchsci and aarchbio bases are pulled through the
+`aegc-quay` ECR pull-through cache, so pulls stay in-region. See
+[Worker images](../how-to/images.md).
 
 ## Task path
 
@@ -203,7 +207,7 @@ refuses a `vcpu=` range that does, and narrows the default range to fit a small 
 example `max_vcpus=4` gives `vcpu=2-4`).
 
 The scaler asks for the vCPUs that the pool's demand needs (queued plus running tasks): with
-`slots=auto`, one vCPU per task; with `slots=N`, one worker of the pool's smallest size per N tasks.
+`slots=auto`, one vCPU per task, or the size class's vCPUs per task (`whole`: the top of `vcpu=`); with `slots=N`, one worker of the pool's smallest size per N tasks.
 Under spend limits, the scaler asks in whole workers of the smallest size (a 1-vCPU demand becomes
 a 2-vCPU worker) and admits whole workers. Auto Scaling can launch an instance larger than the
 vCPUs it still needs, so a group can end up somewhat above its desired capacity; a narrow `vcpu=`
@@ -217,9 +221,10 @@ converted with the smallest size, with a warning.
 ## Python matching
 
 Globus Compute serializes functions with the submitter's Python, so the worker must run the same
-Python minor version. `aegc image build` reads the Python version from the image it built, and the
-pool name records it (`-py314`). The engine routes each task to a pool whose image matches the
-submitter. If there is none, the task fails with:
+Python minor version. `aegc image build` and `aegc image register` read the Python version from
+the image, and the env's record keeps one image per minor. `aegc deploy` makes a pool for each,
+and the pool name records it (`-py314`, `-py313`). The engine routes each task to the pool whose
+image matches the submitter. If there is none, the task fails with:
 
 ```
 no worker image for Python 3.13 in env 'geospatial'; available: 3.14 (geospatial-py314). Submit
@@ -228,7 +233,8 @@ from a matching Python version.
 
 The endpoint process itself never deserializes user functions, so the endpoint image's Python
 doesn't have to match. It defaults to 3.14 so that `aegc endpoint test`, which submits from inside
-the container, matches the aarchsci images.
+the container, matches the aarchsci images; `aegc endpoint build --python 3.13` tests a 3.13 pool
+instead.
 
 ## Design choices
 
