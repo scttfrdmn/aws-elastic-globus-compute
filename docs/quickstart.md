@@ -80,11 +80,12 @@ The endpoint runs in a container on your machine, with `~/.aws` mounted read-onl
 login kept in the Docker volume `aegc-endpoint-home`.
 
 ```sh
-EP="--name aegc-e2e --deployment e2e --env geospatial"
-aegc endpoint $EP build       # builds the local image aegc-endpoint (Python 3.14)
-aegc endpoint $EP login       # interactive Globus login; follow the URL it prints
-aegc endpoint $EP configure   # writes the endpoint config for deployment e2e, env geospatial
-aegc endpoint $EP start       # prints: started aegc-endpoint-aegc-e2e; endpoint id <uuid>
+# A shell function, so this works in zsh (the macOS default) as well as bash.
+ep() { aegc endpoint --name aegc-e2e --deployment e2e --env geospatial "$@"; }
+ep build         # builds the local image aegc-endpoint (Python 3.14)
+ep login         # interactive Globus login; follow the URL it prints
+ep configure     # writes the endpoint config for deployment e2e, env geospatial
+ep start         # prints: started aegc-endpoint-aegc-e2e; endpoint id <uuid>
 ```
 
 Note the endpoint id. `start` runs the container with `--restart unless-stopped`.
@@ -92,7 +93,7 @@ Note the endpoint id. `start` runs the container with `--restart unless-stopped`
 ## 5. Submit tasks
 
 ```sh
-aegc endpoint $EP test
+ep test
 ```
 
 `test` submits from inside the endpoint container (Python 3.14): one task that reports the worker's
@@ -132,7 +133,7 @@ after the last task.
 ## 7. Tear down
 
 ```sh
-aegc endpoint $EP stop
+ep stop
 aegc destroy e2e          # dry run: lists what would be deleted
 aegc destroy e2e --yes    # deletes it
 ```

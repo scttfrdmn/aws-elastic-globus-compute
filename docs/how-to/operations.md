@@ -27,12 +27,13 @@ deployment e2e (us-west-2)
 ## Run the endpoint
 
 ```sh
-EP="--name aegc-e2e --deployment e2e --env geospatial"
-aegc endpoint $EP start    # start the container (restarts with Docker unless stopped)
-aegc endpoint $EP logs     # follow the container's log
-aegc endpoint $EP id       # print the endpoint id
-aegc endpoint $EP test     # submit a probe task and 10 squares (-n N for more)
-aegc endpoint $EP stop     # stop the endpoint cleanly, then the container
+# A shell function, so this works in zsh (the macOS default) as well as bash.
+ep() { aegc endpoint --name aegc-e2e --deployment e2e --env geospatial "$@"; }
+ep start         # start the container (restarts with Docker unless stopped)
+ep logs          # follow the container's log
+ep id            # print the endpoint id
+ep test          # submit a probe task and 10 squares (-n N for more)
+ep stop          # stop the endpoint cleanly, then the container
 ```
 
 `stop` runs `globus-compute-endpoint stop` inside the container before stopping it; a bare
@@ -46,7 +47,7 @@ when idle, and results wait in the result queue for up to 14 days.
 
 ## Read logs
 
-- **Endpoint:** `aegc endpoint $EP logs` follows the container's output. Engine messages
+- **Endpoint:** `ep logs` follows the container's output. Engine messages
   (`aegc.engine`) go to the user endpoint process's log under `/home/gc/.globus_compute/` in the
   container. To find them:
 
