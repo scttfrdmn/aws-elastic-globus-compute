@@ -469,6 +469,19 @@ def deployer_policy(*, region: str, account: str) -> dict[str, Any]:
                 ],
             },
             {
+                # deploy tags the images it pins inuse-<d>-..., so the lifecycle keeps them (#27).
+                "Sid": "EcrInUseTags",
+                "Effect": "Allow",
+                "Action": [
+                    "ecr:BatchGetImage",
+                    "ecr:PutImage",
+                    "ecr:BatchDeleteImage",
+                    "ecr:DescribeImages",
+                    "ecr:PutLifecyclePolicy",
+                ],
+                "Resource": f"arn:aws:ecr:{r}:{a}:repository/{p}/*",
+            },
+            {
                 "Sid": "Identity",
                 "Effect": "Allow",
                 "Action": "sts:GetCallerIdentity",

@@ -23,17 +23,33 @@ from pathlib import Path
 from typing import Any
 
 from aegc import __version__, naming
-from aegc.awsutil import is_not_found
-from aegc.infra import OwnershipError, Report
+from aegc.awsutil import error_code, is_not_found, paginate
+from aegc.infra import Outcome, OwnershipError, Report
 
 DEFAULT_GCE_VERSION = "4.21.0"
 SOURCES = {"aarchsci": "aarchsci", "aarchbio": "aarchbio"}
 #: Packages globus-compute-endpoint may downgrade in a science image (spike #2).
 DEFAULT_ALLOW_CHANGE = ("click",)
+#: Tag prefix that pins an image a deployment uses: ``inuse-<deployment>-<digest12>`` (#27).
+INUSE_PREFIX = "inuse-"
 LIFECYCLE = {
     "rules": [
         {
+            # ECR applies each image's highest-priority matching rule only: an image that matches a
+            # rule's tag selection can't be expired by a lower-priority rule. So any image with an
+            # inuse- tag is kept, however old. The count is never reached in practice.
             "rulePriority": 1,
+            "description": "aegc: keep images a deployment uses (inuse- tags)",
+            "selection": {
+                "tagStatus": "tagged",
+                "tagPrefixList": [INUSE_PREFIX],
+                "countType": "imageCountMoreThan",
+                "countNumber": 10000,
+            },
+            "action": {"type": "expire"},
+        },
+        {
+            "rulePriority": 2,
             "description": "aegc: drop untagged images after a day",
             "selection": {
                 "tagStatus": "untagged",
@@ -44,7 +60,7 @@ LIFECYCLE = {
             "action": {"type": "expire"},
         },
         {
-            "rulePriority": 2,
+            "rulePriority": 3,
             "description": "aegc: keep the 10 most recent builds",
             "selection": {"tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 10},
             "action": {"type": "expire"},
@@ -125,21 +141,37 @@ def existing_image(ecr: Any, env: str, tag: str) -> str | None:
     return f"{uri}@{d[0]['imageDigest']}"
 
 
+def _owned_repository(ecr: Any, name: str) -> dict[str, Any]:
+    """The repository ``name``, if aegc's bootstrap created it; raises OwnershipError if not."""
+    repo = dict(ecr.describe_repositories(repositoryNames=[name])["repositories"][0])
+    found = naming.tag_dict(ecr.list_tags_for_resource(resourceArn=repo["repositoryArn"])["tags"])
+    if not naming.is_owned(naming.PREFIX + "-images", found, naming.BOOTSTRAP):
+        raise OwnershipError(f"ECR repository {name} exists but isn't tagged as aegc's")
+    return repo
+
+
+def apply_lifecycle(ecr: Any, name: str) -> None:
+    """Set :data:`LIFECYCLE` on an aegc repository, so ones created before a rule existed get it.
+
+    Always a put (it's idempotent): comparing first would need ``ecr:GetLifecyclePolicy``, which
+    the builder policy doesn't grant.
+    """
+    ecr.put_lifecycle_policy(repositoryName=name, lifecyclePolicyText=json.dumps(LIFECYCLE))
+
+
 def ensure_repository(ecr: Any, env: str, report: Report, *, dry_run: bool = False) -> str:
     name = naming.image_repository(env)
     tags = naming.tag_list(naming.tags(naming.BOOTSTRAP, "image-repo"))
     try:
-        repo = ecr.describe_repositories(repositoryNames=[name])["repositories"][0]
-        found = naming.tag_dict(
-            ecr.list_tags_for_resource(resourceArn=repo["repositoryArn"])["tags"]
-        )
-        if not naming.is_owned(naming.PREFIX + "-images", found, naming.BOOTSTRAP):
-            raise OwnershipError(f"ECR repository {name} exists but isn't tagged as aegc's")
-        report.add("ecr repository", name, "exists")
-        return str(repo["repositoryUri"])
+        repo = _owned_repository(ecr, name)
     except Exception as e:
         if isinstance(e, OwnershipError) or not is_not_found(e):
             raise
+    else:
+        if not dry_run:
+            apply_lifecycle(ecr, name)
+        report.add("ecr repository", name, "exists")
+        return str(repo["repositoryUri"])
     if dry_run:
         report.add("ecr repository", name, "would-create")
         return name
@@ -149,9 +181,136 @@ def ensure_repository(ecr: Any, env: str, report: Report, *, dry_run: bool = Fal
         imageScanningConfiguration={"scanOnPush": True},
         tags=tags,
     )["repository"]
-    ecr.put_lifecycle_policy(repositoryName=name, lifecyclePolicyText=json.dumps(LIFECYCLE))
+    apply_lifecycle(ecr, name)
     report.add("ecr repository", name, "created")
     return str(repo["repositoryUri"])
+
+
+# --- in-use tags (#27) -------------------------------------------------------------------------
+
+
+def inuse_tag(deployment: str, digest_ref: str) -> str:
+    """``inuse-<deployment>-<first 12 hex digits of the digest>``."""
+    _, sep, digest = digest_ref.partition("@sha256:")
+    if not sep or len(digest) < 12:
+        raise ValueError(f"not a pinned image reference: {digest_ref!r}")
+    return f"{INUSE_PREFIX}{deployment}-{digest[:12]}"
+
+
+def _is_inuse_tag(tag: str, deployment: str) -> bool:
+    # Exactly inuse-<d>-<12 hex>: deployment "dev" mustn't match "inuse-dev-x-<hex>".
+    head = f"{INUSE_PREFIX}{deployment}-"
+    rest = tag.removeprefix(head)
+    return tag.startswith(head) and len(rest) == 12 and all(c in "0123456789abcdef" for c in rest)
+
+
+def protect(
+    ecr: Any, env: str, digest_ref: str, deployment: str, *, report: Report | None = None
+) -> str:
+    """Tag the pinned image ``inuse-<d>-<sha12>`` so the lifecycle never expires it. Returns it.
+
+    ``put_image`` with the image's existing manifest adds a tag without pushing anything; immutable
+    repositories allow new tags, just not moving existing ones. Re-applies the lifecycle first.
+    """
+    name = naming.image_repository(env)
+    repo_ref, _, digest = digest_ref.partition("@")
+    if not repo_ref.endswith("/" + name):
+        raise ValueError(f"image {digest_ref!r} isn't in aegc's repository {name}")
+    tag = inuse_tag(deployment, digest_ref)
+    _owned_repository(ecr, name)
+    apply_lifecycle(ecr, name)
+    got = ecr.batch_get_image(repositoryName=name, imageIds=[{"imageDigest": digest}])
+    if not got.get("images"):
+        raise RuntimeError(
+            f"image {digest_ref} is gone from {name}; "
+            f"rebuild it with `aegc image build --env {env}`"
+        )
+    image = got["images"][0]
+    kw: dict[str, Any] = {}
+    if image.get("imageManifestMediaType"):
+        kw["imageManifestMediaType"] = image["imageManifestMediaType"]
+    outcome: Outcome = "created"
+    try:
+        ecr.put_image(
+            repositoryName=name,
+            imageManifest=image["imageManifest"],
+            imageTag=tag,
+            imageDigest=digest,
+            **kw,
+        )
+    except Exception as e:
+        if error_code(e) != "ImageAlreadyExistsException":
+            raise
+        outcome = "exists"  # already tagged
+    if report is not None:
+        report.add("ecr image tag", f"{name}:{tag}", outcome)
+    return tag
+
+
+def release(
+    ecr: Any,
+    env: str,
+    deployment: str,
+    keep: set[str] | frozenset[str] = frozenset(),
+    *,
+    report: Report | None = None,
+    dry_run: bool = False,
+) -> list[str]:
+    """Remove ``deployment``'s ``inuse-`` tags from ``aegc/<env>``, except those in ``keep``.
+
+    Deletes by tag, which removes the tag and leaves the image (it keeps its build tag). A tag
+    that's an image's only one is kept, because deleting it would delete the image. Returns the
+    tags removed (or that would be, on a dry run).
+    """
+    name = naming.image_repository(env)
+    try:
+        _owned_repository(ecr, name)
+        details = list(
+            paginate(
+                ecr,
+                "describe_images",
+                "imageDetails",
+                repositoryName=name,
+                filter={"tagStatus": "TAGGED"},
+            )
+        )
+    except Exception as e:
+        if is_not_found(e):
+            return []
+        raise
+    removed = []
+    for d in details:
+        tags = d.get("imageTags", [])
+        for t in tags:
+            if not _is_inuse_tag(t, deployment) or t in keep:
+                continue
+            if len(tags) == 1:
+                if report is not None:
+                    report.add("ecr image tag", f"{name}:{t}", "kept", "the image's only tag")
+                continue
+            if not dry_run:
+                ecr.batch_delete_image(repositoryName=name, imageIds=[{"imageTag": t}])
+            removed.append(t)
+            if report is not None:
+                report.add("ecr image tag", f"{name}:{t}", "would-delete" if dry_run else "deleted")
+    return removed
+
+
+def inuse_tags(ecr: Any, deployment: str) -> dict[str, list[str]]:
+    """``{repository: [inuse tags of deployment]}`` across aegc's image repositories."""
+    out: dict[str, list[str]] = {}
+    for repo in paginate(ecr, "describe_repositories", "repositories"):
+        name = str(repo["repositoryName"])
+        if not name.startswith(naming.PREFIX + "/"):
+            continue
+        for d in paginate(
+            ecr, "describe_images", "imageDetails", repositoryName=name,
+            filter={"tagStatus": "TAGGED"},
+        ):  # fmt: skip
+            found = [t for t in d.get("imageTags", []) if _is_inuse_tag(t, deployment)]
+            if found:
+                out.setdefault(name, []).extend(found)
+    return out
 
 
 def record_image(ssm: Any, rec: ImageRecord) -> None:

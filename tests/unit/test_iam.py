@@ -123,6 +123,22 @@ def test_deployer_policy(aws: Callable[[str], Any]) -> None:
         got = decide(c, arn, "iam:CreateServiceLinkedRole", slr, **{"iam:AWSServiceName": svc})
         assert (got == "allowed") is want, svc
 
+    # In-use image tags (#27): aegc's image repositories only, and never deleting a repository.
+    repo = f"arn:aws:ecr:{REGION}:{ACCOUNT}:repository/aegc/geospatial"
+    for action in (
+        "ecr:BatchGetImage", "ecr:PutImage", "ecr:BatchDeleteImage", "ecr:DescribeImages",
+        "ecr:PutLifecyclePolicy",
+    ):  # fmt: skip
+        assert decide(c, arn, action, repo) == "allowed", action
+    for action, res in [
+        ("ecr:PutImage", f"arn:aws:ecr:{REGION}:{ACCOUNT}:repository/other/x"),
+        ("ecr:BatchDeleteImage", f"arn:aws:ecr:{REGION}:{ACCOUNT}:repository/other/x"),
+        ("ecr:BatchDeleteImage", f"arn:aws:ecr:{REGION}:{ACCOUNT}:repository/aegc-quay/aarchsci/x"),
+        ("ecr:PutLifecyclePolicy", f"arn:aws:ecr:{REGION}:{ACCOUNT}:repository/other/x"),
+        ("ecr:SetRepositoryPolicy", repo),
+    ]:
+        assert decide(c, arn, action, res) != "allowed", (action, res)
+
 
 def test_builder_policy(aws: Callable[[str], Any]) -> None:
     c, arn = principal(aws, iam.builder_policy(region=REGION, account=ACCOUNT))

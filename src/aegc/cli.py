@@ -123,13 +123,12 @@ def _clients(sess: object) -> object:
     from aegc import awsutil
     from aegc.infra.deployment import Clients
 
-    return Clients(
-        **{s: awsutil.client(sess, s) for s in ("iam", "ec2", "autoscaling", "sqs", "logs", "ssm")}  # type: ignore[arg-type]
-    )
+    services = ("iam", "ec2", "autoscaling", "sqs", "logs", "ssm", "ecr")
+    return Clients(**{s: awsutil.client(sess, s) for s in services})  # type: ignore[arg-type]
 
 
 def parse_pool(text: str) -> dict[str, Any]:
-    """``env[:key=value,...]``, e.g. ``geospatial:max=8,vcpu=4-16,mem=8192,on-demand``."""
+    """``env[:key=value,...]``, e.g. ``geospatial:max=8,vcpu=4-16,mem=8192,disk=50,on-demand``."""
     env, _, opts = text.partition(":")
     out: dict[str, Any] = {"env": env}
     for opt in filter(None, opts.split(",")):
@@ -150,6 +149,10 @@ def parse_pool(text: str) -> dict[str, Any]:
             out["spot"] = False
         elif key == "idle":
             out["idle_timeout_s"] = int(value)
+        elif key == "disk":
+            out["root_volume_gib"] = int(value)
+        elif key == "throughput":
+            out["throughput_mibps"] = int(value)
         else:
             raise SystemExit(f"aegc: unknown pool option {key!r} in {text!r}")
     return out
@@ -212,17 +215,57 @@ def _destroy(args: argparse.Namespace) -> int:
     from aegc.infra import deployment
 
     sess, region, _ = _ctx(args)
-    print(
-        deployment.destroy(
-            _clients(sess),  # type: ignore[arg-type]
+    c = _clients(sess)
+    if args.verify and args.no_verify:
+        raise SystemExit("aegc: --verify and --no-verify contradict each other")
+    if args.verify and not args.yes:
+        # Verification only: re-check a destroy that ran earlier. Deletes nothing.
+        report = deployment.verify_destroyed(
+            c,  # type: ignore[arg-type]
+            deployment=args.deployment,
+            region=region,
+            wait_s=0,
+        )
+    else:
+        report = deployment.destroy(
+            c,  # type: ignore[arg-type]
             deployment=args.deployment,
             region=region,
             dry_run=not args.yes,
             force=args.force,
+            verify=not args.no_verify,
         )
-    )
-    if not args.yes:
+    print(report)
+    if not args.yes and not args.verify:
         print("dry run; pass --yes to delete")
+    left = deployment.remaining(report)
+    if left:
+        print(f"aegc: {len(left)} resource(s) of {args.deployment} remain", file=sys.stderr)
+        return 1
+    if args.verify or (args.yes and not args.no_verify):
+        print(f"verified: nothing of {args.deployment} remains")
+    return 0
+
+
+def _footprint(args: argparse.Namespace) -> int:
+    from aegc import awsutil, ops
+
+    sess, region, _ = _ctx(args)
+    fp = ops.footprint(
+        **{
+            k: awsutil.client(sess, svc)  # type: ignore[arg-type]
+            for k, svc in (
+                ("tagging", "resourcegroupstaggingapi"),
+                ("sqs", "sqs"),
+                ("autoscaling", "autoscaling"),
+                ("ec2", "ec2"),
+                ("ssm", "ssm"),
+            )
+        },
+        deployment=args.deployment,
+        region=region,
+    )
+    print(fp.render())
     return 0
 
 
@@ -298,7 +341,9 @@ def build_parser() -> argparse.ArgumentParser:
     dp.add_argument("deployment")
     dp.add_argument(
         "--pool", action="append", required=True,
-        help="env[:max=N,min=N,vcpu=LO-HI,mem=MiB,slots=N|auto,idle=S,on-demand]; repeatable",
+        help="env[:max=N,min=N,vcpu=LO-HI,mem=MiB,slots=N|auto,idle=S,disk=GiB,"
+        "throughput=MiBps,on-demand]; repeatable. disk: root gp3 GiB (30-16384, default 30); "
+        "throughput: its MiB/s (125-1000, default 125)",
     )  # fmt: skip
     dp.add_argument("--dry-run", action="store_true")
     dp.set_defaults(func=_deploy)
@@ -307,7 +352,21 @@ def build_parser() -> argparse.ArgumentParser:
     ds.add_argument("deployment")
     ds.add_argument("--yes", action="store_true", help="actually delete")
     ds.add_argument("--force", action="store_true", help="even with tasks queued or running")
+    ds.add_argument(
+        "--verify", action="store_true",
+        help="without --yes: only check that nothing remains (exit 1 if something does)",
+    )  # fmt: skip
+    ds.add_argument(
+        "--no-verify", action="store_true", help="with --yes: skip the check after deleting"
+    )
     ds.set_defaults(func=_destroy)
+
+    fp = sub.add_parser(
+        "footprint",
+        help="list what exists for a deployment: owned resources and untagged look-alikes",
+    )
+    fp.add_argument("deployment")
+    fp.set_defaults(func=_footprint)
 
     st = sub.add_parser("status", help="pools, queues, workers and waiting results")
     st.add_argument("deployment")

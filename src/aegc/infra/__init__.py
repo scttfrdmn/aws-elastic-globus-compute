@@ -5,7 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-Outcome = Literal["created", "exists", "updated", "deleted", "would-create", "would-delete", "kept"]
+Outcome = Literal[
+    "created", "exists", "updated", "deleted", "would-create", "would-delete", "kept", "remaining"
+]
 
 
 @dataclass(frozen=True)

@@ -1,4 +1,4 @@
-"""Operational views and housekeeping: ``aegc status`` and ``aegc reap``."""
+"""Operational views and housekeeping: ``aegc status``, ``aegc footprint`` and ``aegc reap``."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from typing import Any
 from aegc import naming, quotas
 from aegc.awsutil import is_not_found, paginate
 from aegc.infra import Outcome, Report
-from aegc.infra.deployment import read_manifest
+from aegc.infra.deployment import _owned_ec2_filters, read_manifest
 from aegc.quotas import QuotaCheck
 
 #: Result queues untouched this long, and empty, belong to endpoint processes that are gone.
@@ -166,3 +166,176 @@ def reap(
                         raise
             report.add("sqs queue", name, verb, "idle result queue")
     return report
+
+
+# --- footprint (#43) ---------------------------------------------------------------------------
+
+
+@dataclass
+class FootprintItem:
+    kind: str
+    name: str
+    owned: bool  # aegc made it for this deployment (name and tags); else an untagged look-alike
+    found_by: set[str] = field(default_factory=set)  # "tags" and/or "name"
+    detail: str = ""
+
+    def __str__(self) -> str:
+        status = "owned" if self.owned else "look-alike"
+        tail = f" ({self.detail})" if self.detail else ""
+        return f"{status:>10}  {self.kind:<26} {self.name}{tail}"
+
+
+@dataclass
+class Footprint:
+    deployment: str
+    region: str
+    items: dict[tuple[str, str], FootprintItem] = field(default_factory=dict)
+
+    def add(
+        self, kind: str, key: str, name: str, *, owned: bool, found_by: str, detail: str = ""
+    ) -> None:
+        item = self.items.get((kind, key))
+        if item is None:
+            self.items[(kind, key)] = FootprintItem(kind, name, owned, {found_by}, detail)
+            return
+        item.found_by.add(found_by)
+        item.owned = item.owned and owned
+        if found_by == "name":  # the name scan knows the resource's name, not just its id
+            item.name = name
+        item.detail = item.detail or detail
+
+    @property
+    def owned(self) -> list[FootprintItem]:
+        return [i for i in self.items.values() if i.owned]
+
+    @property
+    def look_alikes(self) -> list[FootprintItem]:
+        return [i for i in self.items.values() if not i.owned]
+
+    def render(self) -> str:
+        lines = [f"footprint of {self.deployment} ({self.region}); nothing was changed"]
+        for i in sorted(self.items.values(), key=lambda i: (not i.owned, i.kind, i.name)):
+            lines.append(f"  {i}")
+        lines.append(f"  {len(self.owned)} owned, {len(self.look_alikes)} look-alike(s)")
+        return "\n".join(lines)
+
+
+def _arn_resource(arn: str) -> tuple[str, str]:
+    """``(kind, key)`` for a tagging-API ARN, in the same form the name scan uses."""
+    parts = arn.split(":", 5)
+    service, resource = parts[2], parts[5] if len(parts) > 5 else ""
+    cut = min(
+        (i for i in (resource.find("/"), resource.find(":")) if i >= 0), default=len(resource)
+    )
+    rtype, rest = resource[:cut], resource[cut + 1 :]
+    if service == "sqs":
+        return "sqs queue", resource
+    if service == "ssm" and rtype == "parameter":
+        return "ssm parameter", "/" + rest
+    if service == "logs" and rtype == "log-group":
+        return "log group", rest.removesuffix(":*")
+    if service == "iam":
+        return {"role": "iam role", "instance-profile": "iam instance profile"}.get(
+            rtype, f"iam {rtype}"
+        ), rest.rsplit("/", 1)[-1]
+    if service == "autoscaling":
+        return "auto scaling group", resource.rsplit("autoScalingGroupName/", 1)[-1]
+    if service == "ec2":
+        return {
+            "instance": "ec2 instance",
+            "volume": "ebs volume",
+            "network-interface": "network interface",
+            "security-group": "security group",
+            "launch-template": "launch template",
+        }.get(rtype, f"ec2 {rtype}"), rest
+    return f"{service} {rtype}".strip(), rest or resource
+
+
+_EC2_KINDS = {
+    "ec2 instance",
+    "ebs volume",
+    "network interface",
+    "security group",
+    "launch template",
+}
+
+
+def _owned_by_name_and_tags(kind: str, name: str, tags: dict[str, str], d: str) -> bool:
+    if name == naming.log_group(d) or name.startswith(f"/{naming.PREFIX}/{d}/"):
+        return naming.is_owned(f"{naming.PREFIX}-{d}", tags, d)  # path-named: /aegc/<d>[/...]
+    if kind in _EC2_KINDS:
+        return naming.is_owned(f"{naming.PREFIX}-{d}", tags, d)  # ids carry no name: tags decide
+    return naming.is_owned(name, tags, d)
+
+
+def footprint(
+    *,
+    tagging: Any,
+    sqs: Any,
+    autoscaling: Any,
+    ec2: Any,
+    ssm: Any,
+    deployment: str,
+    region: str,
+) -> Footprint:
+    """Everything that exists for ``deployment``. A report only: it changes nothing.
+
+    Two sources: the Resource Groups Tagging API (everything tagged ``aegc:deployment=<d>``), and
+    a name-prefix scan of queues, Auto Scaling groups, launch templates and ``/aegc/<d>/``
+    parameters, which also finds look-alikes that carry aegc's names but not its tags. Each
+    resource is listed as owned (name and tags both match, :func:`naming.is_owned`) or as a
+    look-alike.
+    """
+    d = naming.validate_name("deployment", deployment)
+    prefix = f"{naming.PREFIX}-{d}-"
+    out = Footprint(deployment=d, region=region)
+
+    for m in paginate(
+        tagging,
+        "get_resources",
+        "ResourceTagMappingList",
+        TagFilters=[{"Key": naming.TAG_DEPLOYMENT, "Values": [d]}],
+    ):
+        kind, key = _arn_resource(m["ResourceARN"])
+        tags = naming.tag_dict(m.get("Tags", []))
+        out.add(kind, key, key, owned=_owned_by_name_and_tags(kind, key, tags, d), found_by="tags")
+
+    for u in paginate(sqs, "list_queues", "QueueUrls", page_size=1000, QueueNamePrefix=prefix):
+        name = u.rsplit("/", 1)[-1]
+        tags = dict(sqs.list_queue_tags(QueueUrl=u).get("Tags", {}))
+        out.add("sqs queue", name, name, owned=naming.is_owned(name, tags, d), found_by="name")
+
+    for g in paginate(autoscaling, "describe_auto_scaling_groups", "AutoScalingGroups"):
+        name = g["AutoScalingGroupName"]
+        if name.startswith(prefix):
+            tags = naming.tag_dict(g.get("Tags", []))
+            owned = naming.is_owned(name, tags, d)
+            out.add("auto scaling group", name, name, owned=owned, found_by="name")
+
+    # Ownership by tag filter: works where describe calls don't echo tags back.
+    tagged = {
+        lt["LaunchTemplateId"]
+        for lt in paginate(
+            ec2, "describe_launch_templates", "LaunchTemplates", Filters=_owned_ec2_filters(d)
+        )
+    }
+    for lt in paginate(ec2, "describe_launch_templates", "LaunchTemplates"):
+        name, lid = lt["LaunchTemplateName"], lt["LaunchTemplateId"]
+        if name.startswith(prefix):
+            out.add("launch template", lid, name, owned=lid in tagged, found_by="name", detail=lid)
+
+    for p in paginate(
+        ssm, "get_parameters_by_path", "Parameters", Path=f"/{naming.PREFIX}/{d}", Recursive=True
+    ):
+        name = str(p["Name"])
+        try:
+            tags = naming.tag_dict(
+                ssm.list_tags_for_resource(ResourceType="Parameter", ResourceId=name)["TagList"]
+            )
+        except Exception as e:
+            if not is_not_found(e):
+                raise
+            tags = {}
+        owned = naming.is_owned(f"{naming.PREFIX}-{d}", tags, d)
+        out.add("ssm parameter", name, name, owned=owned, found_by="name")
+    return out
