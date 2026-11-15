@@ -20,6 +20,7 @@ from aegc.awsutil import error_code, is_not_found, paginate
 from aegc.infra import Outcome, OwnershipError, Report
 
 PAYLOAD_EXPIRY_DAYS = 15
+LEDGER_EXPIRY_DAYS = 400
 UPSTREAM = "quay.io"
 TEMPLATE_POLICY = "aegc-ecr-template"
 TEMPLATE_ROLE_RETRIES = 6
@@ -113,7 +114,14 @@ def ensure_bucket(s3: Any, bucket: str, region: str, report: Report, *, dry_run:
                     "Filter": {"Prefix": "payloads/"},
                     "Expiration": {"Days": PAYLOAD_EXPIRY_DAYS},
                     "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 1},
-                }
+                },
+                {
+                    # Cost history for `aegc cost`; small JSON records, one per instance.
+                    "ID": "aegc-expire-ledger",
+                    "Status": "Enabled",
+                    "Filter": {"Prefix": "ledger/"},
+                    "Expiration": {"Days": LEDGER_EXPIRY_DAYS},
+                },
             ]
         },
     )

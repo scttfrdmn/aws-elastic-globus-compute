@@ -21,7 +21,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any
 
-from aegc import __version__, images, naming
+from aegc import __version__, images, naming, protocol
 from aegc.awsutil import error_code, is_not_found, paginate
 from aegc.infra import Outcome, OwnershipError, Report, iam, userdata
 
@@ -408,6 +408,7 @@ def launch_template_data(
         image=pool.image,
         log_group=naming.log_group(d),
         worker_config=worker_config(spec, pool, task_queue_url),
+        max_age_s=pool.max_lifetime_s + (pool.max_walltime_s or protocol.MAX_WALLTIME_S) + 900,
     )
     instance_tags = naming.tag_list(naming.tags(d, "worker", pool=pool.name, extra=spec.extra_tags))
     return {

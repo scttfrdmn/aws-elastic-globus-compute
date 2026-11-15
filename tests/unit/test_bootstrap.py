@@ -64,7 +64,10 @@ def test_bootstrap_creates_then_is_idempotent(aws: Callable[[str], Any]) -> None
     tags = naming.tag_dict(s3.get_bucket_tagging(Bucket=BUCKET)["TagSet"])
     assert naming.is_owned(BUCKET, tags, naming.BOOTSTRAP)
     rules = s3.get_bucket_lifecycle_configuration(Bucket=BUCKET)["Rules"]
-    assert rules[0]["Expiration"]["Days"] == bootstrap.PAYLOAD_EXPIRY_DAYS
+    by_id = {r["ID"]: r for r in rules}
+    assert by_id["aegc-expire-payloads"]["Expiration"]["Days"] == bootstrap.PAYLOAD_EXPIRY_DAYS
+    assert by_id["aegc-expire-ledger"]["Filter"]["Prefix"] == "ledger/"
+    assert by_id["aegc-expire-ledger"]["Expiration"]["Days"] == bootstrap.LEDGER_EXPIRY_DAYS
     assert s3.get_public_access_block(Bucket=BUCKET)["PublicAccessBlockConfiguration"][
         "RestrictPublicBuckets"
     ]

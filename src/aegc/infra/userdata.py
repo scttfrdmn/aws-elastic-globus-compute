@@ -90,13 +90,16 @@ UNIT
 
 cat > /usr/local/bin/aegc-watchdog <<'WATCH'
 #!/bin/bash
-# Terminate this instance if the worker has been down, or silent, for too long.
+# Terminate this instance if the worker has been down, or silent, for too long, or if the
+# instance has outlived its lifetime (the worker stops claiming at max_lifetime_s; this is the
+# backstop: lifetime + the longest walltime + 15 minutes).
 HB=/scratch/.aegc-heartbeat
 stale=$$(( $$(date +%s) - $$(stat -c %Y "$$HB" 2>/dev/null || echo 0) ))
-if ! systemctl is-active --quiet aegc-worker || [ "$$stale" -gt ${watchdog_stale_s} ]; then
-  up=$$(cut -d. -f1 /proc/uptime)
+up=$$(cut -d. -f1 /proc/uptime)
+if ! systemctl is-active --quiet aegc-worker || [ "$$stale" -gt ${watchdog_stale_s} ] \
+    || [ "$$up" -gt ${max_age_s} ]; then
   [ "$$up" -lt ${watchdog_grace_s} ] && exit 0
-  echo "aegc-watchdog: worker down or stale ($$stale s); draining"
+  echo "aegc-watchdog: worker down, stale ($$stale s) or past its lifetime ($$up s); draining"
   TOKEN=$$(curl -sfX PUT http://169.254.169.254/latest/api/token \
     -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
   md() { curl -sf -H "X-aws-ec2-metadata-token: $$TOKEN" \
@@ -141,6 +144,7 @@ class WorkerBoot:
     worker_uid: int = DEFAULT_WORKER_UID
     watchdog_stale_s: int = 600
     watchdog_grace_s: int = 900
+    max_age_s: int = 24 * 3600 + 41_400 + 900  # lifetime + max walltime + 15 min
 
 
 def render(boot: WorkerBoot) -> str:
@@ -159,6 +163,7 @@ def render(boot: WorkerBoot) -> str:
         worker_uid=boot.worker_uid,
         watchdog_stale_s=boot.watchdog_stale_s,
         watchdog_grace_s=boot.watchdog_grace_s,
+        max_age_s=boot.max_age_s,
     )
 
 
