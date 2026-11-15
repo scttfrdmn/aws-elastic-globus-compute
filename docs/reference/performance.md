@@ -52,3 +52,31 @@ Fixed before v0.1 (see the [changelog](../../CHANGELOG.md)):
 - A Spot rebalance recommendation 5 s after launch made a worker drain and exit while its instance
   stayed in the group, holding the pool above zero for 14 minutes until the watchdog removed it.
   Workers now keep working; capacity rebalance replaces the instance, and SIGTERM releases tasks.
+
+## v0.2 live run (2026-11-15)
+
+us-west-2, deployment `v02`, pool `geospatial:max_vcpus=6` (vCPU-weighted), Spot Graviton workers
+with a 30 GiB gp3 root at 125 MiB/s, the endpoint in Docker on a laptop.
+
+| Check | Result |
+|---|---|
+| Cold start, 0 workers to first result, 125 MiB/s root volume | **38 s** (v0.1 at 500 MiB/s: 35–46 s); 10 tasks done in 41 s |
+| vCPU-weighted scale-out | desired 6 vCPUs, filled with 2-vCPU `m9g.large` Spot workers |
+| Cost ledger | real Spot prices; about $0.03 for the whole run |
+| Spend cap | a $0.0001/day limit set on the running deployment tripped in **42 s**; new tasks refused with `AEGC_BUDGET_EXCEEDED` |
+| `limits --resume` | refused while over the limit; raising the limit with `--resume` resumed and renewed the lease |
+| `aegc stop` | the running task finished; a new one got `AEGC_STOPPED`; the worker left 3 s after its task |
+| `aegc stop --hard --yes` | a 10-minute running task failed with `AEGC_STOPPED` about 45 s after the stop; the worker left by itself |
+| Redeploy pickup | the running engine loaded the new manifest within 15 s (no restart) |
+| TTL (`--ttl 15m`, a `min_vcpus=2` worker) | at the TTL the schedules set the state to `expired` and the minimum to 0; the worker left within 85 s |
+| `destroy --yes` (verifies) and `footprint` | nothing remains |
+
+**Found and fixed during the run:**
+- A new scheduler role takes seconds before Scheduler can assume it. Lease creation now retries.
+- A task submitted right after `resume` was refused from a 30-second-old copy of the state. The
+  engine now re-reads a stale state before refusing.
+- The tagging index keeps deleted EC2 resources for a while, and schedule groups delete
+  asynchronously. `footprint` and `destroy --verify` no longer report those.
+
+**AWS behaviour checked:** in a vCPU-weighted group, terminating a 2-vCPU worker with the
+decrement while desired is 1 succeeds and clamps desired to 0 (substrate#1526).
