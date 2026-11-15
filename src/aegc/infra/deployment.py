@@ -115,11 +115,31 @@ class DeploymentSpec:
     limits: dict[str, Any] = field(default_factory=dict)  # aegc.state.Limits.to_dict()
     lease_s: int = 48 * 3600  # freeze the deployment if no endpoint renews it (0: no lease)
     ttl_at: float = 0.0  # hard expiry, UTC epoch seconds (0: none)
+    grants: tuple[iam.Grant, ...] = ()  # worker access to the user's S3 prefixes (#53)
 
     def __post_init__(self) -> None:
         naming.validate_name("deployment", self.deployment)
         if len({p.name for p in self.pools}) != len(self.pools):
             raise ValueError("pool names must be unique")
+        grants = tuple(
+            dict.fromkeys(
+                g if isinstance(g, iam.Grant) else iam.Grant.from_dict(g) for g in self.grants
+            )
+        )
+        object.__setattr__(self, "grants", grants)
+        self.grants_policy()  # too many grants fail here, before anything changes
+
+    def worker_policy(self) -> dict[str, Any]:
+        return iam.worker_policy(
+            deployment=self.deployment, region=self.region, account=self.account, bucket=self.bucket
+        )
+
+    def grants_policy(self) -> dict[str, Any] | None:
+        """The ``aegc-grants`` document, or None without grants."""
+        if not self.grants:
+            return None
+        room = iam.INLINE_POLICY_LIMIT - iam.policy_size(self.worker_policy())
+        return iam.grants_policy(self.grants, deployment=self.deployment, budget=room)
 
 
 @dataclass
@@ -151,11 +171,7 @@ def _retry(fn: Callable[[], Any], *, codes: set[str], attempts: int, delay_s: fl
 def ensure_worker_role(c: Clients, spec: DeploymentSpec, report: Report, *, dry_run: bool) -> str:
     d, name = spec.deployment, naming.worker_role(spec.deployment, spec.region)
     tags = naming.tag_list(naming.tags(d, "worker-role", extra=spec.extra_tags))
-    policy = json.dumps(
-        iam.worker_policy(
-            deployment=d, region=spec.region, account=spec.account, bucket=spec.bucket
-        )
-    )
+    policy = json.dumps(spec.worker_policy())
     profile_arn = f"arn:aws:iam::{spec.account}:instance-profile{naming.IAM_PATH}{name}"
     try:
         found = naming.tag_dict(c.iam.list_role_tags(RoleName=name)["Tags"])
@@ -178,6 +194,18 @@ def ensure_worker_role(c: Clients, spec: DeploymentSpec, report: Report, *, dry_
     if dry_run:
         return profile_arn
     c.iam.put_role_policy(RoleName=name, PolicyName=iam.WORKER_POLICY, PolicyDocument=policy)
+    if (grants := spec.grants_policy()) is not None:
+        c.iam.put_role_policy(
+            RoleName=name, PolicyName=iam.GRANTS_POLICY, PolicyDocument=json.dumps(grants)
+        )
+        report.add("iam role policy", iam.GRANTS_POLICY, "updated", f"{len(spec.grants)} grant(s)")
+    else:
+        try:
+            c.iam.delete_role_policy(RoleName=name, PolicyName=iam.GRANTS_POLICY)
+            report.add("iam role policy", iam.GRANTS_POLICY, "deleted")
+        except Exception as e:
+            if not is_not_found(e):
+                raise
 
     try:
         prof = c.iam.get_instance_profile(InstanceProfileName=name)["InstanceProfile"]
@@ -398,6 +426,8 @@ def worker_config(spec: DeploymentSpec, pool: PoolSpec, task_queue_url: str) -> 
         "root_volume_gib": pool.root_volume_gib,
         "throughput_mibps": pool.throughput_mibps,
         "max_lifetime_s": pool.max_lifetime_s,
+        # Only with grants, so the launch templates of deployments without any don't change.
+        **({"grants": [g.to_dict() for g in spec.grants]} if spec.grants else {}),
     }
 
 
@@ -667,6 +697,7 @@ def manifest(
         },
         "limits": dict(spec.limits),
         "lease": {"lease_s": spec.lease_s, "ttl_at": spec.ttl_at},
+        "grants": [g.to_dict() for g in spec.grants],
     }
     body["generation"] = manifest_generation(body)
     return body

@@ -32,6 +32,11 @@ class WorkerConfig:
     lifecycle: str = ""  # "spot" or "on-demand", from IMDS
     root_volume_gib: int = 30
     throughput_mibps: int = 125
+    #: The deployment's data-access grants, ``{"access", "bucket", "prefix"}`` each (#53).
+    grants: tuple[dict[str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "grants", tuple(dict(g) for g in self.grants))
 
     @property
     def slot_count(self) -> int:
