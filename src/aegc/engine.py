@@ -124,6 +124,11 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         label: str = "AWSEngine",
         max_retries_on_system_failure: int = 1,
         stall_fail_s: float = 3600.0,
+        pool: str = "",
+        size: str = "",
+        cpus: float = 0,
+        memory_gib: float = 0,
+        walltime_s: int = 0,
         **kwargs: Any,
     ) -> None:
         # Every argument is stored under its own name: RepresentationMixin requires it.
@@ -137,6 +142,13 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         self.inline_limit_bytes = inline_limit_bytes
         self.label = label
         self.stall_fail_s = stall_fail_s
+        # Task defaults from user_endpoint_config: the web service drops these keys from a
+        # task's resource_specification (it keeps only num_nodes and the MPI fields).
+        self.pool = pool
+        self.size = size
+        self.cpus = cpus
+        self.memory_gib = memory_gib
+        self.walltime_s = walltime_s
         super().__init__(
             *args, max_retries_on_system_failure=max_retries_on_system_failure, **kwargs
         )
@@ -382,6 +394,18 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         spec, problem = _strip_mpi_keys(spec)
         if problem:
             return None, 0, problem
+        defaults = {
+            k: v
+            for k, v in (
+                ("pool", self.pool),
+                ("size", self.size),
+                ("cpus", self.cpus),
+                ("memory_gib", self.memory_gib),
+                ("walltime_s", self.walltime_s),
+            )
+            if v
+        }
+        spec = {**defaults, **spec}
         unknown = set(spec) - RESOURCE_KEYS
         if unknown:
             hints = [f"{k} -> {_DID_YOU_MEAN[k]}" for k in sorted(unknown) if k in _DID_YOU_MEAN]

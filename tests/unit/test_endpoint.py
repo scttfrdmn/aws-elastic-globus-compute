@@ -44,7 +44,15 @@ def test_dispatcher_builds_awsengine() -> None:
     assert type(eng).__name__ == "AWSEngine" and eng.deployment == "dev"
 
 
-@pytest.mark.parametrize(("opts", "env"), [({}, "geospatial"), ({"env": "climate"}, "climate")])
+@pytest.mark.parametrize(
+    ("opts", "env"),
+    [
+        ({}, "geospatial"),
+        ({"env": "climate"}, "climate"),
+        ({"env": "climate", "size": "mem", "walltime_s": 600}, "climate"),
+        ({"cpus": 4, "memory_gib": 24.5, "pool": "geospatial-py314-large"}, "geospatial"),
+    ],
+)
 def test_rendered_template_with_globus_renderer(
     tmp_path: Path, opts: dict[str, Any], env: str
 ) -> None:
@@ -71,6 +79,21 @@ def test_rendered_template_with_globus_renderer(
     engine = data["engine"]
     assert engine["type"] == "AWSEngine" and engine["deployment"] == "dev"
     assert engine["env"] == env and engine["python_minor"] == "3.14"
+    for key in ("pool", "size", "cpus", "memory_gib", "walltime_s"):
+        assert engine.get(key) == opts.get(key)
+    from globus_compute_endpoint.endpoint.config.dispatch import EngineDispatcher
+
+    built = EngineDispatcher.build_instance(engine)
+    assert built.size == opts.get("size", "") and built.cpus == opts.get("cpus", 0)
+
+
+@pytest.mark.parametrize("bad", [{"size": "huge"}, {"cpus": 0}, {"walltime_s": 1.5}, {"vcpus": 2}])
+def test_bad_endpoint_options_are_refused(tmp_path: Path, bad: dict[str, Any]) -> None:
+    import jsonschema
+
+    schema = json.loads(ep._template("user_config_schema.json"))
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(bad, schema)
 
 
 def test_commands_are_composed(tmp_path: Path) -> None:

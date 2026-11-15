@@ -159,3 +159,16 @@ def test_mpi_keys_from_the_web_service(env: Env, spec: dict[str, Any], expect: s
 def test_num_nodes_1_is_accepted() -> None:
     assert engine._strip_mpi_keys({"num_nodes": 1, "size": "mem"}) == ({"size": "mem"}, "")
     assert engine._strip_mpi_keys({"walltime_s": 60}) == ({"walltime_s": 60}, "")
+
+
+@pytest.mark.timeout(60)
+def test_endpoint_config_defaults_route(env: Env) -> None:
+    # What the template renders from user_endpoint_config={"size": "mem"}: the web service drops
+    # aegc's keys from resource_specification, so they come in as engine defaults.
+    e = env.engine(size="mem")
+    try:
+        f = submit(e, triple, 1, spec={"num_nodes": 1})
+        is_err, text = unpack_result(f.result(timeout=5))
+        assert is_err and "no size='mem' pool" in text
+    finally:
+        e.shutdown()
