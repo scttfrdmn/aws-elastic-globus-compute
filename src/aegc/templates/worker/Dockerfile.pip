@@ -24,7 +24,7 @@ RUN set -e; \
     rm -rf /opt/aegc/dist; \
     BIN="$("$PY" -c 'import shutil; print(shutil.which("aegc-worker") or "")')"; \
     if [ -z "$BIN" ]; then BIN="$("$PY" -c 'import sysconfig; print(sysconfig.get_path("scripts"))')/aegc-worker"; fi; \
-    ln -sf "$BIN" /usr/local/bin/aegc-worker; \
+    [ "$BIN" = /usr/local/bin/aegc-worker ] || ln -sf "$BIN" /usr/local/bin/aegc-worker; \
     if ! getent passwd "${AEGC_UID}" >/dev/null; then \
         useradd --create-home --uid "${AEGC_UID}" aegc 2>/dev/null \
         || adduser -D -u "${AEGC_UID}" aegc; \

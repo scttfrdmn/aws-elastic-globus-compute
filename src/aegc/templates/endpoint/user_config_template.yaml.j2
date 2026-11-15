@@ -4,7 +4,9 @@
 
   One user endpoint process runs per submitter runtime and per user_endpoint_config (spike #4).
   The submitter's Python minor version selects the worker image; `env` (from
-  Executor(user_endpoint_config={"env": ...})) selects the science environment.
+  Executor(user_endpoint_config={"env": ...})) selects the science environment, and `size`,
+  `cpus`, `memory_gib`, `walltime_s` and `pool` the pool and walltime. These go here, not in
+  resource_specification: the web service keeps only its MPI fields there.
   Template values from _GC.user_runtime and user_endpoint_config arrive already JSON-quoted.
 -#}
 {%- set py = _GC.user_runtime.python.version_tuple if _GC.user_runtime is defined and _GC.user_runtime.python is defined else [] %}
@@ -25,4 +27,19 @@ engine:
   region: @@REGION@@
   env: {{ env | default('"@@DEFAULT_ENV@@"') }}
   python_minor: "{{ py[:2] | join('.') }}"
+{%- if pool is defined %}
+  pool: {{ pool }}
+{%- endif %}
+{%- if size is defined %}
+  size: {{ size }}
+{%- endif %}
+{%- if cpus is defined %}
+  cpus: {{ cpus }}
+{%- endif %}
+{%- if memory_gib is defined %}
+  memory_gib: {{ memory_gib }}
+{%- endif %}
+{%- if walltime_s is defined %}
+  walltime_s: {{ walltime_s }}
+{%- endif %}
   max_retries_on_system_failure: 1
