@@ -26,7 +26,14 @@ engine:
   deployment: @@DEPLOYMENT@@
   region: @@REGION@@
   env: {{ env | default('"@@DEFAULT_ENV@@"') }}
+{#- The SDK sends the submitter's Python; Globus Flows doesn't, so `python` can say it. #}
+{%- if py %}
   python_minor: "{{ py[:2] | join('.') }}"
+{%- elif python is defined %}
+  python_minor: {{ python }}
+{%- else %}
+  python_minor: ""
+{%- endif %}
 {%- if pool is defined %}
   pool: {{ pool }}
 {%- endif %}

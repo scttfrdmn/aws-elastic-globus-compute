@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -120,3 +121,78 @@ def test_commands_are_composed(tmp_path: Path) -> None:
     stop_cmds = [c for c in flat if c.startswith(("docker exec", "docker stop"))]
     assert stop_cmds[0] == "docker exec aegc-endpoint-aegc globus-compute-endpoint stop aegc"
     assert stop_cmds[1].startswith("docker stop")
+
+
+def test_configure_writes_allowed_functions(tmp_path: Path) -> None:
+    # #57: the list goes in the manager's config.yaml, registered with Globus at start.
+    import shlex as _shlex
+
+    calls: list[list[str]] = []
+
+    def run(cmd: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    fid = "11111111-1111-1111-1111-111111111111"
+    ep.configure(ep.EndpointSpec(**{**SPEC.__dict__, "allowed_functions": (fid,)}), run=run)
+    script = calls[-1][-1]
+    assert "allowed_functions" in script and fid in script
+    ep.configure(SPEC, run=run)  # None: config.yaml's list is left alone
+    assert "allowed_functions" not in calls[-1][-1]
+    # The edit itself, on a real file.
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("display_name: null\namqp_port: 5671\n")
+    step = ep._allowed_functions_edit(str(cfg), (fid,)).replace(
+        "python3", _shlex.quote(sys.executable), 1
+    )
+    subprocess.run(["sh", "-c", step], check=True)
+    assert yaml.safe_load(cfg.read_text()) == {
+        "display_name": None,
+        "amqp_port": 5671,
+        "allowed_functions": [fid],
+    }
+    step = ep._allowed_functions_edit(str(cfg), ()).replace(
+        "python3", _shlex.quote(sys.executable), 1
+    )
+    subprocess.run(["sh", "-c", step], check=True)
+    assert "allowed_functions" not in yaml.safe_load(cfg.read_text())
+
+
+def test_cli_refuses_bad_function_ids() -> None:
+    from aegc import cli
+
+    with pytest.raises(SystemExit, match="UUIDs"):
+        cli.main(["--region", "us-west-2", "endpoint", "configure", "--env", "geo",
+                  "--allow-function", "not-a-uuid"])  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("runtime", "opts", "minor"),
+    [
+        ({"python": {"version_tuple": [3, 13, 2]}}, {"python": "3.12"}, "3.13"),  # SDK wins
+        ({}, {"python": "3.12"}, "3.12"),  # Globus Flows: no runtime, the option says it
+        ({}, {}, ""),
+    ],
+)
+def test_template_python_without_a_runtime(
+    tmp_path: Path, runtime: dict[str, Any], opts: dict[str, Any], minor: str
+) -> None:
+    import pwd
+
+    from globus_compute_endpoint.endpoint.config import CoreEndpointConfig
+    from globus_compute_endpoint.endpoint.config.utils import render_config_user_template
+    from globus_compute_endpoint.endpoint.identity_mapper import MappedPosixIdentity
+
+    template = tmp_path / "user_config_template.yaml.j2"
+    template.write_text(ep.render_template(SPEC))
+    rendered = render_config_user_template(
+        parent_config=CoreEndpointConfig(),
+        user_config_template=template.read_text(),
+        user_config_template_path=template,
+        mapped_identity=MappedPosixIdentity(pwd.getpwuid(os.getuid()), [], None),
+        user_config_schema=json.loads(ep._template("user_config_schema.json")),
+        user_opts=opts,
+        user_runtime=runtime,
+    )
+    assert yaml.safe_load(rendered)["engine"]["python_minor"] == minor

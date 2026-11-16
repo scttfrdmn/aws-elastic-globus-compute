@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import tempfile
 import time
@@ -36,6 +37,9 @@ class EndpointSpec:
     region: str
     default_env: str
     aws_profile: str = ""
+    #: Function ids the endpoint may run (#57); None leaves config.yaml's list as it is, and ()
+    #: removes it (any function).
+    allowed_functions: tuple[str, ...] | None = None
 
     @property
     def container(self) -> str:
@@ -120,9 +124,28 @@ def configure(spec: EndpointSpec, run: Runner = subprocess.run) -> None:
             *[f"cat > {ep}/{name} <<'AEGC_EOF'\n{body}AEGC_EOF" for name, body in files.items()],
             f"grep -q '^amqp_port:' {ep}/config.yaml"
             f" || printf 'amqp_port: 5671\\n' >> {ep}/config.yaml",
+            *([_allowed_functions_edit(f"{ep}/config.yaml", spec.allowed_functions)]
+              if spec.allowed_functions is not None else []),
         ]
-    )
+    )  # fmt: skip
     run(["docker", "run", "--rm", *_mounts(spec), IMAGE, "sh", "-c", script], check=True, text=True)
+
+
+def _allowed_functions_edit(path: str, functions: tuple[str, ...]) -> str:
+    """A shell step that sets (or, with none, removes) ``allowed_functions`` in config.yaml.
+
+    It goes in the manager's config: registered with Globus at start (so other functions get 403)
+    and passed to every user endpoint process.
+    """
+    code = (
+        "import sys, yaml\n"
+        "p, fns = sys.argv[1], sys.argv[2:]\n"
+        "c = yaml.safe_load(open(p)) or {}\n"
+        "c.pop('allowed_functions', None)\n"
+        "if fns: c['allowed_functions'] = fns\n"
+        "yaml.safe_dump(c, open(p, 'w'), sort_keys=False)\n"
+    )
+    return " ".join(["python3", "-c", shlex.quote(code), shlex.quote(path), *functions])
 
 
 def start(spec: EndpointSpec, run: Runner = subprocess.run) -> None:

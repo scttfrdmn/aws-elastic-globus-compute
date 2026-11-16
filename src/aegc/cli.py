@@ -140,12 +140,26 @@ def _endpoint(args: argparse.Namespace) -> int:
 
     profile = args.profile or ep.default_profile()
     region = args.region or awsutil.session(profile or None).region_name or ""
+    allowed: tuple[str, ...] | None = None
+    if args.allow_function:
+        import uuid as _uuid
+
+        if args.allow_function == ["none"]:
+            allowed = ()
+        else:
+            try:
+                allowed = tuple(str(_uuid.UUID(f)) for f in args.allow_function)
+            except ValueError:
+                raise SystemExit(
+                    "aegc: --allow-function takes function ids (UUIDs), or none to allow any"
+                ) from None
     spec = ep.EndpointSpec(
         name=args.name,
         deployment=args.deployment,
         region=region,
         default_env=args.env or "",
         aws_profile=profile,
+        allowed_functions=allowed,
     )
     cmd = args.endpoint_command
     if cmd == "build":
@@ -160,6 +174,11 @@ def _endpoint(args: argparse.Namespace) -> int:
         print(
             f"configured {spec.name}: deployment {spec.deployment}, region {region}, env {args.env}"
         )
+        if allowed is not None:
+            print(
+                f"allowed functions: {', '.join(allowed) if allowed else 'any'}; restart the "
+                "endpoint (stop, start) for Globus to enforce it"
+            )
     elif cmd == "start":
         ep.start(spec)
         print(f"started {spec.container}; endpoint id {ep.wait_for_id(spec)}")
@@ -941,6 +960,11 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--deployment", default="default", help="aegc deployment the engine uses")
     e.add_argument("--env", help="default science environment (configure); env to test (test)")
     e.add_argument("-n", type=int, default=10, help="tasks to submit (test)")
+    e.add_argument(
+        "--allow-function", action="append", metavar="ID",
+        help="configure: only these registered function ids may run (repeatable; 'none' allows "
+        "any). Globus refuses others with 403 once the endpoint restarts",
+    )  # fmt: skip
     e.add_argument("--project-dir", default=".", help="aegc source tree (build)")
     e.add_argument(
         "--python",

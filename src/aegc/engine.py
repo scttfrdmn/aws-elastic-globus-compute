@@ -459,6 +459,14 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
                     f"available: {', '.join(have)}. Submit from a matching Python version."
                 )
             candidates = {n: candidates[n] for n in matching}
+        else:
+            minors = sorted({str(p.get("python_minor")) for p in candidates.values()})
+            if len(minors) > 1:
+                return None, (
+                    f"this submission doesn't say its Python version (Globus Flows doesn't send "
+                    f"one), and env {env!r} has worker images for {', '.join(minors)}; add "
+                    f'"python": "{minors[-1]}" (your function\'s Python) to user_endpoint_config'
+                )
         return _pick_size(spec, candidates, env)
 
     def _python_check(self, name: str, pool: dict[str, Any]) -> str:

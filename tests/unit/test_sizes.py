@@ -172,3 +172,16 @@ def test_endpoint_config_defaults_route(env: Env) -> None:
         assert is_err and "no size='mem' pool" in text
     finally:
         e.shutdown()
+
+
+def test_no_python_version_and_several_minors_is_refused() -> None:
+    # Globus Flows sends no user_runtime: with images for two minors the engine must not pick one.
+    e = engine.AWSEngine(deployment="dev", region="us-west-2", env="geospatial", python_minor="")
+    pools = {
+        "geospatial-py313": {**asdict(POOL), "python_minor": "3.13", "capacity_type": "vcpu"},
+        "geospatial-py314": {**asdict(POOL), "python_minor": "3.14", "capacity_type": "vcpu"},
+    }
+    name, problem = e._pick_pool({}, pools)
+    assert name is None and '"python": "3.14"' in problem and "3.13, 3.14" in problem
+    one = {"geospatial-py314": pools["geospatial-py314"]}
+    assert e._pick_pool({}, one)[0] == "geospatial-py314"  # one minor: no ambiguity
