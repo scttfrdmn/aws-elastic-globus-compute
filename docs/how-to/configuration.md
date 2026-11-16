@@ -120,8 +120,8 @@ need, in `user_endpoint_config` (not `resource_specification`; see
 [below](#choose-the-env-size-and-walltime-from-the-client)):
 
 ```python
-user_endpoint_config={"env": "geospatial", "size": "mem"}                    # that class
-user_endpoint_config={"env": "geospatial", "cpus": 4, "memory_gib": 24}      # cheapest that fits
+user_endpoint_config = {"env": "geospatial", "size": "mem"}  # that class
+user_endpoint_config = {"env": "geospatial", "cpus": 4, "memory_gib": 24}  # cheapest that fits
 ```
 
 With `cpus` and `memory_gib` (positive numbers; either alone works), the engine takes the env's

@@ -146,9 +146,7 @@ def norm(n):
     return float(np.linalg.norm(np.arange(n)))
 
 
-with Executor(
-    endpoint_id=ENDPOINT_ID, amqp_port=5671, user_endpoint_config={"env": "numpy"}
-) as ex:
+with Executor(endpoint_id=ENDPOINT_ID, amqp_port=5671, user_endpoint_config={"env": "numpy"}) as ex:
     print(ex.submit(norm, 1_000_000).result())
 ```
 
