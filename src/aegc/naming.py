@@ -140,6 +140,11 @@ def worker_role(deployment: str, region: str) -> str:
     return f"{PREFIX}-{deployment}-worker-{region}"
 
 
+def task_role(deployment: str, region: str) -> str:
+    """The role task code runs with (its grants), assumed by the agent for its tasks (#32)."""
+    return f"{PREFIX}-{deployment}-task-{region}"
+
+
 def ecr_template_role(region: str) -> str:
     """Region-wide role ECR assumes to create and tag pull-through cache repositories."""
     return f"{PREFIX}-ecr-template-{region}"

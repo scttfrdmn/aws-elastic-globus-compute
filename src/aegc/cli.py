@@ -321,6 +321,8 @@ def _pool_spec(
         if kw["max_vcpus"] and vmax > kw["max_vcpus"]:
             kw["vcpu_max"] = max(int(kw["max_vcpus"]), int(kw.get("vcpu_min", 2)))
     kw["image"] = rec.image
+    # 0.4 workers isolate task processes from the worker role (#32); older images can't.
+    kw["isolate_tasks"] = _version(rec.aegc_version) >= (0, 4)
     try:
         return deployment.PoolSpec(**kw)
     except ValueError as e:
@@ -459,6 +461,13 @@ def _deploy(args: argparse.Namespace) -> int:
             args.grant, prev, deployment=args.deployment, account=account, region=region
         ),
     )
+    if old := [p.name for p in pools if not p.isolate_tasks]:
+        print(
+            f"warning: {', '.join(old)}: images built before aegc 0.4 run tasks with the worker "
+            "role's credentials (they can read other tasks' payloads and post results); rebuild "
+            "them with `aegc image build` to isolate tasks",
+            file=sys.stderr,
+        )
     errors = _quota_preflight(sess, [asdict(p) for p in pools])
     if errors and not args.dry_run:
         raise SystemExit("aegc: " + "\naegc: ".join(errors))

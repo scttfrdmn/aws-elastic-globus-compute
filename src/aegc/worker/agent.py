@@ -83,6 +83,8 @@ class Agent:
     #: a loop pass takes at most one long poll plus botocore's retries (5 x (10 s + 30 s)).
     loop_stale_s: float = 300.0
     stats: Stats = field(default_factory=Stats)
+    #: Isolated pools: the environment task processes get (task-role credentials, #32).
+    task_env: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._lock = threading.Lock()
@@ -99,6 +101,16 @@ class Agent:
         self._last_activity = self.clock()
         self._ctx = self.ctx or runner.context()
         self._scratch = Path(self.config.scratch)
+        self._task_uid: int | None = None
+        if self.config.task_uid:
+            if os.geteuid() == 0:
+                self._task_uid = self.config.task_uid
+            else:
+                log.error(
+                    "this pool isolates tasks, but the agent isn't root; tasks run as uid %d "
+                    "with the agent's credentials",
+                    os.geteuid(),
+                )
         self._halt: State | None = None  # set when the deployment state isn't running
         self._state_checked = -1e18
         self._started_at = _boot_time()
@@ -267,6 +279,8 @@ class Agent:
                 run_in_sandbox=msg.call.run_in_sandbox,
                 task_deserializers=msg.call.task_deserializers,
                 result_serializers=msg.call.result_serializers,
+                task_uid=self._task_uid,
+                task_env=self.task_env or None,
             )
         except Exception as e:
             log.exception("runner failed for %s", msg.executor_task_id)
@@ -406,7 +420,11 @@ class Agent:
     # --- background loops -------------------------------------------------------------------
 
     def _heartbeat_loop(self) -> None:
-        hb = self._scratch / ".aegc-heartbeat"
+        hb = (
+            Path(self.config.state_dir) / "heartbeat"
+            if self.config.state_dir
+            else self._scratch / ".aegc-heartbeat"
+        )
         next_file = 0.0
         while not self._stop.wait(min(self.config.heartbeat_s, self.heartbeat_file_s)):
             self.extend_visibility()

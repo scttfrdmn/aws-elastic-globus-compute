@@ -32,6 +32,11 @@ class WorkerConfig:
     lifecycle: str = ""  # "spot" or "on-demand", from IMDS
     root_volume_gib: int = 30
     throughput_mibps: int = 125
+    # Isolated pools (#32): tasks run as task_uid with the task role's credentials, and the
+    # agent keeps its state (heartbeat, credentials token) in the root-owned state_dir.
+    task_role_arn: str = ""
+    task_uid: int = 0
+    state_dir: str = ""
     size_class: str = ""  # aegc.sizes; empty: one task per vCPU
     task_cpus: int = 1
     task_memory_gib: float = 0

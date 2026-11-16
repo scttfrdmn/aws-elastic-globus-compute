@@ -34,6 +34,18 @@ def _run(_: argparse.Namespace) -> int:
     except Exception as e:  # off EC2, or IMDS unreachable: the ledger records less
         logging.getLogger("aegc").warning("couldn't read instance identity: %s", e)
     sess = awsutil.session(region=cfg.region)
+    task_env: dict[str, str] = {}
+    creds = None
+    if cfg.task_role_arn:  # isolated pool (#32): tasks get the task role, not the worker role
+        from aegc.worker.credentials import TaskCredentials
+
+        creds = TaskCredentials(
+            sts=awsutil.client(sess, "sts"),
+            role_arn=cfg.task_role_arn,
+            session_name=f"aegc-{cfg.instance_id or 'worker'}",
+            token_file=Path(cfg.state_dir or "/run/aegc") / "task-token",
+        )
+        task_env = creds.start()
     agent = Agent(
         config=cfg,
         sqs=awsutil.client(sess, "sqs"),
@@ -41,6 +53,7 @@ def _run(_: argparse.Namespace) -> int:
         autoscaling=awsutil.client(sess, "autoscaling"),
         ssm=awsutil.client(sess, "ssm") if cfg.state_parameter else None,
         metadata=imds,
+        task_env=task_env,
     )
 
     def on_term(signum: int, _frame: FrameType | None) -> None:
@@ -52,7 +65,11 @@ def _run(_: argparse.Namespace) -> int:
     logging.getLogger("aegc").info(
         "aegc-worker: pool %s, %d slots, queue %s", cfg.pool, cfg.slot_count, cfg.task_queue_url
     )
-    reason = agent.run()
+    try:
+        reason = agent.run()
+    finally:
+        if creds is not None:
+            creds.stop()
     logging.getLogger("aegc").info("aegc-worker: exiting (%s): %s", reason, agent.stats)
     return 0
 

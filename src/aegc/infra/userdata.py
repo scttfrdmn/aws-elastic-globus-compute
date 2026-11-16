@@ -15,8 +15,10 @@ from dataclasses import dataclass
 from string import Template
 from typing import Any
 
-#: aarchsci images run as mambauser.
+#: aarchsci images run as mambauser; isolated pools run task processes as this uid (#32).
 DEFAULT_WORKER_UID = 57439
+#: Isolated pools: the agent's state (heartbeat, task credentials token), root-owned.
+STATE_DIR = "/run/aegc"
 
 _TEMPLATE = Template(
     r"""#!/bin/bash
@@ -63,7 +65,7 @@ done
 [ -n "$$pulled" ] || fail "couldn't pull $$IMAGE"
 
 mkdir -p /scratch && chown ${worker_uid}:${worker_uid} /scratch
-
+${isolation}
 cat > /etc/systemd/system/aegc-worker.service <<UNIT
 [Unit]
 Description=aegc worker (${deployment}/${pool})
@@ -79,7 +81,7 @@ TimeoutStopSec=150
 ExecStartPre=-/usr/bin/docker rm -f aegc-worker
 ExecStart=/usr/bin/docker run --rm --init --name aegc-worker --network host --ipc host \
   --log-driver awslogs --log-opt awslogs-region=$$REGION --log-opt awslogs-group=${log_group} \
-  --log-opt awslogs-stream=${pool}/$$IID -v /scratch:/scratch --stop-timeout 120 \
+  --log-opt awslogs-stream=${pool}/$$IID -v /scratch:/scratch --stop-timeout 120 ${docker_flags}\
   -e AEGC_WORKER_CONFIG_B64=${config_b64} -e AEGC_INSTANCE_ID=$$IID -e AWS_REGION=$$REGION \
   $$IMAGE aegc-worker run
 ExecStop=/usr/bin/docker stop -t 120 aegc-worker
@@ -93,7 +95,7 @@ cat > /usr/local/bin/aegc-watchdog <<'WATCH'
 # Terminate this instance if the worker has been down, or silent, for too long, or if the
 # instance has outlived its lifetime (the worker stops claiming at max_lifetime_s; this is the
 # backstop: lifetime + the longest walltime + 15 minutes).
-HB=/scratch/.aegc-heartbeat
+HB=${heartbeat}
 stale=$$(( $$(date +%s) - $$(stat -c %Y "$$HB" 2>/dev/null || echo 0) ))
 up=$$(cut -d. -f1 /proc/uptime)
 if ! systemctl is-active --quiet aegc-worker || [ "$$stale" -gt ${watchdog_stale_s} ] \
@@ -145,6 +147,7 @@ class WorkerBoot:
     image: str  # <registry>/<repo>@sha256:<digest>
     log_group: str
     worker_config: dict[str, Any]
+    isolate: bool = False  # task processes without instance-role access (#32)
     worker_uid: int = DEFAULT_WORKER_UID
     watchdog_stale_s: int = 600
     watchdog_grace_s: int = 900
@@ -168,6 +171,33 @@ def render(boot: WorkerBoot) -> str:
         watchdog_stale_s=boot.watchdog_stale_s,
         watchdog_grace_s=boot.watchdog_grace_s,
         max_age_s=boot.max_age_s,
+        isolation=_isolation(boot) if boot.isolate else "",
+        docker_flags=_DOCKER_ISOLATED if boot.isolate else "",
+        heartbeat=f"{STATE_DIR}/heartbeat" if boot.isolate else "/scratch/.aegc-heartbeat",
+    )
+
+
+#: The agent runs as root, with only the capabilities it needs to start task processes as the
+#: task uid, own their directories and signal them; no-new-privileges stops setuid binaries.
+_DOCKER_ISOLATED = (
+    "--user 0 --security-opt no-new-privileges --cap-drop ALL "
+    + " ".join(
+        f"--cap-add {c}" for c in ("SETUID", "SETGID", "KILL", "CHOWN", "DAC_OVERRIDE", "FOWNER")
+    )
+    + f" -v {STATE_DIR}:{STATE_DIR} "
+)
+
+
+def _isolation(boot: WorkerBoot) -> str:
+    """Root-owned agent state, and no instance metadata for the task uid: tasks get the task
+    role's credentials from the agent instead of the worker role's (#32)."""
+    uid = boot.worker_uid
+    return (
+        f"mkdir -p {STATE_DIR} && chown root:root {STATE_DIR} && chmod 755 {STATE_DIR}\n"
+        f"iptables -w -I OUTPUT -d 169.254.169.254 -m owner --uid-owner {uid} -j REJECT \\\n"
+        '  || fail "couldn\'t block instance metadata for tasks"\n'
+        f"ip6tables -w -I OUTPUT -d fd00:ec2::254 -m owner --uid-owner {uid} -j REJECT "
+        "2>/dev/null || true\n"
     )
 
 

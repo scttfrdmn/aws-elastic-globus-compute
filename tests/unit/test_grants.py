@@ -10,7 +10,7 @@ import pytest
 
 from aegc import cli, naming
 from aegc.infra import deployment, iam
-from aegc.infra.deployment import Clients, DeploymentSpec
+from aegc.infra.deployment import Clients, DeploymentSpec, PoolSpec
 from aegc.infra.iam import Grant
 from tests.conftest import ACCOUNT, REGION
 from tests.unit.test_deployment import env as env  # the fixture
@@ -155,8 +155,13 @@ def test_deployer_can_manage_the_grants_policy(aws: Callable[[str], Any]) -> Non
 # --- deploy and destroy ------------------------------------------------------------------------
 
 
-def role_policies(c: Clients) -> list[str]:
-    return sorted(c.iam.list_role_policies(RoleName=ROLE)["PolicyNames"])
+WORKER_GRANTS = f"{iam.GRANTS_POLICY} (worker role)"
+TASK_GRANTS = f"{iam.GRANTS_POLICY} (task role)"
+TASK_ROLE = "aegc-dev-task-us-west-2"
+
+
+def role_policies(c: Clients, role: str = ROLE) -> list[str]:
+    return sorted(c.iam.list_role_policies(RoleName=role)["PolicyNames"])
 
 
 def worker_config_of(c: Clients) -> dict[str, Any]:
@@ -177,7 +182,9 @@ def test_deploy_puts_redeploy_clears_destroy_removes(env: tuple[Clients, Deploym
     grants = (Grant.parse("read=s3://open-data/in/"), Grant.parse("write=s3://lab/out/"))
     with_grants = DeploymentSpec(**{**spec.__dict__, "grants": grants})
     r = outcomes(deployment.deploy(c, with_grants))
-    assert r[("iam role policy", iam.GRANTS_POLICY)] == "updated"
+    # POOL's image predates 0.4, so its tasks still run with the worker role: both roles get them.
+    assert r[("iam role policy", WORKER_GRANTS)] == "updated"
+    assert r[("iam role policy", TASK_GRANTS)] == "updated"
     assert role_policies(c) == [iam.GRANTS_POLICY, iam.WORKER_POLICY]
     doc = c.iam.get_role_policy(RoleName=ROLE, PolicyName=iam.GRANTS_POLICY)["PolicyDocument"]
     doc = json.loads(doc) if isinstance(doc, str) else doc
@@ -193,12 +200,13 @@ def test_deploy_puts_redeploy_clears_destroy_removes(env: tuple[Clients, Deploym
 
     # Redeploying without grants (--grant none) deletes the policy, and says so once.
     r = outcomes(deployment.deploy(c, spec))
-    assert r[("iam role policy", iam.GRANTS_POLICY)] == "deleted"
+    assert r[("iam role policy", WORKER_GRANTS)] == "deleted"
+    assert r[("iam role policy", TASK_GRANTS)] == "deleted"
     assert role_policies(c) == [iam.WORKER_POLICY]
     assert deployment.read_manifest(c.ssm, "dev")["grants"] == []
     assert "grants" not in worker_config_of(c)
     r = outcomes(deployment.deploy(c, spec))
-    assert ("iam role policy", iam.GRANTS_POLICY) not in r
+    assert ("iam role policy", WORKER_GRANTS) not in r
 
     deployment.deploy(c, with_grants)
     assert iam.GRANTS_POLICY in role_policies(c)
@@ -262,3 +270,73 @@ def test_cli_parses_grant_flags() -> None:
     )
     assert args.grant == ["read=s3://a-b/c/", "none"]
     assert cli.build_parser().parse_args(["deploy", "dev", "--pool", "sci"]).grant is None
+
+
+def test_isolated_pools_keep_grants_off_the_worker_role(
+    env: tuple[Clients, DeploymentSpec],
+) -> None:
+    # #32: tasks of 0.4 images get the task role; the worker role (queues, payloads, ledger,
+    # Auto Scaling) never holds the grants.
+    from dataclasses import asdict
+
+    from tests.unit.test_deployment import POOL
+
+    c, spec = env
+    pool = PoolSpec(**{**asdict(POOL), "isolate_tasks": True})
+    grants = (Grant.parse("read=s3://open-data/in/"), Grant.parse("write=s3://lab/out/"))
+    iso = DeploymentSpec(**{**spec.__dict__, "pools": (pool,), "grants": grants})
+    deployment.deploy(c, iso)
+    assert role_policies(c) == [iam.WORKER_POLICY]
+    assert role_policies(c, TASK_ROLE) == [iam.GRANTS_POLICY, iam.TASK_POLICY]
+    trust = c.iam.get_role(RoleName=TASK_ROLE)["Role"]["AssumeRolePolicyDocument"]
+    trust = json.loads(trust) if isinstance(trust, str) else trust
+    (st,) = trust["Statement"]
+    assert st["Principal"] == {"AWS": f"arn:aws:iam::{ACCOUNT}:role/aegc/{ROLE}"}
+    cfg = worker_config_of(c)
+    assert cfg["task_role_arn"].endswith(f"/{TASK_ROLE}") and cfg["task_uid"] == 57439
+    done = outcomes(
+        deployment.destroy(c, deployment="dev", region=REGION, dry_run=False, wait_s=30, poll_s=0.1)
+    )
+    assert done[("iam role", TASK_ROLE)] == "deleted"
+
+
+def test_task_role_can_only_use_its_grants(aws: Callable[[str], Any]) -> None:
+    # The IAM simulator: the task role reaches its grants and the manifest, nothing of the
+    # worker's (task queues, result queues, payloads, ledger, Auto Scaling).
+    c = aws("iam")
+    policy = iam.task_policy(deployment="dev", region=REGION, account=ACCOUNT)
+    grants = iam.grants_policy(
+        (Grant.parse("write=s3://lab/out/"),), deployment="dev", account=ACCOUNT
+    )
+    docs = [json.dumps(policy), json.dumps(grants)]
+
+    def allowed(action: str, resource: str) -> bool:
+        r = c.simulate_custom_policy(
+            PolicyInputList=docs,
+            ActionNames=[action],
+            ResourceArns=[resource],
+            ContextEntries=[
+                {
+                    "ContextKeyName": "s3:ResourceAccount",
+                    "ContextKeyValues": [ACCOUNT],
+                    "ContextKeyType": "string",
+                }
+            ],
+        )["EvaluationResults"][0]
+        return bool(r["EvalDecision"] == "allowed")
+
+    sqs = f"arn:aws:sqs:{REGION}:{ACCOUNT}"
+    bucket = naming.bucket_name(ACCOUNT, REGION)
+    assert allowed("s3:PutObject", "arn:aws:s3:::lab/out/x")
+    assert allowed(
+        "ssm:GetParameter", f"arn:aws:ssm:{REGION}:{ACCOUNT}:parameter/aegc/dev/manifest"
+    )
+    for action, resource in (
+        ("sqs:ReceiveMessage", f"{sqs}:aegc-dev-sci-py314-tasks"),
+        ("sqs:SendMessage", f"{sqs}:aegc-dev-res-abc"),
+        ("s3:GetObject", f"arn:aws:s3:::{bucket}/payloads/dev/tasks/t/1.task"),
+        ("s3:PutObject", f"arn:aws:s3:::{bucket}/ledger/dev/x.json"),
+        ("autoscaling:SetDesiredCapacity", "*"),
+        ("ssm:GetParameter", f"arn:aws:ssm:{REGION}:{ACCOUNT}:parameter/aegc/dev/state"),
+    ):
+        assert not allowed(action, resource), action

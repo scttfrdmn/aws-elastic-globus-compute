@@ -66,6 +66,9 @@ class PoolSpec:
     task_cpus: int = 1  # vCPUs per task (0: the whole instance)
     task_memory_gib: float = 0  # memory per task (0: not a slot limit)
     memory_gib_per_vcpu_min: float = 0  # InstanceRequirements MemoryGiBPerVCpu.Min (0: unset)
+    # Task processes run as uid 57439 without instance-role access, with the task role's
+    # credentials (#32). Needs an image built with aegc 0.4 or later.
+    isolate_tasks: bool = False
 
     def __post_init__(self) -> None:
         naming.validate_name("pool", self.name)
@@ -160,11 +163,22 @@ class DeploymentSpec:
             deployment=self.deployment, region=self.region, account=self.account, bucket=self.bucket
         )
 
+    def task_policy(self) -> dict[str, Any]:
+        return iam.task_policy(deployment=self.deployment, region=self.region, account=self.account)
+
+    @property
+    def unisolated_pools(self) -> tuple[str, ...]:
+        """Pools whose tasks still run with the worker role (images older than aegc 0.4)."""
+        return tuple(p.name for p in self.pools if not p.isolate_tasks)
+
     def grants_policy(self) -> dict[str, Any] | None:
-        """The ``aegc-grants`` document, or None without grants."""
+        """The ``aegc-grants`` document, or None without grants. It goes on the task role, and
+        on the worker role too while any pool isn't isolated; it must fit next to either."""
         if not self.grants:
             return None
-        room = iam.INLINE_POLICY_LIMIT - iam.policy_size(self.worker_policy())
+        room = iam.INLINE_POLICY_LIMIT - max(
+            iam.policy_size(self.worker_policy()), iam.policy_size(self.task_policy())
+        )
         return iam.grants_policy(
             self.grants, deployment=self.deployment, budget=room, account=self.account
         )
@@ -196,6 +210,64 @@ def _retry(fn: Callable[[], Any], *, codes: set[str], attempts: int, delay_s: fl
 # --- deployment-level --------------------------------------------------------------------------
 
 
+def _set_grants(
+    c: Clients, role: str, grants: dict[str, Any] | None, n: int, report: Report, *, role_kind: str
+) -> None:
+    label = f"{iam.GRANTS_POLICY} ({role_kind} role)"
+    if grants is not None:
+        c.iam.put_role_policy(
+            RoleName=role, PolicyName=iam.GRANTS_POLICY, PolicyDocument=json.dumps(grants)
+        )
+        report.add("iam role policy", label, "updated", f"{n} grant(s)")
+        return
+    try:
+        c.iam.delete_role_policy(RoleName=role, PolicyName=iam.GRANTS_POLICY)
+        report.add("iam role policy", label, "deleted")
+    except Exception as e:
+        if not is_not_found(e):
+            raise
+
+
+def ensure_task_role(c: Clients, spec: DeploymentSpec, report: Report, *, dry_run: bool) -> str:
+    """The task role (#32): trusted only by the worker role, with the grants and the manifest
+    read. Returns its ARN."""
+    d, name = spec.deployment, naming.task_role(spec.deployment, spec.region)
+    arn = f"arn:aws:iam::{spec.account}:role{naming.IAM_PATH}{name}"
+    worker_arn = (
+        f"arn:aws:iam::{spec.account}:role{naming.IAM_PATH}"
+        f"{naming.worker_role(spec.deployment, spec.region)}"
+    )
+    trust = json.dumps(iam.task_trust_policy(worker_arn))
+    try:
+        found = naming.tag_dict(c.iam.list_role_tags(RoleName=name)["Tags"])
+        if not naming.is_owned(name, found, d):
+            raise OwnershipError(f"IAM role {name} exists but isn't tagged as {d}'s")
+        outcome: Outcome = "exists"
+        if not dry_run:
+            c.iam.update_assume_role_policy(RoleName=name, PolicyDocument=trust)
+    except Exception as e:
+        if isinstance(e, OwnershipError) or not is_not_found(e):
+            raise
+        outcome = "would-create" if dry_run else "created"
+        if not dry_run:
+            c.iam.create_role(
+                Path=naming.IAM_PATH,
+                RoleName=name,
+                AssumeRolePolicyDocument=trust,
+                Description=f"aegc task code for deployment {d} (its grants)",
+                MaxSessionDuration=3600,
+                Tags=naming.tag_list(naming.tags(d, "task-role", extra=spec.extra_tags)),
+            )
+    report.add("iam role", name, outcome)
+    if dry_run:
+        return arn
+    c.iam.put_role_policy(
+        RoleName=name, PolicyName=iam.TASK_POLICY, PolicyDocument=json.dumps(spec.task_policy())
+    )
+    _set_grants(c, name, spec.grants_policy(), len(spec.grants), report, role_kind="task")
+    return arn
+
+
 def ensure_worker_role(c: Clients, spec: DeploymentSpec, report: Report, *, dry_run: bool) -> str:
     d, name = spec.deployment, naming.worker_role(spec.deployment, spec.region)
     tags = naming.tag_list(naming.tags(d, "worker-role", extra=spec.extra_tags))
@@ -222,18 +294,10 @@ def ensure_worker_role(c: Clients, spec: DeploymentSpec, report: Report, *, dry_
     if dry_run:
         return profile_arn
     c.iam.put_role_policy(RoleName=name, PolicyName=iam.WORKER_POLICY, PolicyDocument=policy)
-    if (grants := spec.grants_policy()) is not None:
-        c.iam.put_role_policy(
-            RoleName=name, PolicyName=iam.GRANTS_POLICY, PolicyDocument=json.dumps(grants)
-        )
-        report.add("iam role policy", iam.GRANTS_POLICY, "updated", f"{len(spec.grants)} grant(s)")
-    else:
-        try:
-            c.iam.delete_role_policy(RoleName=name, PolicyName=iam.GRANTS_POLICY)
-            report.add("iam role policy", iam.GRANTS_POLICY, "deleted")
-        except Exception as e:
-            if not is_not_found(e):
-                raise
+    # Tasks of isolated pools get grants through the task role; unisolated pools' tasks still
+    # run with this role, so it keeps them while there are any.
+    grants = spec.grants_policy() if spec.unisolated_pools else None
+    _set_grants(c, name, grants, len(spec.grants), report, role_kind="worker")
 
     try:
         prof = c.iam.get_instance_profile(InstanceProfileName=name)["InstanceProfile"]
@@ -454,6 +518,17 @@ def worker_config(spec: DeploymentSpec, pool: PoolSpec, task_queue_url: str) -> 
         "root_volume_gib": pool.root_volume_gib,
         "throughput_mibps": pool.throughput_mibps,
         "max_lifetime_s": pool.max_lifetime_s,
+        # Only for isolated pools (#32), so other pools' user data doesn't change.
+        **(
+            {
+                "task_role_arn": f"arn:aws:iam::{spec.account}:role{naming.IAM_PATH}"
+                f"{naming.task_role(spec.deployment, spec.region)}",
+                "task_uid": userdata.DEFAULT_WORKER_UID,
+                "state_dir": userdata.STATE_DIR,
+            }
+            if pool.isolate_tasks
+            else {}
+        ),
         # Only for sized pools, so other pools' user data (and launch templates) don't change.
         **(
             {
@@ -495,6 +570,7 @@ def launch_template_data(
         image=pool.image,
         log_group=naming.log_group(d),
         worker_config=worker_config(spec, pool, task_queue_url),
+        isolate=pool.isolate_tasks,
         max_age_s=pool.max_lifetime_s + (pool.max_walltime_s or protocol.MAX_WALLTIME_S) + 900,
     )
     instance_tags = naming.tag_list(naming.tags(d, "worker", pool=pool.name, extra=spec.extra_tags))
@@ -895,6 +971,7 @@ def deploy(c: Clients, spec: DeploymentSpec, *, dry_run: bool = False) -> Report
         )
     inuse = _protect_images(c, spec, report, dry_run=dry_run)
     profile_arn = ensure_worker_role(c, spec, report, dry_run=dry_run)
+    ensure_task_role(c, spec, report, dry_run=dry_run)
     vpc, subnets = resolve_network(c.ec2, spec)
     if not subnets:
         raise RuntimeError(f"no subnets found in {vpc}")
@@ -1128,6 +1205,7 @@ def destroy(
             dry_run=dry_run,
         )  # fmt: skip
     _destroy_worker_role(c, d, region, report, dry_run=dry_run)
+    _destroy_role(c, d, naming.task_role(d, region), report, dry_run=dry_run)
 
     log_name = naming.log_group(d)
     for g in list(
@@ -1276,10 +1354,20 @@ def verify_destroyed(
         ),
         ("iam role", lambda: c.iam.list_role_tags(RoleName=role)),
     ]
+    task = naming.task_role(d, region)
     for kind, list_tags in checks:
         try:
             if naming.is_owned(role, naming.tag_dict(list_tags()["Tags"]), d):
                 report.add(kind, role, "remaining")
+        except Exception as e:
+            if not is_not_found(e):
+                raise
+    if True:  # the task role (#32)
+        try:
+            if naming.is_owned(
+                task, naming.tag_dict(c.iam.list_role_tags(RoleName=task)["Tags"]), d
+            ):
+                report.add("iam role", task, "remaining")
         except Exception as e:
             if not is_not_found(e):
                 raise
@@ -1342,6 +1430,11 @@ def _destroy_worker_role(c: Clients, d: str, region: str, report: Report, *, dry
     except Exception as e:
         if not is_not_found(e):
             raise
+    _destroy_role(c, d, name, report, dry_run=dry_run)
+
+
+def _destroy_role(c: Clients, d: str, name: str, report: Report, *, dry_run: bool) -> None:
+    verb: Outcome = "would-delete" if dry_run else "deleted"
     try:
         role_tags = naming.tag_dict(c.iam.list_role_tags(RoleName=name)["Tags"])
         if naming.is_owned(name, role_tags, d):

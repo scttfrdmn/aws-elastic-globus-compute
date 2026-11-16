@@ -545,6 +545,18 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
                 [etid], block_id=msg.worker.get("pool"), job_id=msg.worker.get("instance_id")
             )
             return
+        # Before anything else: a forged message pointing at another key (e.g. another task's
+        # input, #32) must neither be returned nor make the engine delete that object.
+        ref = msg.result.s3 if msg.result is not None else None
+        if ref is not None and (
+            ref.key != protocol.result_payload_key(self.deployment, msg.task_uuid, msg.attempt)
+            or ref.bucket != self._manifest_value("bucket")
+        ):
+            log.warning(
+                "ignoring a result for %s that points at s3://%s/%s, not its own result key",
+                msg.task_uuid, ref.bucket, ref.key,
+            )  # fmt: skip
+            return
 
         with self._lock:
             entry = self._inflight.get(etid)

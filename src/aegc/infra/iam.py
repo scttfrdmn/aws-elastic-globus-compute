@@ -218,6 +218,41 @@ def ec2_trust_policy() -> dict[str, Any]:
     }
 
 
+#: The task role's own inline policy (grants go in aegc-grants next to it).
+TASK_POLICY = "aegc-task"
+
+
+def task_trust_policy(worker_role_arn: str) -> dict[str, Any]:
+    """Only the deployment's worker role may assume its task role."""
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"AWS": worker_role_arn},
+                "Action": "sts:AssumeRole",
+            }
+        ],
+    }
+
+
+def task_policy(*, deployment: str, region: str, account: str) -> dict[str, Any]:
+    """What task code may do besides its grants: read the manifest, for aegc.outputs' current
+    grants. Nothing else: no queues, payloads, ledger or Auto Scaling."""
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "ReadManifest",
+                "Effect": "Allow",
+                "Action": "ssm:GetParameter",
+                "Resource": f"arn:aws:ssm:{region}:{account}:parameter"
+                f"{naming.deployment_manifest_parameter(deployment)}",
+            }
+        ],
+    }
+
+
 def worker_policy(*, deployment: str, region: str, account: str, bucket: str) -> dict[str, Any]:
     """Least privilege for aegc-worker on an instance of ``deployment``.
 
@@ -311,6 +346,14 @@ def worker_policy(*, deployment: str, region: str, account: str, bucket: str) ->
             {
                 # Stop claiming when the deployment is capped, stopped or expired.
                 # The state (stop, caps), and the manifest for aegc.outputs' current grants.
+                # The agent assumes the task role and hands its credentials to task processes.
+                "Sid": "AssumeTaskRole",
+                "Effect": "Allow",
+                "Action": "sts:AssumeRole",
+                "Resource": f"arn:aws:iam::{account}:role{naming.IAM_PATH}"
+                f"{naming.task_role(d, region)}",
+            },
+            {
                 "Sid": "ReadDeploymentState",
                 "Effect": "Allow",
                 "Action": "ssm:GetParameter",
