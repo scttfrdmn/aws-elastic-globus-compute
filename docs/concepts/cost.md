@@ -234,6 +234,11 @@ every release). The Cost Explorer API is served from `us-east-1` whatever region
 [Billing console](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/activating-tags.html)
 does the same thing. Without a backfill, activation applies only to usage from then on.
 
+Even with a backfill, don't count on Cost Explorer for usage from before activation: in our account
+a deployment that ran a few hours before activation never appeared under its tag, although the
+backfill succeeded. Deployments after activation matched the ledger closely (v03: $0.0150 billed,
+$0.0154 estimated). Cost Explorer also lags by up to a day; `aegc cost` doesn't.
+
 ## Keeping costs predictable
 
 - Set a spend limit, `--max-usd-day` or `--max-usd-month`, on every deployment.
