@@ -49,6 +49,8 @@ def _run(_: argparse.Namespace) -> int:
             token_file=Path(cfg.state_dir or "/run/aegc") / "task-token",
         )
         task_env = creds.start()
+        # botocore found the region through instance metadata, which tasks can't reach now.
+        task_env.update({"AWS_REGION": cfg.region, "AWS_DEFAULT_REGION": cfg.region})
     agent = Agent(
         config=cfg,
         sqs=awsutil.client(sess, "sqs"),

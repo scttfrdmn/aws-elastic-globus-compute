@@ -231,3 +231,46 @@ def test_oversized_results_are_refused(tmp_path: Path, monkeypatch: pytest.Monke
         endpoint_id=str(uuid.uuid4()), run_dir=tmp_path / "t", walltime_s=60,
     )  # fmt: skip
     assert out.outcome == "crashed" and out.result is None
+
+
+def test_worker_cli_gives_tasks_a_region(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # Found live: with instance metadata blocked, boto3 in a task had no region (NoRegionError).
+    import base64
+    import json as _json
+
+    from aegc.worker import cli as wcli
+
+    captured: dict[str, Any] = {}
+
+    class FakeCreds:
+        def __init__(self, **kw: Any) -> None: ...
+
+        def start(self) -> dict[str, str]:
+            return {"AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://127.0.0.1:1/x"}
+
+        def stop(self) -> None: ...
+
+    class FakeAgent:
+        def __init__(self, **kw: Any) -> None:
+            captured.update(kw)
+            self.stats = None
+
+        def run(self) -> str:
+            return "test"
+
+        def stop(self, reason: str) -> None: ...
+
+        def handle_notice(self, kind: str) -> None: ...
+
+    cfg = {"deployment": "d", "pool": "p", "region": "us-west-2", "task_queue_url": "q",
+           "bucket": "b", "task_role_arn": "arn:aws:iam::1:role/aegc/t", "task_uid": 57439,
+           "state_dir": str(tmp_path)}  # fmt: skip
+    monkeypatch.setenv(
+        "AEGC_WORKER_CONFIG_B64", base64.b64encode(_json.dumps(cfg).encode()).decode()
+    )
+    monkeypatch.setattr("aegc.worker.credentials.TaskCredentials", FakeCreds)
+    monkeypatch.setattr("aegc.worker.agent.Agent", FakeAgent)
+    monkeypatch.setattr("aegc.worker.imds.Imds.identity", lambda self: {})
+    assert wcli.main(["run"]) == 0
+    env = captured["task_env"]
+    assert env["AWS_DEFAULT_REGION"] == env["AWS_REGION"] == "us-west-2"
