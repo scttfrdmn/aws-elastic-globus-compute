@@ -17,11 +17,13 @@ def _run(_: argparse.Namespace) -> int:
     from dataclasses import replace
 
     from aegc import awsutil
+    from aegc.worker import jsonlog
     from aegc.worker.agent import Agent
     from aegc.worker.config import WorkerConfig
     from aegc.worker.imds import Imds
 
     cfg = WorkerConfig.from_env()
+    jsonlog.set_context(deployment=cfg.deployment, pool=cfg.pool, instance_id=cfg.instance_id)
     imds = Imds()
     try:
         ident = imds.identity()
@@ -33,6 +35,7 @@ def _run(_: argparse.Namespace) -> int:
         )
     except Exception as e:  # off EC2, or IMDS unreachable: the ledger records less
         logging.getLogger("aegc").warning("couldn't read instance identity: %s", e)
+    jsonlog.set_context(type=cfg.instance_type, az=cfg.availability_zone, lifecycle=cfg.lifecycle)
     sess = awsutil.session(region=cfg.region)
     agent = Agent(
         config=cfg,
@@ -121,7 +124,6 @@ def _version(_: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(prog="aegc-worker")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("run", help="claim and run tasks until drained").set_defaults(func=_run)
@@ -130,6 +132,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     sub.add_parser("version", help="aegc, Python and uid, as JSON").set_defaults(func=_version)
     args = parser.parse_args(argv)
+    if args.command == "run":
+        # On instances: one JSON object per line, for CloudWatch Logs Insights (#39).
+        from aegc.worker import jsonlog
+
+        jsonlog.configure()
+    else:  # image builds and checks: for people
+        logging.basicConfig(
+            level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s"
+        )
     return int(args.func(args))
 
 

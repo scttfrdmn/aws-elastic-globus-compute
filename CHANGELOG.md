@@ -6,6 +6,32 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **JSON worker logs:** `aegc-worker run` logs one JSON object per line (stdlib only): `ts`,
+  `level`, `logger`, `msg`, the worker's `deployment`, `pool`, `instance_id`, `type`, `az` and
+  `lifecycle`, and per-task `task_uuid`, `attempt`, `etid`, `receive_count`. Each task ends with
+  a `task finished` line (`"event": "task_finished"`) carrying its `outcome`, phase times
+  (`received_at`, `started_at`, `finished_at`, `exec_s`, `queue_wait_s`) and its provenance
+  record. Message wording is unchanged. `selftest` and `version` keep plain-text logs (#39).
+- **EMF metrics:** the worker writes CloudWatch Embedded Metric Format lines to stdout, and user
+  data adds `--log-opt awslogs-format=json/emf` so CloudWatch Logs extracts them. No new worker
+  IAM. Namespace `aegc`, dimensions `[Deployment, Pool]` and `[Deployment]` only, plus
+  `[Deployment, Pool, Outcome]` on `TasksCompleted` (Outcome `ok` or `task_error`) and
+  `TasksFailed` (`walltime`, `crashed`, `poison`, `payload_missing`, `refused`); also
+  `ExecSeconds`, `QueueWaitSeconds` (from the task message's `submitted_at`),
+  `BootToFirstClaimSeconds`, `Interruptions`, `Releases`, `PoisonTasks` and `WorkerExit` (#39).
+- **Provenance in results:** each Result's `details` keeps what `execute_task` put there and
+  gains `details["aegc"]`: the image digest, instance id and type, Availability Zone, Spot or
+  on-demand, vCPUs and slots, attempt and receive count, timings, and `est_cost_usd` (this
+  task's share of its instance at the static on-demand price, Spot's ceiling). User data passes
+  the image to the worker as `AEGC_IMAGE`; result messages also carry `timings.queue_wait_s`
+  (#40).
+
+### Changed
+- **Worker user data changes** (the awslogs format and `AEGC_IMAGE`), so the next `aegc deploy`
+  adds a launch template version to every pool. Running workers keep the old one until they
+  leave; workers from images built before 0.4 log plain text and emit no metrics.
+
 ## [0.3.0] - 2026-11-15
 
 Run your own work: worker images from any arm64 base, several Python versions per environment,

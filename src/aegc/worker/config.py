@@ -37,6 +37,9 @@ class WorkerConfig:
     task_memory_gib: float = 0
     #: The deployment's data-access grants, ``{"access", "bucket", "prefix"}`` each (#53).
     grants: tuple[dict[str, str], ...] = ()
+    #: The worker image, ``<registry>/<repo>@sha256:<digest>`` (user data passes AEGC_IMAGE), for
+    #: provenance (#40).
+    image: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "grants", tuple(dict(g) for g in self.grants))
@@ -78,6 +81,8 @@ class WorkerConfig:
         d = json.loads(base64.b64decode(raw))
         if env.get("AEGC_INSTANCE_ID"):
             d["instance_id"] = env["AEGC_INSTANCE_ID"]
+        if env.get("AEGC_IMAGE"):
+            d["image"] = env["AEGC_IMAGE"]
         if env.get("AWS_REGION"):
             d.setdefault("region", env["AWS_REGION"])
         return cls.from_dict(d)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import io
+import json
 import logging
 import os
 import threading
@@ -16,6 +18,7 @@ import pytest
 from aegc import ledger, naming, payloads, protocol, state
 from aegc.infra import deployment
 from aegc.protocol import Payload, ResultMessage, TaskMessage
+from aegc.worker import emf, jsonlog
 from aegc.worker.agent import Agent
 from aegc.worker.config import WorkerConfig
 from aegc.worker.testing import pack_task, unpack_result
@@ -75,6 +78,18 @@ class Rig:
             scratch=str(tmp),
             instance_id="i-123",
         )
+        self.emf_out = io.StringIO()
+
+    def metrics(self) -> list[dict[str, Any]]:
+        """The EMF documents the agents wrote."""
+        return [json.loads(line) for line in self.emf_out.getvalue().splitlines()]
+
+    def metric_values(self, name: str, outcome: str | None = None) -> list[float]:
+        return [
+            float(d[name])
+            for d in self.metrics()
+            if name in d and (outcome is None or d.get("Outcome") == outcome)
+        ]
 
     def join_group(self, *, min_size: int = 0) -> str:
         """Run this worker on a real instance of a real group; returns the instance id."""
@@ -114,6 +129,7 @@ class Rig:
         )
 
     def agent(self, **kw: Any) -> Agent:
+        kw.setdefault("metrics", emf.Emitter("dev", "p", stream=self.emf_out))
         return Agent(
             config=self.cfg, sqs=self.sqs, s3=self.s3, autoscaling=self.asg, wait_s=1, **kw
         )
@@ -236,6 +252,8 @@ def test_poison_task_is_not_rerun(rig: Rig) -> None:
     assert m.kind == "system_failure" and m.error is not None
     assert m.error.code == "WORKER_LOST_REPEATEDLY"
     assert a.stats.poison == 1 and rig.task_queue_empty()
+    assert rig.metric_values("PoisonTasks") == [1.0]
+    assert rig.metric_values("TasksFailed", "poison") == [1.0]
 
 
 @pytest.mark.timeout(60)
@@ -270,6 +288,8 @@ def test_interruption_releases_inflight(rig: Rig) -> None:
     r = rig.sqs.receive_message(QueueUrl=rig.tasks, WaitTimeSeconds=1)
     assert r.get("Messages") and tid in r["Messages"][0]["Body"]
     assert a.stats.released == 1
+    assert rig.metric_values("Interruptions") == [1.0]
+    assert rig.metric_values("Releases") == [1.0]
 
 
 def test_watchdog_heartbeat_needs_a_live_claim_loop(rig: Rig, tmp_path: Path) -> None:
@@ -376,6 +396,73 @@ def test_config_from_env() -> None:
     ).decode()
     cfg = WorkerConfig.from_env({"AEGC_WORKER_CONFIG_B64": raw, "AEGC_INSTANCE_ID": "i-9"})
     assert cfg.slot_count == 3 and cfg.instance_id == "i-9" and cfg.heartbeat_s == 100
+    assert cfg.image == ""
+    image = "r/aegc/geospatial@sha256:" + "a" * 64
+    cfg = WorkerConfig.from_env({"AEGC_WORKER_CONFIG_B64": raw, "AEGC_IMAGE": image})
+    assert cfg.image == image  # user data passes it (-e AEGC_IMAGE) for provenance
+
+
+# --- observability (v0.4: #39, #40) --------------------------------------------------------------
+
+IMAGE = "123456789012.dkr.ecr.us-west-2.amazonaws.com/aegc/geospatial@sha256:" + "c" * 64
+
+
+@pytest.mark.timeout(120)
+def test_provenance_metrics_and_the_task_finished_line(
+    rig: Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    from globus_compute_common import messagepack
+
+    rig.cfg = WorkerConfig(
+        **{**rig.cfg.__dict__, "instance_type": "c8g.large", "availability_zone": "us-west-2a",
+           "lifecycle": "spot", "image": IMAGE}
+    )  # fmt: skip
+    a = rig.agent()
+    t1, t2 = rig.submit(double, 21), rig.submit(boom)
+    with caplog.at_level(logging.INFO, logger="aegc"):
+        while a.stats.claimed < 2:
+            a.claim_once()
+        a.wait_idle()
+    res = rig.final(2)
+    assert value_of(res[t1], rig.s3) == (False, 42)  # still the task's value
+
+    # details["aegc"] is merged into what execute_task already put in details.
+    assert res[t1].result is not None
+    packed = payloads.read_payload(res[t1].result, s3=rig.s3)
+    details = messagepack.unpack(packed).details
+    assert {"os", "python_version", "globus_compute_sdk_version"} <= set(details)
+    prov = details["aegc"]
+    assert prov["image"] == IMAGE
+    assert (prov["instance_type"], prov["availability_zone"], prov["lifecycle"]) == (
+        "c8g.large", "us-west-2a", "spot",
+    )  # fmt: skip
+    assert prov["slots"] == 2 and prov["vcpus"] == os.cpu_count()
+    assert (prov["attempt"], prov["receive_count"]) == (1, 1)
+    t = prov["timings"]
+    assert t["received_at"] <= t["started_at"] <= t["finished_at"]
+    assert t["exec_s"] >= 0 and t["queue_wait_s"] >= 0
+    assert prov["est_cost_usd"] > 0 and prov["est_cost_source"] == "static"
+    assert res[t1].timings["queue_wait_s"] == pytest.approx(t["queue_wait_s"], abs=0.01)
+
+    # One task_finished line per task, carrying the same record; JSON with the task fields.
+    done = {r.task_uuid: r for r in caplog.records if getattr(r, "event", "") == "task_finished"}
+    assert set(done) == {t1, t2}
+    assert (done[t1].outcome, done[t2].outcome) == ("ok", "task_error")
+    line = json.loads(jsonlog.JsonFormatter().format(done[t1]))
+    assert line["msg"].startswith("task finished: ") and line["level"] == "INFO"
+    assert line["etid"] == f"{t1}:1" and line["receive_count"] == 1 and line["posted"] is True
+    assert line["provenance"]["image"] == IMAGE
+
+    # Metrics: a user exception is a completed task (Outcome task_error), not a failed one.
+    assert rig.metric_values("TasksCompleted", "ok") == [1.0]
+    assert rig.metric_values("TasksCompleted", "task_error") == [1.0]
+    assert not rig.metric_values("TasksFailed")
+    assert len(rig.metric_values("ExecSeconds")) == 2
+    assert len(rig.metric_values("QueueWaitSeconds")) == 2
+    assert len(rig.metric_values("BootToFirstClaimSeconds")) == 1  # once per worker
+    directives = [m for d in rig.metrics() for m in d["_aws"]["CloudWatchMetrics"]]
+    dims = {n for m in directives for dim_set in m["Dimensions"] for n in dim_set}
+    assert dims == {"Deployment", "Pool", "Outcome"}
 
 
 # --- deployment state, lifetime, ledger (v0.2) ---------------------------------------------------
@@ -464,6 +551,8 @@ def test_halted_worker_leaves_the_group(rig: Rig) -> None:
 def test_lifetime_drains(rig: Rig) -> None:
     rig.cfg = WorkerConfig(**{**rig.cfg.__dict__, "max_lifetime_s": 0, "instance_id": ""})
     assert rig.agent().run(max_cycles=5) == "lifetime"
+    (doc,) = [d for d in rig.metrics() if "WorkerExit" in d]
+    assert doc["WorkerExit"] == 1 and doc["reason"] == "lifetime"
 
 
 @pytest.mark.timeout(60)

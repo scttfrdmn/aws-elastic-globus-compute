@@ -79,8 +79,10 @@ TimeoutStopSec=150
 ExecStartPre=-/usr/bin/docker rm -f aegc-worker
 ExecStart=/usr/bin/docker run --rm --init --name aegc-worker --network host --ipc host \
   --log-driver awslogs --log-opt awslogs-region=$$REGION --log-opt awslogs-group=${log_group} \
+  --log-opt awslogs-format=json/emf \
   --log-opt awslogs-stream=${pool}/$$IID -v /scratch:/scratch --stop-timeout 120 \
   -e AEGC_WORKER_CONFIG_B64=${config_b64} -e AEGC_INSTANCE_ID=$$IID -e AWS_REGION=$$REGION \
+  -e AEGC_IMAGE=$$IMAGE \
   $$IMAGE aegc-worker run
 ExecStop=/usr/bin/docker stop -t 120 aegc-worker
 
