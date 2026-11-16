@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-16
+
+Observability, the Globus ecosystem, and task isolation: task code no longer runs with the
+worker role; workers log JSON and publish CloudWatch metrics; results say where and how they
+ran; and Globus Flows, Timers and function allowlists work and are documented. Validated live;
+see the [performance page](docs/reference/performance.md).
+
 ### Added
 - **Task isolation** for pools whose images are built (or registered) with aegc 0.4 or later:
   task code no longer runs with the worker role. The worker container runs as root with
@@ -433,7 +440,8 @@ Bugs found and fixed during validation:
 - the operator and deployer policies missed actions their commands use;
 - env names over 14 characters couldn't be deployed.
 
-[Unreleased]: https://github.com/scttfrdmn/aws-elastic-globus-compute/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/aws-elastic-globus-compute/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/scttfrdmn/aws-elastic-globus-compute/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/scttfrdmn/aws-elastic-globus-compute/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/scttfrdmn/aws-elastic-globus-compute/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/scttfrdmn/aws-elastic-globus-compute/releases/tag/v0.1.0
