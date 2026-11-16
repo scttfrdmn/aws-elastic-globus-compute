@@ -20,6 +20,9 @@ Semantics follow spore-host spawn's task pool:
   in-flight tasks (or fails them at once if the state says ``kill``), then leaves the group.
 - **Lifetime:** after ``max_lifetime_s`` the worker stops claiming and leaves the group once idle.
 - **Ledger:** the worker writes its cost-ledger record at start, every 5 minutes, and at exit.
+- **Observability:** JSON log lines (:mod:`aegc.worker.jsonlog`), one ``task_finished`` line per
+  task, EMF metrics on stdout (:mod:`aegc.worker.emf`) and provenance in each Result's
+  ``details["aegc"]`` (:mod:`aegc.worker.provenance`).
 """
 
 from __future__ import annotations
@@ -35,12 +38,12 @@ from multiprocessing.context import BaseContext
 from pathlib import Path
 from typing import Any
 
-from aegc import __version__, ledger, naming, payloads, protocol
+from aegc import __version__, ledger, naming, payloads, pricing, protocol
 from aegc.awsutil import error_code
 from aegc.gcresult import failed_result
 from aegc.protocol import ErrorInfo, ProtocolError, ResultMessage, TaskMessage
 from aegc.state import State, read_state
-from aegc.worker import runner
+from aegc.worker import emf, provenance, runner
 from aegc.worker.config import WorkerConfig
 from aegc.worker.imds import Metadata, NoMetadata, Notice
 
@@ -55,6 +58,7 @@ class InFlight:
     receive_count: int
     future: Future[Any] | None = None
     released: bool = False
+    queue_wait_s: float = 0.0  # submitted (the engine's clock) to claimed
 
 
 @dataclass
@@ -85,6 +89,8 @@ class Agent:
     stats: Stats = field(default_factory=Stats)
     #: Isolated pools: the environment task processes get (task-role credentials, #32).
     task_env: dict[str, str] = field(default_factory=dict)
+    #: EMF metrics; default: stdout, which awslogs (awslogs-format=json/emf) turns into metrics.
+    metrics: emf.Emitter | None = None
 
     def __post_init__(self) -> None:
         self._lock = threading.Lock()
@@ -118,6 +124,13 @@ class Agent:
         self._busy_slot_s = 0.0
         self._ledger_written = 0.0
         self._exit_reason = ""
+        self._emf = self.metrics or emf.Emitter(
+            self.config.deployment,
+            self.config.pool,
+            properties={"instance_id": self.config.instance_id} if self.config.instance_id else {},
+        )
+        self._first_claim = False
+        self._prices = pricing.Prices(region=self.config.region)  # static: no pricing IAM
 
     # --- public -----------------------------------------------------------------------------
 
@@ -173,6 +186,13 @@ class Agent:
             self._stop.set()
             self._exit_reason = self._drain_reason or "stopped"
             self.write_ledger(final=True)
+            self._emf.emit(
+                {"WorkerExit": 1},
+                reason=self._exit_reason,
+                claimed=self.stats.claimed,
+                completed=self.stats.completed,
+                failed=self.stats.failed,
+            )
         return self._drain_reason or "stopped"
 
     def stop(self, reason: str = "stopped") -> None:
@@ -220,13 +240,23 @@ class Agent:
             return
         self.stats.claimed += 1
         self._touch()
-        log.info("claimed %s (delivery %d)", msg.executor_task_id, receive_count)
+        now = time.time()
+        if not self._first_claim:
+            self._first_claim = True
+            self._emf.emit({"BootToFirstClaimSeconds": max(0.0, now - self._started_at)})
+        log.info(
+            "claimed %s (delivery %d)",
+            msg.executor_task_id,
+            receive_count,
+            extra=_task_fields(msg, receive_count),
+        )
         if self._halt is not None:
             if self._post_refusal(msg, self._halt):
                 self._ack(receipt)
             return
         if receive_count > self.config.max_deliveries:
             self.stats.poison += 1
+            self._emf.emit({"PoisonTasks": 1, "TasksFailed": 1}, outcome="poison")
             self._post_failure(
                 msg,
                 "WORKER_LOST_REPEATEDLY",
@@ -239,6 +269,7 @@ class Agent:
             body = payloads.read_payload(msg.task, s3=self.s3)
         except payloads.PayloadMissing as e:
             self._post_failure(msg, "PAYLOAD_MISSING", str(e), receive_count)
+            self._emf.emit({"TasksFailed": 1}, outcome="payload_missing")
             self._ack(receipt)
             return
         except Exception:
@@ -246,8 +277,13 @@ class Agent:
             self._change_visibility(receipt, 0)
             return
         job = InFlight(
-            msg=msg, receipt=receipt, received_at=time.time(), receive_count=receive_count
+            msg=msg,
+            receipt=receipt,
+            received_at=now,
+            receive_count=receive_count,
+            queue_wait_s=max(0.0, now - msg.submitted_at),  # clocks differ: never negative
         )
+        self._emf.emit({"QueueWaitSeconds": job.queue_wait_s})
         with self._lock:
             self._inflight[receipt] = job
         self._post(
@@ -287,16 +323,21 @@ class Agent:
             outcome = runner.RunOutcome("crashed", None, f"runner error: {e}")
         finished = time.time()
         self._busy_slot_s += finished - started
-        log.info("%s: %s in %.1f s", msg.executor_task_id, outcome.outcome, finished - started)
+        timings = {
+            "received_at": job.received_at,
+            "started_at": started,
+            "finished_at": finished,
+            "exec_s": finished - started,
+            "queue_wait_s": job.queue_wait_s,
+        }
+        prov: dict[str, Any] = {}
+        status: str = outcome.outcome  # what the task_finished line and the metrics report
+        posted = False
         try:
+            prov = self._provenance(job, timings)
             if job.released or self._stop.is_set():
+                status = "released"
                 return  # another worker will run it
-            timings = {
-                "received_at": job.received_at,
-                "started_at": started,
-                "finished_at": finished,
-                "exec_s": finished - started,
-            }
             if outcome.outcome == "crashed":
                 self.stats.failed += 1
                 self._post_failure(msg, "CHILD_CRASHED", outcome.detail, job.receive_count, timings)
@@ -306,8 +347,11 @@ class Agent:
                     self.stats.failed += 1
                 else:
                     self.stats.completed += 1
+                packed, is_error = provenance.merge(outcome.result, prov)
+                if outcome.outcome == "result":
+                    status = "task_error" if is_error else "ok"
                 result = payloads.make_payload(
-                    outcome.result,
+                    packed,
                     s3=self.s3,
                     bucket=self.config.bucket,
                     key=protocol.result_payload_key(
@@ -328,12 +372,29 @@ class Agent:
                     msg.reply_to,
                 ):
                     return  # couldn't post: don't ack; redelivery (and the DLQ) keep it
+            posted = True
             self._ack(job.receipt)
+            count = "TasksCompleted" if status in emf.COMPLETED_OUTCOMES else "TasksFailed"
+            self._emf.emit({count: 1, "ExecSeconds": timings["exec_s"]}, outcome=status)
         finally:
             with self._lock:
                 self._inflight.pop(job.receipt, None)
             runner.clean(run_dir, self._scratch)
             self._touch()
+            log.info(
+                "task finished: %s %s in %.1f s",
+                msg.executor_task_id,
+                status,
+                timings["exec_s"],
+                extra={
+                    "event": "task_finished",
+                    **_task_fields(msg, job.receive_count),
+                    "outcome": status,
+                    "posted": posted,
+                    **{k: round(v, 3) for k, v in timings.items()},
+                    "provenance": prov,
+                },
+            )
 
     # --- SQS --------------------------------------------------------------------------------
 
@@ -416,6 +477,8 @@ class Agent:
         for j in jobs:
             self._change_visibility(j.receipt, 0)
             self.stats.released += 1
+        if jobs:
+            self._emf.emit({"Releases": len(jobs)})
 
     # --- background loops -------------------------------------------------------------------
 
@@ -475,6 +538,8 @@ class Agent:
                 log.info("rebalance recommendation: Auto Scaling will replace this instance")
         else:
             log.warning("%s: releasing in-flight tasks and exiting", notice)
+            if notice == "interruption":
+                self._emf.emit({"Interruptions": 1})
             self.stop(notice)
 
     # --- deployment state ---------------------------------------------------------------
@@ -517,7 +582,7 @@ class Agent:
             bucket=self.config.bucket,
             key=protocol.result_payload_key(self.config.deployment, msg.task_uuid, msg.attempt),
         )
-        return self._post(
+        posted = self._post(
             ResultMessage(
                 kind="result",
                 task_uuid=msg.task_uuid,
@@ -528,6 +593,9 @@ class Agent:
             ),
             msg.reply_to,
         )
+        if posted:
+            self._emf.emit({"TasksFailed": 1}, outcome="refused")
+        return posted
 
     def fail_queued_once(self, st: State) -> int:
         """Receive queued tasks and fail each with a clear result. Returns how many."""
@@ -700,6 +768,41 @@ class Agent:
     def _idle_for(self) -> float:
         return self.clock() - self._last_activity
 
+    def _provenance(self, job: InFlight, timings: dict[str, float]) -> dict[str, Any]:
+        """``details["aegc"]`` for a task's Result (#40)."""
+        cfg = self.config
+        slots = cfg.slot_count
+        cost: float | None = None
+        source = ""
+        if cfg.instance_type:
+            # Static prices (no pricing IAM on workers): Spot is billed at most this much.
+            rate = self._prices.rate(
+                cfg.instance_type,
+                cfg.availability_zone,
+                cfg.lifecycle or "spot",
+                root_gib=cfg.root_volume_gib,
+                throughput_mibps=cfg.throughput_mibps,
+            )
+            cost = round(rate.usd_per_hour / max(1, slots) * timings["exec_s"] / 3600, 6)
+            source = rate.source
+        return {
+            "image": cfg.image,
+            "instance_id": cfg.instance_id,
+            "instance_type": cfg.instance_type,
+            "availability_zone": cfg.availability_zone,
+            "lifecycle": cfg.lifecycle,
+            "vcpus": cfg.host_vcpus,
+            "slots": slots,
+            "deployment": cfg.deployment,
+            "pool": cfg.pool,
+            "aegc_version": __version__,
+            "attempt": job.msg.attempt,
+            "receive_count": job.receive_count,
+            "timings": {k: round(v, 3) for k, v in timings.items()},
+            "est_cost_usd": cost,
+            "est_cost_source": source,  # "static": the on-demand table, Spot's ceiling
+        }
+
     def _worker_info(self) -> dict[str, Any]:
         return {
             "instance_id": self.config.instance_id,
@@ -709,6 +812,16 @@ class Agent:
             "availability_zone": self.config.availability_zone,
             "lifecycle": self.config.lifecycle,
         }
+
+
+def _task_fields(msg: TaskMessage, receive_count: int) -> dict[str, Any]:
+    """The per-task fields of a JSON log line."""
+    return {
+        "task_uuid": msg.task_uuid,
+        "attempt": msg.attempt,
+        "etid": msg.executor_task_id,
+        "receive_count": receive_count,
+    }
 
 
 def _boot_time() -> float:

@@ -142,7 +142,7 @@ def test_bad_size_requests(env: Env, spec: dict[str, Any], expect: str) -> None:
     [
         ({"num_nodes": 2, "size": "mem"}, "num_nodes must be 1"),
         ({"num_nodes": 1, "num_ranks": 4}, "doesn't launch MPI ranks"),
-        ({"num_nodes": "x"}, "are numbers"),
+        ({"num_nodes": "x"}, "must be numbers"),
     ],
 )
 def test_mpi_keys_from_the_web_service(env: Env, spec: dict[str, Any], expect: str) -> None:

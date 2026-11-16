@@ -183,8 +183,8 @@ def test_deploy_puts_redeploy_clears_destroy_removes(env: tuple[Clients, Deploym
     with_grants = DeploymentSpec(**{**spec.__dict__, "grants": grants})
     r = outcomes(deployment.deploy(c, with_grants))
     # POOL's image predates 0.4, so its tasks still run with the worker role: both roles get them.
-    assert r[("iam role policy", WORKER_GRANTS)] == "updated"
-    assert r[("iam role policy", TASK_GRANTS)] == "updated"
+    assert r[("iam role policy", WORKER_GRANTS)] == "created"
+    assert r[("iam role policy", TASK_GRANTS)] == "created"
     assert role_policies(c) == [iam.GRANTS_POLICY, iam.WORKER_POLICY]
     doc = c.iam.get_role_policy(RoleName=ROLE, PolicyName=iam.GRANTS_POLICY)["PolicyDocument"]
     doc = json.loads(doc) if isinstance(doc, str) else doc

@@ -6,6 +6,49 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **JSON worker logs:** `aegc-worker run` logs one JSON object per line (stdlib only): `ts`,
+  `level`, `logger`, `msg`, the worker's `deployment`, `pool`, `instance_id`, `type`, `az` and
+  `lifecycle`, and per-task `task_uuid`, `attempt`, `etid`, `receive_count`. Each task ends with
+  a `task finished` line (`"event": "task_finished"`) carrying its `outcome`, phase times
+  (`received_at`, `started_at`, `finished_at`, `exec_s`, `queue_wait_s`) and its provenance
+  record. Message wording is unchanged. `selftest` and `version` keep plain-text logs (#39).
+- **EMF metrics:** the worker writes CloudWatch Embedded Metric Format lines to stdout, and user
+  data adds `--log-opt awslogs-format=json/emf` so CloudWatch Logs extracts them. No new worker
+  IAM. Namespace `aegc`, dimensions `[Deployment, Pool]` and `[Deployment]` only, plus
+  `[Deployment, Pool, Outcome]` on `TasksCompleted` (Outcome `ok` or `task_error`) and
+  `TasksFailed` (`walltime`, `crashed`, `poison`, `payload_missing`, `refused`); also
+  `ExecSeconds`, `QueueWaitSeconds` (from the task message's `submitted_at`),
+  `BootToFirstClaimSeconds`, `Interruptions`, `Releases`, `PoisonTasks` and `WorkerExit` (#39).
+- **Provenance in results:** each Result's `details` keeps what `execute_task` put there and
+  gains `details["aegc"]`: the image digest, instance id and type, Availability Zone, Spot or
+  on-demand, vCPUs and slots, attempt and receive count, timings, and `est_cost_usd` (this
+  task's share of its instance at the static on-demand price, Spot's ceiling). User data passes
+  the image to the worker as `AEGC_IMAGE`; result messages also carry `timings.queue_wait_s`
+  (#40).
+- **`aegc metrics <d> [--since 1h|1d|...] [--json]`:** per-pool task counts by outcome, average
+  and maximum execution and queue-wait times, boot-to-first-claim, interruptions, releases,
+  poison tasks, worker exits and the group's capacity, read with GetMetricData (already in the
+  operator policy). `aegc deploy` turns on 1-minute Auto Scaling group metrics
+  (EnableMetricsCollection, added to the deployer policy); with an older deployer policy it
+  reports them as not enabled and carries on (#39).
+- **`aegc provenance <d> <task_uuid> [--json]`:** a task's `task_finished` records, one per
+  attempt, from `/aegc/<d>` with FilterLogEvents, for clients that don't see `details`. The
+  operator policy gains `logs:FilterLogEvents` on that log group only (#40).
+- **`aegc status` shows grants and size classes:** the deployment's data-access grants, and each
+  pool's size class with the vCPUs and GiB one task gets (also in `--json`) (#69).
+
+### Changed
+- **`aegc deploy` reports role policies accurately:** `aegc-worker` and `aegc-grants` are compared
+  with what the role has, so an unchanged redeploy reports `exists` (not `updated`), a first put
+  `created`, and a dry run `would-create`, `would-update` or `would-delete` (#69).
+- **Engine error texts** name task options instead of `resource_specification` (they now come from
+  `user_endpoint_config`): `unsupported task options [...]`, `task option cpus must be a positive
+  number`, `num_nodes, ranks_per_node and num_ranks must be numbers` (#69).
+- **Worker user data changes** (the awslogs format and `AEGC_IMAGE`), so the next `aegc deploy`
+  adds a launch template version to every pool. Running workers keep the old one until they
+  leave; workers from images built before 0.4 log plain text and emit no metrics.
+
 ## [0.3.0] - 2026-11-15
 
 Run your own work: worker images from any arm64 base, several Python versions per environment,
