@@ -340,3 +340,50 @@ def test_task_role_can_only_use_its_grants(aws: Callable[[str], Any]) -> None:
         ("ssm:GetParameter", f"arn:aws:ssm:{REGION}:{ACCOUNT}:parameter/aegc/dev/state"),
     ):
         assert not allowed(action, resource), action
+
+
+def test_worker_role_keeps_grants_while_pre_04_instances_run(
+    env: tuple[Clients, DeploymentSpec],
+) -> None:
+    # Review: rebuilding every image to 0.4 and redeploying mustn't pull the grants from
+    # instances still running the old images (their tasks use the worker role).
+    from dataclasses import asdict
+
+    from tests.unit.test_deployment import ASG, POOL
+
+    c, spec = env
+    grants = (Grant.parse("read=s3://open-data/in/"),)
+    old = DeploymentSpec(**{**spec.__dict__, "grants": grants})
+    deployment.deploy(c, old)
+    c.autoscaling.set_desired_capacity(
+        AutoScalingGroupName=ASG, DesiredCapacity=2
+    )  # one old worker
+    pool = PoolSpec(**{**asdict(POOL), "isolate_tasks": True})
+    new = DeploymentSpec(**{**old.__dict__, "pools": (pool,)})
+    r = outcomes(deployment.deploy(c, new))
+    assert r[("iam role policy", WORKER_GRANTS)] == "kept"
+    assert iam.GRANTS_POLICY in role_policies(c)
+    # The old worker leaves; the next deploy removes them.
+    g = c.autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[ASG])
+    for i in g["AutoScalingGroups"][0]["Instances"]:
+        c.ec2.terminate_instances(InstanceIds=[i["InstanceId"]])
+    c.autoscaling.set_desired_capacity(AutoScalingGroupName=ASG, DesiredCapacity=0)
+    r = outcomes(deployment.deploy(c, new))
+    assert r[("iam role policy", WORKER_GRANTS)] == "deleted"
+    assert role_policies(c) == [iam.WORKER_POLICY]
+
+
+def test_isolated_launch_templates(env: tuple[Clients, DeploymentSpec]) -> None:
+    from dataclasses import asdict
+
+    from tests.unit.test_deployment import POOL
+
+    c, spec = env
+    pool = PoolSpec(**{**asdict(POOL), "isolate_tasks": True})
+    deployment.deploy(c, DeploymentSpec(**{**spec.__dict__, "pools": (pool,)}))
+    data = c.ec2.describe_launch_template_versions(
+        LaunchTemplateName="aegc-dev-sci-py314", Versions=["$Default"]
+    )["LaunchTemplateVersions"][0]["LaunchTemplateData"]
+    assert data["MetadataOptions"]["HttpProtocolIpv6"] == "disabled"
+    tags = {t["Key"]: t["Value"] for ts in data["TagSpecifications"] for t in ts["Tags"]}
+    assert tags[deployment.TAG_ISOLATED] == "true"

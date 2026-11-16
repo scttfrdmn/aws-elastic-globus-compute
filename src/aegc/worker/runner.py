@@ -31,6 +31,8 @@ from aegc.gcresult import failed_result
 
 PRELOAD = ["globus_compute_endpoint.engines.helper"]
 KILL_GRACE_S = 10.0
+#: Globus Compute refuses results over 10 MB; a child that sends more is broken or hostile.
+MAX_RESULT_BYTES = 32 * 2**20
 #: Let GC_TASK_TIMEOUT report a clean AppTimeout for pure-Python work before the hard kill.
 SOFT_GRACE_S = 5.0
 
@@ -84,6 +86,9 @@ def _child(
     task_env: dict[str, str] | None = None,
 ) -> None:
     os.setsid()  # its own process group, so walltime kills reach anything it starts
+    # The agent's stdout carries EMF metric lines; task output goes to stderr, so a partial line
+    # from a task can't corrupt one (docker logs each stream line by line).
+    os.dup2(2, 1)
     if task_uid is not None:
         drop_privileges(task_uid, run_dir)  # before the task body is deserialized
         os.environ["AWS_EC2_METADATA_DISABLED"] = "true"  # it's unreachable; don't wait for it
@@ -176,8 +181,8 @@ def _receive(recv: Connection, proc: BaseProcess, timeout_s: float) -> tuple[byt
             return None, True
         if recv.poll(min(left, 1.0)):
             try:
-                return recv.recv_bytes(), False
-            except (EOFError, OSError):  # the child exited (or crashed) without sending one
+                return recv.recv_bytes(MAX_RESULT_BYTES), False
+            except (EOFError, OSError):  # the child exited (or crashed), or sent too much
                 return None, False
         if not proc.is_alive() and not recv.poll(0):
             return None, False

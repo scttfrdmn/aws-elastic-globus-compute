@@ -204,6 +204,7 @@ def test_launch_template_requests_imdsv2() -> None:
         "HttpTokens": "required",
         "HttpPutResponseHopLimit": 2,
         "HttpEndpoint": "enabled",
+        "HttpProtocolIpv6": "disabled",
         "InstanceMetadataTags": "enabled",
     }
 

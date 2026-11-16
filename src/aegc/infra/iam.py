@@ -186,8 +186,9 @@ def grants_policy(
     if (size := policy_size(doc)) > budget:
         raise ValueError(
             f"deployment {deployment}'s {len(gs)} grants need a {size}-character IAM policy, but "
-            f"the worker role has room for {budget} (IAM allows {INLINE_POLICY_LIMIT} in all of a "
-            "role's inline policies); use fewer, broader prefixes"
+            f"the worker and task roles have room for {budget} (IAM allows "
+            f"{INLINE_POLICY_LIMIT} in all of a role's inline policies); use fewer, broader "
+            "prefixes"
         )
     return doc
 

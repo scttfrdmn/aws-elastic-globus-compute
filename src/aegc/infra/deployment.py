@@ -232,6 +232,25 @@ def _set_grants(
         _delete_role_policy(c, role, iam.GRANTS_POLICY, report, dry_run=dry_run, label=label)
 
 
+#: Instance tag on workers of isolated pools (#32).
+TAG_ISOLATED = "aegc:isolated"
+
+
+def _unisolated_instances(c: Clients, d: str) -> list[str]:
+    """This deployment's live workers whose tasks still run with the worker role."""
+    out = []
+    for r in paginate(
+        c.ec2, "describe_instances", "Reservations",
+        Filters=[{"Name": f"tag:{naming.TAG_DEPLOYMENT}", "Values": [d]},
+                 {"Name": "instance-state-name", "Values": ["pending", "running"]}],
+    ):  # fmt: skip
+        for i in r.get("Instances", []):
+            tags = {t["Key"]: t["Value"] for t in i.get("Tags", [])}
+            if tags.get(naming.TAG_ROLE) == "worker" and tags.get(TAG_ISOLATED) != "true":
+                out.append(str(i["InstanceId"]))
+    return out
+
+
 def ensure_task_role(c: Clients, spec: DeploymentSpec, report: Report, *, dry_run: bool) -> str:
     """The task role (#32): trusted only by the worker role, with the grants and the manifest
     read. Returns its ARN."""
@@ -248,20 +267,27 @@ def ensure_task_role(c: Clients, spec: DeploymentSpec, report: Report, *, dry_ru
             raise OwnershipError(f"IAM role {name} exists but isn't tagged as {d}'s")
         outcome: Outcome = "exists"
         if not dry_run:
-            c.iam.update_assume_role_policy(RoleName=name, PolicyDocument=trust)
+            _retry(
+                lambda: c.iam.update_assume_role_policy(RoleName=name, PolicyDocument=trust),
+                codes={"MalformedPolicyDocument"}, attempts=10, delay_s=3,
+            )  # fmt: skip
     except Exception as e:
         if isinstance(e, OwnershipError) or not is_not_found(e):
             raise
         outcome = "would-create" if dry_run else "created"
         if not dry_run:
-            c.iam.create_role(
-                Path=naming.IAM_PATH,
-                RoleName=name,
-                AssumeRolePolicyDocument=trust,
-                Description=f"aegc task code for deployment {d} (its grants)",
-                MaxSessionDuration=3600,
-                Tags=naming.tag_list(naming.tags(d, "task-role", extra=spec.extra_tags)),
-            )
+            # A worker role created seconds ago isn't a valid principal yet everywhere in IAM.
+            _retry(
+                lambda: c.iam.create_role(
+                    Path=naming.IAM_PATH,
+                    RoleName=name,
+                    AssumeRolePolicyDocument=trust,
+                    Description=f"aegc task code for deployment {d} (its grants)",
+                    MaxSessionDuration=3600,
+                    Tags=naming.tag_list(naming.tags(d, "task-role", extra=spec.extra_tags)),
+                ),
+                codes={"MalformedPolicyDocument"}, attempts=10, delay_s=3,
+            )  # fmt: skip
     report.add("iam role", name, outcome)
     _put_role_policy(c, name, iam.TASK_POLICY, spec.task_policy(), report, dry_run=dry_run)
     _set_grants(
@@ -295,8 +321,15 @@ def ensure_worker_role(c: Clients, spec: DeploymentSpec, report: Report, *, dry_
     _put_role_policy(c, name, iam.WORKER_POLICY, spec.worker_policy(), report, dry_run=dry_run)
     # Tasks of isolated pools get grants through the task role; unisolated pools' tasks still
     # run with this role, so it keeps them while there are any.
-    grants = spec.grants_policy() if spec.unisolated_pools else None
-    _set_grants(c, name, grants, len(spec.grants), report, role_kind="worker", dry_run=dry_run)
+    old = [] if spec.unisolated_pools else _unisolated_instances(c, d)
+    if old:  # pools are all isolated now, but instances launched before still use this role
+        report.add(
+            "iam role policy", f"{iam.GRANTS_POLICY} (worker role)", "kept",
+            f"{len(old)} pre-0.4 instance(s) still running; deploy again after they leave",
+        )  # fmt: skip
+    else:
+        grants = spec.grants_policy() if spec.unisolated_pools else None
+        _set_grants(c, name, grants, len(spec.grants), report, role_kind="worker", dry_run=dry_run)
     if dry_run:
         return profile_arn
 
@@ -645,7 +678,10 @@ def launch_template_data(
         isolate=pool.isolate_tasks,
         max_age_s=pool.max_lifetime_s + (pool.max_walltime_s or protocol.MAX_WALLTIME_S) + 900,
     )
-    instance_tags = naming.tag_list(naming.tags(d, "worker", pool=pool.name, extra=spec.extra_tags))
+    worker_tags = naming.tags(d, "worker", pool=pool.name, extra=spec.extra_tags)
+    if pool.isolate_tasks:
+        worker_tags[TAG_ISOLATED] = "true"
+    instance_tags = naming.tag_list(worker_tags)
     return {
         "ImageId": ami,
         "IamInstanceProfile": {"Arn": profile_arn},
@@ -654,6 +690,7 @@ def launch_template_data(
             "HttpTokens": "required",
             "HttpPutResponseHopLimit": 2,
             "HttpEndpoint": "enabled",
+            "HttpProtocolIpv6": "disabled",  # tasks' IMDS block covers IPv4; keep IPv6 off
             "InstanceMetadataTags": "enabled",
         },
         "BlockDeviceMappings": [

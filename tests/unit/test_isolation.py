@@ -197,3 +197,37 @@ def test_engine_ignores_results_pointing_at_other_keys(env: Env) -> None:
         assert f.result(timeout=15) == b"packed-ok"
     finally:
         e.shutdown()
+
+
+def stdout_is_stderr() -> bool:
+    import os
+
+    a, b = os.fstat(1), os.fstat(2)
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
+@pytest.mark.timeout(120)
+def test_task_stdout_goes_to_stderr(tmp_path: Path) -> None:
+    # Review: the agent's stdout carries EMF lines; a task's partial line there would corrupt one.
+    tid = str(uuid.uuid4())
+    out = runner.run_task(
+        ctx=runner.context(), task_body=pack_task(stdout_is_stderr, task_uuid=tid), task_uuid=tid,
+        endpoint_id=str(uuid.uuid4()), run_dir=tmp_path / "t", walltime_s=60,
+    )  # fmt: skip
+    assert unpack_result(out.result or b"") == (False, True)
+
+
+def medium() -> bytes:
+    return b"y" * 20_000
+
+
+@pytest.mark.timeout(120)
+def test_oversized_results_are_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Review: a hostile child could send gigabytes over the pipe and exhaust the agent's memory.
+    monkeypatch.setattr(runner, "MAX_RESULT_BYTES", 1000)
+    tid = str(uuid.uuid4())
+    out = runner.run_task(
+        ctx=runner.context(), task_body=pack_task(medium, task_uuid=tid), task_uuid=tid,
+        endpoint_id=str(uuid.uuid4()), run_dir=tmp_path / "t", walltime_s=60,
+    )  # fmt: skip
+    assert out.outcome == "crashed" and out.result is None
