@@ -5,10 +5,10 @@ workaround and its uses, so the test exercises substrate directly.
 
 Gaps without code here (substrate v0.129.0 fixed #1523 and #1525):
 - substrate#1524: no ECR lifecycle policy preview (a strict xfail in test_images.py).
-- (issue to be filed) GetMetricData returns no MetricDataResults for metrics put with
+- substrate#1595: GetMetricData returns no MetricDataResults for metrics put with
   PutMetricData, and ListMetrics drops their dimensions; test_observability_ops.py stubs
   CloudWatch for ``aegc metrics``.
-- (issue to be filed) FilterLogEvents ignores JSON filter patterns (``{ $.task_uuid = "..." }``
+- substrate#1596: FilterLogEvents ignores JSON filter patterns (``{ $.task_uuid = "..." }``
   matches nothing); ``aegc provenance`` uses a quoted-term pattern, which works on both.
 """
 
@@ -34,7 +34,7 @@ def no_network_interfaces(ec2: Any) -> Any:
 
 
 def metrics_collection(autoscaling: Any) -> list[dict[str, Any]]:
-    """substrate (issue to be filed): no EnableMetricsCollection (InvalidAction).
+    """substrate#1594: no EnableMetricsCollection (InvalidAction).
 
     Answers it on this client with success and returns a list that collects each call's request
     body (``AutoScalingGroupName``, ``Granularity``), so deploy's call can be checked. Without the
