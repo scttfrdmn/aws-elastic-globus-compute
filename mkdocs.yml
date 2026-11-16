@@ -60,6 +60,8 @@ nav:
       - Build or bring worker images: how-to/images.md
       - Read and write your data: how-to/data.md
       - Operate a deployment: how-to/operations.md
+      - "Watch tasks: logs, metrics, provenance": how-to/observability.md
+      - Use Globus Flows and Timers: how-to/flows.md
       - Troubleshooting: how-to/troubleshooting.md
   - Reference:
       - CLI: reference/cli.md

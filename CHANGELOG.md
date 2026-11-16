@@ -7,12 +7,31 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Task isolation** for pools whose images are built (or registered) with aegc 0.4 or later:
+  task code no longer runs with the worker role. The worker container runs as root with
+  `no-new-privileges` and only `SETUID`, `SETGID`, `KILL`, `CHOWN`, `DAC_OVERRIDE` and `FOWNER`;
+  each task process drops to uid 57439 before it deserializes anything; host iptables rejects
+  instance metadata for that uid, and launch templates turn the IPv6 metadata endpoint off. A new
+  per-deployment **task role**, `aegc-<d>-task-<region>`, trusted only by the worker role, holds
+  the grants (`aegc-grants`) and the manifest read (`aegc-task`); the agent assumes it and serves
+  its credentials on 127.0.0.1 in the container-credentials format
+  (`AWS_CONTAINER_CREDENTIALS_FULL_URI` and a token file), with `AWS_REGION` and
+  `AWS_DEFAULT_REGION` set, so boto3, the AWS CLI and GDAL work unchanged. Results come back over
+  a pipe instead of a file in the task's directory, and the engine ignores a result whose S3
+  payload isn't that task's own result key. The worker policy gains `sts:AssumeRole` on the task
+  role. Pools with older images keep the old behaviour, and `aegc deploy` warns about them; the
+  worker role keeps `aegc-grants` while such pools, or workers launched before their pool was
+  isolated (instances without the new tag `aegc:isolated=true`), remain, and a later deploy
+  removes it. Tasks on one worker still share uid 57439, so they can see and signal each other's
+  processes and read each other's run directories (#32).
 - **JSON worker logs:** `aegc-worker run` logs one JSON object per line (stdlib only): `ts`,
   `level`, `logger`, `msg`, the worker's `deployment`, `pool`, `instance_id`, `type`, `az` and
   `lifecycle`, and per-task `task_uuid`, `attempt`, `etid`, `receive_count`. Each task ends with
-  a `task finished` line (`"event": "task_finished"`) carrying its `outcome`, phase times
-  (`received_at`, `started_at`, `finished_at`, `exec_s`, `queue_wait_s`) and its provenance
-  record. Message wording is unchanged. `selftest` and `version` keep plain-text logs (#39).
+  a `task finished` line (`"event": "task_finished"`) carrying its `outcome`, whether it was
+  `posted`, phase times (`received_at`, `started_at`, `finished_at`, `exec_s`, `queue_wait_s`)
+  and its provenance record. That line replaces the old per-task outcome line; other messages
+  are unchanged. Task output goes to the worker's stderr. `selftest` and `version` keep plain-text
+  logs (#39).
 - **EMF metrics:** the worker writes CloudWatch Embedded Metric Format lines to stdout, and user
   data adds `--log-opt awslogs-format=json/emf` so CloudWatch Logs extracts them. No new worker
   IAM. Namespace `aegc`, dimensions `[Deployment, Pool]` and `[Deployment]` only, plus
@@ -23,31 +42,63 @@ All notable changes to this project are documented here. The format follows
 - **Provenance in results:** each Result's `details` keeps what `execute_task` put there and
   gains `details["aegc"]`: the image digest, instance id and type, Availability Zone, Spot or
   on-demand, vCPUs and slots, attempt and receive count, timings, and `est_cost_usd` (this
-  task's share of its instance at the static on-demand price, Spot's ceiling). User data passes
-  the image to the worker as `AEGC_IMAGE`; result messages also carry `timings.queue_wait_s`
-  (#40).
+  task's share of its instance at the static on-demand price, Spot's ceiling). The SDK sees it
+  in `Client().get_task(task_id)["details"]["aegc"]`; Globus Flows' action output doesn't
+  include it. User data passes the image to the worker as `AEGC_IMAGE`; result messages also
+  carry `timings.queue_wait_s` (#40).
 - **`aegc metrics <d> [--since 1h|1d|...] [--json]`:** per-pool task counts by outcome, average
   and maximum execution and queue-wait times, boot-to-first-claim, interruptions, releases,
   poison tasks, worker exits and the group's capacity, read with GetMetricData (already in the
-  operator policy). `aegc deploy` turns on 1-minute Auto Scaling group metrics
+  operator and deployer policies). `aegc deploy` turns on 1-minute Auto Scaling group metrics
   (EnableMetricsCollection, added to the deployer policy); with an older deployer policy it
   reports them as not enabled and carries on (#39).
-- **`aegc provenance <d> <task_uuid> [--json]`:** a task's `task_finished` records, one per
-  attempt, from `/aegc/<d>` with FilterLogEvents, for clients that don't see `details`. The
-  operator policy gains `logs:FilterLogEvents` on that log group only (#40).
+- **`aegc provenance <d> <task_uuid> [--since 14d] [--json]`:** a task's `task_finished`
+  records, one per attempt, from `/aegc/<d>` with FilterLogEvents, for clients that don't see
+  `details` (such as Globus Flows). The operator policy gains `logs:FilterLogEvents` on that log
+  group only (#40).
 - **`aegc status` shows grants and size classes:** the deployment's data-access grants, and each
   pool's size class with the vCPUs and GiB one task gets (also in `--json`) (#69).
+- **`aegc endpoint configure --allow-function ID`** (repeatable) writes `allowed_functions` into
+  the endpoint's `config.yaml`, so Globus refuses other functions with `403
+  FUNCTION_NOT_PERMITTED` once the endpoint restarts; `--allow-function none` removes the list,
+  and without the option `configure` leaves it alone (#57).
+- **`python` in `user_endpoint_config`** (`"3.13"`), for submissions that don't carry the
+  submitter's Python, such as Globus Flows' (verified: Flows sends no `user_runtime`). When a
+  submission does carry one, it wins. Rerun `aegc endpoint configure` (and restart the endpoint)
+  to get the new schema and template (#55).
+- Docs: a how-to for Globus Flows and Timers (#56), a how-to for logs, metrics and provenance,
+  task isolation in the security model, the task role in the IAM and resources references,
+  "Upgrade from v0.3", and the v0.4 live run on the performance page.
 
 ### Changed
-- **`aegc deploy` reports role policies accurately:** `aegc-worker` and `aegc-grants` are compared
-  with what the role has, so an unchanged redeploy reports `exists` (not `updated`), a first put
-  `created`, and a dry run `would-create`, `would-update` or `would-delete` (#69).
+- **Submissions without a Python version** (Globus Flows) to an env with images for several
+  Python minors now fail with `this submission doesn't say its Python version (Globus Flows
+  doesn't send one), and env '...' has worker images for 3.13, 3.14; add "python": "3.14" (your
+  function's Python) to user_endpoint_config`, instead of silently going to one of its pools (#55).
+- **`aegc deploy` reports role policies accurately:** `aegc-worker`, `aegc-task` and
+  `aegc-grants` are compared with what the role has, so an unchanged redeploy reports `exists`
+  (not `updated`), a first put `created`, and a dry run `would-create`, `would-update` or
+  `would-delete`. Grant lines name their role, e.g. `aegc-grants (task role) (2 grant(s))` (#69).
+- **Grants must fit next to `aegc-worker` and `aegc-task`**; the refusal now reads `... but the
+  worker and task roles have room for N ...`.
 - **Engine error texts** name task options instead of `resource_specification` (they now come from
   `user_endpoint_config`): `unsupported task options [...]`, `task option cpus must be a positive
   number`, `num_nodes, ranks_per_node and num_ranks must be numbers` (#69).
-- **Worker user data changes** (the awslogs format and `AEGC_IMAGE`), so the next `aegc deploy`
-  adds a launch template version to every pool. Running workers keep the old one until they
-  leave; workers from images built before 0.4 log plain text and emit no metrics.
+- **Worker user data changes** (the awslogs format and `AEGC_IMAGE`; for isolated pools also the
+  container's user and capabilities, `/run/aegc` and the metadata firewall rule), and launch
+  templates set `HttpProtocolIpv6=disabled`, so the next `aegc deploy` adds a launch template
+  version to every pool. Running workers keep the old one until they leave; workers from images
+  built before 0.4 log plain text and emit no metrics.
+
+### Fixed
+- **A task that finishes while its worker stops now posts its result.** A SIGTERM racing a claim
+  left the task out of the stop's release; when it finished, the worker dropped its result as if
+  released, and the message stayed hidden for the full visibility timeout (300 s). Anything
+  still claimed when the worker exits now goes back to the queue at once. Found with
+  `aegc provenance` in the v0.4 live run.
+- **Isolated tasks get the region.** Without instance metadata, boto3 in a task raised
+  `NoRegionError`; the agent now sets `AWS_REGION` and `AWS_DEFAULT_REGION` for task processes.
+  Found in the v0.4 live run.
 
 ## [0.3.0] - 2026-11-15
 

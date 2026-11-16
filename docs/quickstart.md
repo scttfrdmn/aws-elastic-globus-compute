@@ -157,7 +157,8 @@ aegc status e2e
 This shows the deployment's state (`running`), its estimated spend against the limit, when the
 lease expires, and per pool the queued, running and dead-lettered tasks, the workers by instance
 type, the last scaling activity, and any results waiting in result queues. `aegc cost e2e` shows
-today's estimated spend from the workers' cost ledger. Workers leave the
+today's estimated spend from the workers' cost ledger, and `aegc metrics e2e` the last hour's task
+counts and times ([Watch tasks](how-to/observability.md)). Workers leave the
 group about 5 minutes after they go idle; in the live run the pool was back to zero 5.5 minutes
 after the last task.
 

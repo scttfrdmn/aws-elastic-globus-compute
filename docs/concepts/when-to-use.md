@@ -42,10 +42,12 @@ These are the current limits. Numbers come from the live run in
 - **Payload size.** Globus Compute itself limits task and result sizes (about 10 MB). aegc's S3
   offload only covers the hop between the endpoint and the workers. Write large outputs to S3 with
   [`aegc.outputs`](../how-to/data.md#return-large-outputs) and return the URI.
-- **Workers reach only what you grant.** The worker role allows aegc's queues, its payload prefix,
-  its image repositories and its log group. Open data is read with **unsigned** requests; your own
-  buckets, requester-pays data and output buckets need a `--grant` per prefix (at most 32, and
-  writes only to your own account's buckets). Grants are shared by every task in the deployment;
+- **Tasks reach only what you grant.** Tasks run with the deployment's task role, which holds
+  nothing but your grants (and a read of the manifest); the worker role, for aegc's queues,
+  payloads, images and logs, stays with the worker agent (on images built with aegc 0.4 or
+  later). Open data is read with **unsigned** requests; your own buckets, requester-pays data and
+  output buckets need a `--grant` per prefix (at most 32, and writes only to your own account's
+  buckets). Grants are shared by every task in the deployment;
   see [Security model](security.md#data-access).
 - **Images must be arm64 with Python 3.11 or later, and have a shell.** Any such image works as a
   base, or as a registered image with aegc 0.3 or later in it; see
@@ -65,8 +67,10 @@ These are the current limits. Numbers come from the live run in
   interruption, for example). Write functions so a rerun is harmless. See
   [Delivery and idempotency](delivery.md).
 - **No checkpointing.** An interrupted task starts again from the beginning.
-- **One trust domain per deployment.** Every task in a deployment runs with the same worker role.
-  Give separate groups separate deployments.
+- **One trust domain per deployment.** Every task in a deployment runs with the same task role and
+  its grants, and tasks on a worker share a uid, so they can see each other's processes and
+  files. Give separate groups separate deployments. See
+  [Task isolation](security.md#task-isolation).
 - **Not high-assurance.** Task data goes to AWS; `AWSEngine` refuses high-assurance endpoints.
 - **Default VPC.** `aegc deploy` places workers in the region's default VPC and default subnets.
   Only us-west-2 has been tested live.

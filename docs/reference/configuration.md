@@ -16,7 +16,13 @@ engine:
   deployment: e2e
   region: us-west-2
   env: {{ env | default('"geospatial"') }}
+{%- if py %}
   python_minor: "{{ py[:2] | join('.') }}"
+{%- elif python is defined %}
+  python_minor: {{ python }}
+{%- else %}
+  python_minor: ""
+{%- endif %}
 {%- if pool is defined %}
   pool: {{ pool }}
 {%- endif %}
@@ -41,7 +47,7 @@ engine:
 | `amqp_port` | `5671` | AMQPS on 443 had cut connections and a reconnect race ([globus/globus-compute#2232](https://github.com/globus/globus-compute/issues/2232)). `configure` also adds it to the endpoint's `config.yaml`. |
 | `engine.type` | `AWSEngine` | Resolvable through the `.pth` hook installed with aegc. |
 | `engine.env` | from `user_endpoint_config`, else the `--env` given to `configure` | Default env for this process's tasks. |
-| `engine.python_minor` | the submitter's Python, e.g. `"3.14"` | Selects the pool for the env's image of that minor. |
+| `engine.python_minor` | the submitter's Python, e.g. `"3.14"`; else `python` from `user_endpoint_config`; else empty | Selects the pool for the env's image of that minor. The SDK sends its Python with each submission; Globus Flows doesn't, so `python` can say it. |
 | `engine.pool`, `size`, `cpus`, `memory_gib`, `walltime_s` | from `user_endpoint_config`, only if given | Pool choice and walltime for this process's tasks; see [below](#user_endpoint_config). |
 | `engine.max_retries_on_system_failure` | `1` | One resubmission after a worker system failure. |
 
@@ -59,7 +65,7 @@ defaults.
 | `deployment` | `"default"` | aegc deployment to use; its manifest is `/aegc/<deployment>/manifest` |
 | `region` | the session's | AWS region of the deployment |
 | `env` | `""` | Default env; empty means any pool, subject to the Python check |
-| `python_minor` | `""` | Submitter's Python minor version; empty skips the Python check |
+| `python_minor` | `""` | Submitter's Python minor version; empty skips the Python check, but refuses tasks for an env with several minors |
 | `pool` | `""` | Run tasks on this exact pool |
 | `size` | `""` | Run tasks on a pool of this [size class](#size-classes) |
 | `cpus` | `0` | vCPUs each task needs (0: no requirement) |
@@ -83,6 +89,7 @@ allows these keys, and the template renders them into the engine section:
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `env` | string matching `^[a-z][a-z0-9-]{0,40}$` | the `--env` given to `configure` | Science environment for this executor's tasks |
+| `python` | string matching `^3\.[0-9]{1,2}$`, e.g. `"3.14"` | the submitter's Python | Pick the env's image for this Python minor when the submission doesn't carry a Python version, as from [Globus Flows](../how-to/flows.md). Ignored when it does (the SDK's) |
 | `pool` | string matching `^[a-z][a-z0-9-]{0,39}$` | | Run on this exact pool (e.g. `geospatial-py314`); overrides `env` and `size`. `cpus` and `memory_gib`, if given, must fit it |
 | `size` | `small`, `medium`, `mem`, `large` or `whole` | | Run on a pool of this [size class](#size-classes); a pool without one counts as `small`. `cpus` and `memory_gib`, if given too, must fit it |
 | `cpus` | number > 0 | | vCPUs a task needs: run on the cheapest pool whose tasks get at least this many |
@@ -112,8 +119,10 @@ keys as long as they ask for one instance and no MPI launch:
 | `launcher_options` | missing or empty | the same |
 
 aegc's own keys, if they do reach the engine in a `resource_specification`, override those from
-`user_endpoint_config`; any other key fails the task (`unsupported resource_specification keys
-[...]`, with a hint for `vcpus`, `memory` and similar spellings).
+`user_endpoint_config`; any other key fails the task (`unsupported task options [...]; AWSEngine
+accepts [...]`, with a hint for `vcpus`, `memory` and similar spellings), and so does a `cpus` or
+`memory_gib` that isn't a positive number (`task option cpus must be a positive number`).
+Non-numeric MPI keys fail with `num_nodes, ranks_per_node and num_ranks must be numbers`.
 
 ## Pool selection
 
@@ -127,7 +136,8 @@ For each task the engine:
    `user_endpoint_config`), overridden by any that arrive in `resource_specification`;
 4. with `pool`, uses that pool if it exists and its Python matches the submitter;
 5. otherwise takes the pools whose env is the engine's `env` (all pools if it's empty), and keeps
-   those whose image's Python minor matches the submitter (if known);
+   those whose image's Python minor matches the submitter (or `python`); if neither is known and
+   those pools have more than one minor, it fails the task, asking for `python`;
 6. from those, with `size`, picks the first by name of that class, and checks that its tasks get
    at least `cpus` and `memory_gib`; otherwise keeps the pools whose tasks get at least `cpus`
    vCPUs and `memory_gib` GiB (both 0 if not given) and picks the cheapest: the fewest vCPUs held
@@ -178,7 +188,10 @@ manifest. Settings that `--pool` doesn't expose are fixed:
 | AMI | `/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id`, resolved at deploy |
 | Capacity | `DesiredCapacityType=vcpu`: minimum, maximum and desired capacity are vCPUs |
 | Root volume | gp3, encrypted, deleted with the instance; `disk=` GiB (default 30) at `throughput=` MiB/s (default 125), 3,000 IOPS (4 × the throughput above 750 MiB/s) |
-| Instance metadata | IMDSv2 required, hop limit 2, instance tags enabled |
+| Instance metadata | IMDSv2 required, hop limit 2, IPv6 endpoint disabled, instance tags enabled |
+| Task isolation | Pools whose image has aegc 0.4 or later: the worker container runs as root with `no-new-privileges` and six capabilities, task processes run as uid 57439, which the host's iptables bars from instance metadata, and get the [task role](iam.md#task-role)'s credentials; workers are tagged `aegc:isolated=true`. See [Task isolation](../concepts/security.md#task-isolation) |
+| Worker logs | The awslogs driver to `/aegc/<d>`, stream `<pool>/<instance-id>`, `awslogs-format=json/emf` (so EMF lines become [metrics](../how-to/observability.md#metrics)) |
+| Auto Scaling group metrics | Enabled at 1-minute granularity |
 | Scale-in protection | New instances protected; `AZRebalance` suspended |
 | Subnets | The default VPC's default subnets |
 
@@ -199,6 +212,14 @@ The launch template passes this to `aegc-worker run` as base64 JSON in `AEGC_WOR
 | `state_parameter` | `/aegc/<d>/state`, read every 60 s |
 | `max_lifetime_s` | The pool's `lifetime` (86,400; 3,600 to 259,200) |
 | `root_volume_gib`, `throughput_mibps` | The pool's `disk` and `throughput`, for the cost ledger |
+| `task_role_arn`, `task_uid`, `state_dir` | Isolated pools only: the [task role](iam.md#task-role) to assume, the task uid (57439) and the agent's root-owned state directory (`/run/aegc`, for the heartbeat and the credentials token) |
 
 At start the worker adds the instance type, Availability Zone and lifecycle (Spot or on-demand)
-from instance metadata, for its [cost ledger](../concepts/cost.md#cost-ledger) record.
+from instance metadata, for its [cost ledger](../concepts/cost.md#cost-ledger) record, its log
+lines and [provenance](../how-to/observability.md#provenance). The user data also passes
+`AEGC_INSTANCE_ID`, `AWS_REGION` and `AEGC_IMAGE` (the pinned image, for provenance).
+
+In isolated pools each task process gets `AWS_CONTAINER_CREDENTIALS_FULL_URI` and
+`AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` (the agent's task-role credentials on `127.0.0.1`),
+`AWS_REGION`, `AWS_DEFAULT_REGION` and `AWS_EC2_METADATA_DISABLED=true`. Every task gets
+`AEGC_TASK_UUID` and `GC_TASK_TIMEOUT` (its walltime).

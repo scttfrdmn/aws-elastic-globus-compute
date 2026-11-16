@@ -15,15 +15,18 @@ the command makes no AWS calls. The tests check these documents with the IAM pol
 | Policy | Attach to | Used by |
 |---|---|---|
 | [worker](#worker) | Created by `aegc deploy` as the inline policy `aegc-worker` on the role `aegc-<d>-worker-<region>` | `aegc-worker` on worker instances |
-| [operator](#operator) | The credentials the endpoint container runs with | `AWSEngine`; also `aegc cost`, `aegc limits --resume` and the spend lines of `aegc status` |
-| [deployer](#deployer) | The credentials you run `aegc deploy`, `destroy`, `stop`, `resume`, `limits`, `status`, `reap` and `footprint` with | The `aegc` CLI |
+| [operator](#operator) | The credentials the endpoint container runs with | `AWSEngine`; also `aegc cost`, `aegc limits --resume`, `aegc provenance` and the spend lines of `aegc status` |
+| [deployer](#deployer) | The credentials you run `aegc deploy`, `destroy`, `stop`, `resume`, `limits`, `status`, `metrics`, `reap` and `footprint` with | The `aegc` CLI |
 | [bootstrap](#bootstrap) | The credentials you run `aegc bootstrap` and `unbootstrap` with | The `aegc` CLI |
 | [builder](#builder) | The credentials you run `aegc image build`, `register`, `list` and `forget` with | The `aegc` CLI |
 
-With [grants](../how-to/data.md), `aegc deploy` adds a second inline policy to the worker role,
-[`aegc-grants`](#aegc-grants), for your own S3 prefixes. It also creates two roles of its own,
-shown at the end: the [scheduler role](#scheduler-role) for the deployment lease, and (from
-`aegc bootstrap`) the [ECR creation template role](#ecr-creation-template-role).
+`aegc deploy` also creates the [task role](#task-role), `aegc-<d>-task-<region>`, whose
+credentials task code gets in [isolated](../concepts/security.md#task-isolation) pools, with its
+inline policy `aegc-task`. With [grants](../how-to/data.md), it adds the inline policy
+[`aegc-grants`](#aegc-grants) for your own S3 prefixes to the task role (and to the worker role
+while pools with images from before aegc 0.4 remain). Two more roles of aegc's own are shown at the
+end: the [scheduler role](#scheduler-role) for the deployment lease, and (from `aegc bootstrap`)
+the [ECR creation template role](#ecr-creation-template-role).
 
 ## Why five
 
@@ -38,9 +41,10 @@ Sizes of the documents below, without whitespace:
 
 | Policy | Characters | Limit |
 |---|---|---|
-| worker | 1,967 | 10,240 for all of the role's inline policies, `aegc-grants` included |
-| operator | 3,059 | 6,144 |
-| deployer | 5,767 | 6,144 |
+| worker | 2,108 | 10,240 for all of the role's inline policies, `aegc-grants` included |
+| task (`aegc-task`) | 182 | 10,240 for all of the role's inline policies, `aegc-grants` included |
+| operator | 3,262 | 6,144 |
+| deployer | 5,805 | 6,144 |
 | bootstrap | 2,311 | 6,144 |
 | builder | 1,142 | 6,144 |
 
@@ -52,15 +56,17 @@ What a worker may do: consume the deployment's task queues, post to its result q
 payloads and write result payloads under `payloads/<d>/`, pull `aegc/*` images, write to its log
 group, terminate itself in an Auto Scaling group tagged with the deployment, read the deployment's
 state and manifest (for [`aegc.outputs`](../how-to/data.md#return-large-outputs)' current
-grants), and write its cost ledger record under `ledger/<d>/`. Nothing else; in particular no S3
-access outside those prefixes, so tasks read open data unsigned, and reach your own buckets only
-through [grants](#aegc-grants).
+grants on workers from before aegc 0.4), write its cost ledger record under `ledger/<d>/`, and
+assume the deployment's [task role](#task-role) (`AssumeTaskRole`), whose credentials it hands to
+task processes. Nothing else; in particular no S3 access outside those prefixes, so tasks read
+open data unsigned, and reach your own buckets only through [grants](#aegc-grants).
 
 `ShrinkToLeave` exists because a vCPU-weighted group refuses a decrement larger than its desired
 capacity (desired 1 vCPU, a 2-vCPU worker): the worker lowers desired by its own weight, then
 terminates without a decrement. The agent only ever lowers it, but `SetDesiredCapacity` has no
 condition on the value, so code running as the worker role could also raise a group's desired
-capacity, up to its `max_vcpus` (see [Security model](../concepts/security.md)).
+capacity, up to its `max_vcpus`. Task code runs as the worker role only in pools with images from
+before aegc 0.4 (see [Security model](../concepts/security.md#pools-with-older-images)).
 
 ```json
 {
@@ -153,6 +159,12 @@ capacity, up to its `max_vcpus` (see [Security model](../concepts/security.md)).
       "Resource": "arn:aws:logs:us-west-2:123456789012:log-group:/aegc/e2e:*"
     },
     {
+      "Sid": "AssumeTaskRole",
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Resource": "arn:aws:iam::123456789012:role/aegc/aegc-e2e-task-us-west-2"
+    },
+    {
       "Sid": "ReadDeploymentState",
       "Effect": "Allow",
       "Action": "ssm:GetParameter",
@@ -171,8 +183,9 @@ capacity, up to its `max_vcpus` (see [Security model](../concepts/security.md)).
 }
 ```
 
-`aegc deploy` rewrites this inline policy on every run, so redeploying a v0.1 deployment gives its
-workers the new state and ledger permissions.
+`aegc deploy` puts this inline policy back whenever it differs from the role's (and reports
+`exists` when it doesn't), so redeploying an older deployment gives its workers the new
+permissions, such as v0.4's `AssumeTaskRole`.
 
 The role trusts EC2:
 
@@ -191,13 +204,60 @@ The role trusts EC2:
 }
 ```
 
+## Task role
+
+`aegc deploy` creates `/aegc/aegc-<d>-task-<region>` (tag `aegc:role=task-role`, maximum session
+an hour) for task code. The worker agent of an [isolated](../concepts/security.md#task-isolation)
+pool assumes it and serves its credentials to task processes on `127.0.0.1`. It trusts only the
+deployment's worker role:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::123456789012:role/aegc/aegc-e2e-worker-us-west-2"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+```
+
+Its inline policy `aegc-task` lets task code read the deployment's manifest, where
+[`aegc.outputs`](../how-to/data.md#return-large-outputs) finds the current grants, and nothing
+else: no queues, payloads, cost ledger, deployment state or Auto Scaling.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadManifest",
+      "Effect": "Allow",
+      "Action": "ssm:GetParameter",
+      "Resource": "arn:aws:ssm:us-west-2:123456789012:parameter/aegc/e2e/manifest"
+    }
+  ]
+}
+```
+
+With grants it also has [`aegc-grants`](#aegc-grants). `aegc iam-policy` doesn't print these
+documents; `deploy` writes them. A new worker role can take a few seconds to become a valid
+principal, so `deploy` retries the trust policy while IAM reports `MalformedPolicyDocument`.
+`aegc destroy` deletes the role with its inline policies.
+
 ## aegc-grants
 
-The worker role's second inline policy, for the deployment's
-[grants](../how-to/data.md): `aegc deploy --grant read=...` and `--grant write=...`. It exists only
-while the deployment has grants: `deploy` puts it after `aegc-worker`, `--grant none` deletes it,
-and `aegc destroy` deletes it with the role. `aegc iam-policy` doesn't print it; it depends on the
-grants. For
+The inline policy for the deployment's [grants](../how-to/data.md): `aegc deploy --grant read=...`
+and `--grant write=...`. It goes on the [task role](#task-role), and also on the worker role while
+any pool runs an image from before aegc 0.4, or any worker launched before its pool was isolated
+(without the instance tag `aegc:isolated=true`) is still running. It exists only while the
+deployment has grants: `deploy` puts it after `aegc-worker` and `aegc-task`, `--grant none`
+deletes it, and `aegc destroy` deletes it with the roles. `aegc iam-policy` doesn't print it; it
+depends on the grants. For
 
 ```sh
 aegc deploy e2e --pool geospatial \
@@ -265,11 +325,16 @@ it is:
 - Grants can't contain `*`, `?` or `${`, so the only wildcard is the `*` aegc appends to each
   prefix.
 - IAM counts all of a role's inline policies against 10,240 characters, without whitespace.
-  `aegc-worker` takes about 1,970, and `deploy` refuses grants that don't fit in the rest, before
-  it changes anything. The policy above is 564 characters.
+  `aegc-worker` takes about 2,110 and `aegc-task` about 180, and `deploy` refuses grants that
+  don't fit next to either, before it changes anything. The policy above is 564 characters.
 - Requester-pays buckets need nothing more. Buckets in another account (read grants only) must
-  also allow the worker role in their bucket policy, and buckets encrypted with a customer managed KMS key need
-  `kms:Decrypt` or `kms:GenerateDataKey` on the key, which aegc doesn't add.
+  also allow the task role in their bucket policy (and the worker role while pools with older
+  images remain), and buckets encrypted with a customer managed KMS key need `kms:Decrypt` or
+  `kms:GenerateDataKey` on the key, which aegc doesn't add.
+- `deploy` compares the policy with the role's and reports `created`, `updated` or `exists`
+  (`would-create`, `would-update` or `would-delete` in a dry run), labelled with the role, for
+  example `aegc-grants (task role) (2 grant(s))`. While pre-0.4 workers still run on an otherwise
+  isolated deployment, the worker role's copy is reported as `kept`.
 
 The [deployer](#deployer) policy already allows `iam:PutRolePolicy` and `iam:DeleteRolePolicy` on roles
 under `/aegc/`, so grants need no extra permissions to deploy.
@@ -293,6 +358,10 @@ capacity on the deployment's Auto Scaling groups. For spend limits and the lease
   manifest's value;
 - reads and updates the deployment's schedules, and passes the scheduler role to EventBridge
   Scheduler (`RenewLease`, `ListLease`, `PassLeaseRole`), to renew the lease.
+
+For [`aegc provenance`](cli.md#aegc-provenance), it may also search the deployment's log group,
+`/aegc/<d>`, and no other (`ReadTaskLogs`, `logs:FilterLogEvents`). `aegc metrics` uses
+`cloudwatch:GetMetricData`, already in `VcpuQuotaPreflight`.
 
 ```json
 {
@@ -455,6 +524,15 @@ capacity on the deployment's Auto Scaling groups. For spend limits and the lease
       }
     },
     {
+      "Sid": "ReadTaskLogs",
+      "Effect": "Allow",
+      "Action": "logs:FilterLogEvents",
+      "Resource": [
+        "arn:aws:logs:us-west-2:123456789012:log-group:/aegc/e2e",
+        "arn:aws:logs:us-west-2:123456789012:log-group:/aegc/e2e:*"
+      ]
+    },
+    {
       "Sid": "FindResultQueues",
       "Effect": "Allow",
       "Action": "sqs:ListQueues",
@@ -491,7 +569,7 @@ policy has no ledger access. The operator policy includes `ce:GetCostAndUsage` f
 ## deployer
 
 A least-privilege starting point for `aegc deploy`, `destroy`, `stop`, `resume`, `limits`, `status`,
-`reap` and `footprint`. Creates are conditioned on the request carrying `aegc:managed=true`, and
+`metrics`, `reap` and `footprint`. Creates are conditioned on the request carrying `aegc:managed=true`, and
 changes and deletes on the resource carrying it, where the service supports tag conditions. IAM
 actions are limited to the `/aegc/` path, and roles can be passed only to EC2 and EventBridge
 Scheduler.
@@ -668,7 +746,8 @@ Scheduler.
         "autoscaling:DeleteAutoScalingGroup",
         "autoscaling:SuspendProcesses",
         "autoscaling:SetDesiredCapacity",
-        "autoscaling:TerminateInstanceInAutoScalingGroup"
+        "autoscaling:TerminateInstanceInAutoScalingGroup",
+        "autoscaling:EnableMetricsCollection"
       ],
       "Resource": "*",
       "Condition": {
@@ -829,7 +908,11 @@ Scheduler.
 - `LeaseSchedules` and `ListSchedules` manage the `aegc-*` schedule groups and their schedules;
   `PassAegcRoles` lets `deploy` pass the scheduler role to them.
 - `ec2:DescribeInstances`, `DescribeVolumes`, `DescribeNetworkInterfaces` and `tag:GetResources`
-  are for `destroy`'s verification and `aegc footprint`.
+  are for `destroy`'s verification and `aegc footprint`. `deploy` also uses `DescribeInstances` to
+  find workers launched before their pool was isolated.
+- `autoscaling:EnableMetricsCollection` turns on the groups' 1-minute Auto Scaling metrics for
+  [`aegc metrics`](cli.md#aegc-metrics). With a deployer policy from before 0.4, `deploy` reports
+  `kept  auto scaling group metrics ... (not enabled: AccessDenied)` and carries on.
 - The deployer policy has no S3 access, so with it alone `aegc status` leaves out the spend
   figures, and `aegc cost` and `aegc limits --resume` are denied; use credentials with the
   [operator](#operator) policy for the deployment as well. Without

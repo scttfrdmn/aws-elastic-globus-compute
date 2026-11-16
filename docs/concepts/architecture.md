@@ -73,7 +73,12 @@ minimum, it terminates it without lowering desired capacity, so the group launch
 slot (by default one slot per vCPU; a [size class](../how-to/configuration.md#size-classes)
 gives each task more). Each task runs Globus Compute's own `execute_task` in a fresh
 child process, forked from a server that has already imported Globus Compute, so a task starts in
-about 30 ms. The worker enforces walltime by killing the child's process group. It also reads the
+about 30 ms. On images built with aegc 0.4 or later the child drops to uid 57439 before it
+deserializes the task, can't reach instance metadata, and gets the deployment's task role instead
+of the worker role; its result comes back over a pipe (see
+[Task isolation](security.md#task-isolation)). The worker enforces walltime by killing the
+child's process group. It logs JSON lines, emits CloudWatch metrics and adds provenance to each
+result ([Watch tasks](../how-to/observability.md)). It also reads the
 deployment state every 60 s, stops claiming after its lifetime (24 hours by default; at the group's
 minimum it then terminates for a replacement), and writes
 its [cost ledger](cost.md#cost-ledger) record at start, every 5 minutes and at exit.

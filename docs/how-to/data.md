@@ -14,7 +14,7 @@ flowchart LR
     client["Your code<br/>(SDK)"] <-->|"submit(fn, tile)<br/>result: the s3:// URI"| globus(("Globus<br/>Compute"))
     globus <--> ep["Endpoint<br/>AWSEngine"]
     subgraph aws["Your AWS account"]
-        worker["Task on a worker<br/>(worker role)"]
+        worker["Task on a worker<br/>(task role)"]
         inputs[("s3://my-lab-data/inputs/<br/>read grant")]
         results[("s3://my-lab-results/runs/<br/>write grant")]
     end
@@ -33,8 +33,11 @@ aegc deploy e2e --pool geospatial \
 ```
 
 Each `--grant` is `read=s3://BUCKET/PREFIX` or `write=s3://BUCKET/PREFIX`, and is repeatable. aegc
-puts them in an inline policy, `aegc-grants`, on the deployment's worker role (see the
-[IAM reference](../reference/iam.md#aegc-grants)):
+puts them in an inline policy, `aegc-grants`, on the deployment's
+[task role](../reference/iam.md#task-role), whose credentials tasks get (see the
+[IAM reference](../reference/iam.md#aegc-grants)). While a pool runs an image from before aegc
+0.4, whose tasks still run with the worker role, the worker role gets the policy too; see
+[Task isolation](../concepts/security.md#task-isolation).
 
 | Grant | Allows |
 |---|---|
@@ -59,17 +62,24 @@ aegc deploy e2e --pool geospatial --grant none                      # removes th
 
 `--grant` replaces the whole list, so give every grant you want to keep. `--grant none` deletes the
 `aegc-grants` policy, and can't be combined with other grants. The deploy report has a line for the
-policy:
+policy on each role it's on:
 
 ```
-     updated  iam role policy            aegc-grants (2 grant(s))
+     created  iam role policy            aegc-grants (task role) (2 grant(s))
 ```
 
-or `deleted` when the grants were removed. `aegc status` doesn't list grants; to see a
-deployment's current ones:
+`created` the first time, `updated` when the grants changed, `exists` when they didn't, and
+`deleted` when they were removed (`would-create`, `would-update` or `would-delete` with
+`--dry-run`). `aegc status` lists the deployment's grants:
+
+```
+  grants: read s3://my-lab-data/inputs/, write s3://my-lab-results/runs/
+```
+
+and the policy itself is on the task role:
 
 ```sh
-aws iam get-role-policy --role-name aegc-e2e-worker-us-west-2 --policy-name aegc-grants
+aws iam get-role-policy --role-name aegc-e2e-task-us-west-2 --policy-name aegc-grants
 ```
 
 IAM changes reach running workers within seconds, and `aegc.outputs` reads the current grants
@@ -89,7 +99,8 @@ too. (If the manifest can't be read, it falls back to the grants the worker boot
 - **More than 32 grants**, because they also go into each worker's user data:
   `deployment e2e has 40 grants; at most 32 (use fewer, broader prefixes)`. Long prefixes can
   also run out of IAM's room first: all of a role's inline policies share 10,240 characters, and
-  `aegc-worker` uses about 1,970 of them.
+  `aegc-worker` uses about 2,110 of them on the worker role (`aegc-task` about 180 on the task
+  role).
 
 ### Buckets in another account, and KMS
 
@@ -99,7 +110,9 @@ receive your outputs. Writing to another account's bucket is denied even if its 
 allows it.
 
 **Read grants may cross accounts**, as open and shared data often lives elsewhere. The other
-account's bucket policy must also allow the worker role, whose ARN is
+account's bucket policy must also allow the task role, whose ARN is
+`arn:aws:iam::<account>:role/aegc/aegc-<d>-task-<region>`, and, while pools with images from
+before aegc 0.4 remain, the worker role,
 `arn:aws:iam::<account>:role/aegc/aegc-<d>-worker-<region>`.
 
 A bucket encrypted with a customer managed KMS key needs `kms:Decrypt` (to read) or
@@ -220,8 +233,9 @@ PermissionError: no write grant: deploy with `aegc deploy <d> --grant write=s3:/
 
 A few more things to know:
 
-- **Presign links on your machine.** A URL presigned on a worker stops working when the instance
-  role's credentials expire, a few hours later, even if `expires_s` is longer.
+- **Presign links on your machine.** A URL presigned in a task stops working when the credentials
+  that signed it expire, even if `expires_s` is longer: the task role's sessions last at most an
+  hour (the instance role's, on workers from older images, a few hours).
 - **Use `/scratch` for big files.** It's on the worker's root volume (`disk=` GiB, 30 by default),
   shared by the tasks on that worker. Delete what you've uploaded.
 - **Storage is yours.** The objects stay in your bucket until you, or a lifecycle rule of yours,
@@ -231,9 +245,10 @@ A few more things to know:
 
 ## Security
 
-A grant extends the deployment's trust domain to your prefix. Every task in the deployment, from
-anyone who can submit to its endpoints, can read everything a read grant covers and overwrite
-anything a write grant covers, including other tasks' outputs. So:
+A grant extends the deployment's trust domain to your prefix. Every task in the deployment runs
+with the same task role, so every task, from anyone who can submit to its endpoints, can read
+everything a read grant covers and overwrite anything a write grant covers, including other
+tasks' outputs. So:
 
 - Grant the narrowest prefixes that do the job, and use a separate deployment for work that
   shouldn't share them.

@@ -34,7 +34,9 @@ Each prints a report, one line per resource, with an outcome: `created`, `exists
 | [`cost`](#aegc-cost) | Estimated spend from the cost ledger |
 | [`destroy`](#aegc-destroy) | Delete a deployment (dry run by default) |
 | [`footprint`](#aegc-footprint) | List what exists for a deployment: owned resources and untagged look-alikes |
-| [`status`](#aegc-status) | State, spend, limits, lease, pools, queues, workers and waiting results |
+| [`status`](#aegc-status) | State, spend, limits, grants, lease, pools and their size classes, queues, workers and waiting results |
+| [`metrics`](#aegc-metrics) | Per-pool task counts, times, interruptions and capacity from CloudWatch |
+| [`provenance`](#aegc-provenance) | Where and how a task ran: image, instance, timings, estimated cost |
 | [`reap`](#aegc-reap) | Delete idle result queues of finished endpoint processes |
 | [`iam-policy`](#aegc-iam-policy) | Print an IAM policy document for one of aegc's roles |
 | [`endpoint`](#aegc-endpoint) | Run a Globus Compute endpoint with `AWSEngine` in Docker |
@@ -179,6 +181,14 @@ unless given again. Without any limit, `deploy` prints a note. While the deploym
 redeploy keeps group minimums at 0. `deploy` refuses an image built with aegc before 0.2 unless
 `--allow-old-image` is given.
 
+Pools whose image was built with aegc 0.4 or later [isolate tasks](../concepts/security.md#task-isolation)
+from the worker role. For older images `deploy` warns,
+`warning: <pools>: images built before aegc 0.4 run tasks with the worker role's credentials (they
+can read other tasks' payloads and post results); rebuild them with `aegc image build` to isolate
+tasks`, and keeps the grants on the worker role. `deploy` creates the task role
+`aegc-<d>-task-<region>` and turns on each group's 1-minute Auto Scaling metrics. Role policies are
+compared with what the role has: an unchanged one is reported as `exists`.
+
 Pool options:
 
 | Option | Default | Meaning |
@@ -301,14 +311,55 @@ aegc status DEPLOYMENT [--json]
 ```
 
 The deployment's state (and why, if it isn't running); estimated spend now, today and this month,
-and the limits; the lease and TTL. Per pool: tasks queued, running and dead-lettered; workers in
-service, desired and maximum (in vCPUs); workers by type, their $/h, the oldest waiting task and the
-worst-case cost of running tasks; the last scaling activity. Then the vCPU quotas, and each result
-queue with the results waiting in it. See [Operations](../how-to/operations.md#check-status).
+and the limits; the deployment's grants (`grants: none (workers reach only aegc's own bucket)`
+without any); the lease and TTL. Per pool: tasks queued, running and dead-lettered; workers in
+service, desired and maximum (in vCPUs); its size class and what one task gets (for example
+`size mem: 2 vCPU(s), 16 GiB per task`, or `size per-vCPU: ...` for a pool without `size=`);
+workers by type, their $/h, the oldest waiting task and the worst-case cost of running tasks; the
+last scaling activity. Then the vCPU quotas, and each result queue with the results waiting in
+it. See [Operations](../how-to/operations.md#check-status).
 
 | Option | Meaning |
 |---|---|
-| `--json` | Machine-readable output |
+| `--json` | Machine-readable output; also has `grants` and each pool's `size_class`, `task_vcpus` and `task_memory_gib` |
+
+## aegc metrics
+
+```
+aegc metrics DEPLOYMENT [--since SINCE] [--json]
+```
+
+Per pool: tasks completed and failed by outcome, average and maximum execution and queue-wait
+times, average boot-to-first-claim, interruptions, releases, poison tasks, worker exits, and the
+group's largest in-service and desired capacity. It reads the metrics workers emit (namespace
+`aegc`) and the Auto Scaling group metrics with GetMetricData, which the deployer and operator
+policies both allow. Workers from images built before aegc 0.4 emit none. See
+[Watch tasks](../how-to/observability.md#aegc-metrics).
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--since` | `1h` | A duration such as `90m`, `1h`, `1d` or `7d`, or `today` or `month` |
+| `--json` | off | Machine-readable output |
+
+## aegc provenance
+
+```
+aegc provenance DEPLOYMENT TASK_UUID [--since SINCE] [--json]
+```
+
+Where and how a task ran: for each attempt that finished, its outcome, run and queue-wait times,
+instance type, Spot or on-demand, Availability Zone, instance id, pool, slots, vCPUs, image and
+estimated cost. It finds the task's `task_finished` lines in `/aegc/<d>` with FilterLogEvents,
+which needs the [operator policy](iam.md#operator). `TASK_UUID` is the Globus Compute task id.
+The same record is in the result's `details["aegc"]`. It exits 1 if it finds none:
+`aegc: no task_finished line for <uuid> in /aegc/<d> since 14d (logs are kept 14 days; workers
+from images built before aegc 0.4 don't write them)`. See
+[Watch tasks](../how-to/observability.md#aegc-provenance).
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--since` | `14d` | How far back to look: a duration, `today` or `month` (logs are kept 14 days) |
+| `--json` | off | The records as JSON, each with its `log_stream` |
 
 ## aegc reap
 
@@ -347,7 +398,7 @@ With both `--region` and `--account` given, it makes no AWS calls.
 ```
 aegc endpoint {build,login,configure,start,stop,logs,test,id}
               [--name NAME] [--deployment DEPLOYMENT] [--env ENV] [-n N]
-              [--project-dir PROJECT_DIR] [--python PYTHON]
+              [--allow-function ID ...] [--project-dir PROJECT_DIR] [--python PYTHON]
 ```
 
 Run a Globus Compute endpoint with `AWSEngine` in Docker.
@@ -369,11 +420,17 @@ Run a Globus Compute endpoint with `AWSEngine` in Docker.
 | `--deployment` | `default` | aegc deployment the engine uses (configure) |
 | `--env` | | Default science environment (configure); env to test (test) |
 | `-n` | 10 | Tasks to submit (test) |
+| `--allow-function ID` | | Only these registered function ids may run (configure); repeatable. `none` removes the list, so any function may run; without the option, `configure` leaves the list as it is. Globus refuses other functions with `403 FUNCTION_NOT_PERMITTED` once the endpoint restarts. See [Allow only your functions](../how-to/flows.md#allow-only-your-functions) |
 | `--project-dir` | `.` | aegc source tree (build) |
 | `--python` | `3.14` | Python in the endpoint image; `test` submits with it (build) |
 
 The container mounts `~/.aws` read-only and gets `AWS_PROFILE` (from `--profile` or the
 environment), `AWS_REGION` and `AWS_DEFAULT_REGION`.
+
+`configure` writes `allowed_functions` into the endpoint's `config.yaml` with `--allow-function`,
+and prints `allowed functions: <ids>; restart the endpoint (stop, start) for Globus to enforce it`.
+A value that isn't a UUID fails with
+`aegc: --allow-function takes function ids (UUIDs), or none to allow any`.
 
 ## aegc-worker
 
@@ -381,6 +438,6 @@ Runs inside worker images; you don't normally call it yourself.
 
 | Command | What it does |
 |---|---|
-| `aegc-worker run` | Claim and run tasks until drained. Reads its configuration from `AEGC_WORKER_CONFIG_B64` (set by the user data). SIGTERM releases in-flight tasks and exits; SIGUSR1 simulates a Spot interruption |
+| `aegc-worker run` | Claim and run tasks until drained. Reads its configuration from `AEGC_WORKER_CONFIG_B64` (set by the user data). Logs JSON lines, and writes EMF metric lines on stdout. SIGTERM releases in-flight tasks and exits (a task that finishes meanwhile posts its result); SIGUSR1 simulates a Spot interruption |
 | `aegc-worker selftest` | Run a probe task through `execute_task` in this image's Python; used by `aegc image build` and `aegc image register` |
 | `aegc-worker version` | Print the aegc and `globus-compute-endpoint` versions, the Python minor and interpreter, and the uid, as one line of JSON; used by `aegc image register` |

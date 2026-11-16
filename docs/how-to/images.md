@@ -199,10 +199,13 @@ do, with its own entrypoint and user: `docker run <image> aegc-worker version`, 
 - `aegc-worker version` runs, which means `aegc-worker` is on `PATH` and the entrypoint runs the
   command it's given (empty, or `exec "$@"` as micromamba's is);
 - the aegc in it is 0.3 or later (otherwise `<image> has aegc 0.2.0; registered images need aegc
-  0.3 or later`): size classes, grants and `aegc.outputs` are worker features;
+  0.3 or later`): size classes, grants and `aegc.outputs` are worker features. With aegc 0.4 or
+  later, its pools also [isolate tasks](../concepts/security.md#task-isolation) and report logs,
+  metrics and provenance;
 - it runs as root or uid 57439 (otherwise `<image> runs as uid 1000; workers need root or uid
   57439, which owns the host's /scratch (USER 57439 in your Dockerfile)`). The worker keeps its
-  heartbeat and task directories in `/scratch`;
+  task directories in `/scratch`. Pools that isolate tasks run the container as root whatever
+  its `USER`, and run each task as uid 57439;
 - `aegc-worker selftest` passes.
 
 Then it copies the image into `aegc/<env>` with the tag
@@ -322,6 +325,9 @@ new builds. An env's images for every Python minor share one repository, and so 
 - **Rebuild for new worker features.** [Size classes](configuration.md#size-classes) and
   [`aegc.outputs`](data.md#return-large-outputs) need images built with aegc 0.3 or later.
   `aegc deploy` refuses `size=` on an older image, and older workers have no `aegc.outputs`.
+  [Task isolation](../concepts/security.md#task-isolation), JSON logs, metrics and provenance
+  ([Watch tasks](observability.md)) need images built with aegc 0.4 or later; `aegc deploy` warns
+  about pools on older ones.
 - **Images are big.** Science images are often several GB, which shows in cold-start time and ECR
   storage. The pull-through cache keeps aarchsci and aarchbio pulls in-region.
 - **Native arm64 builds.** On Apple Silicon the build is native. Elsewhere buildx needs QEMU, and

@@ -12,9 +12,10 @@ The output looks like this (values are illustrative):
 ```
 deployment e2e (us-west-2): running
   spend: now $0.0866/h, today $0.4120, this month $3.18 (estimates) | limits $5/day (on_cap=fail)
+  grants: read s3://my-lab-data/inputs/, write s3://my-lab-results/runs/
   lease until 2026-11-16 14:05 UTC (renewed by endpoints)
   pool geospatial-py314: env geospatial, Python 3.14 | tasks queued 3, running 4, dead-lettered 0 | workers 2 in service, 4 vCPUs desired, max 8
-    2x c8g.large spot | $0.0866/h | oldest task waiting 2 min | running tasks could cost up to $0.95 more
+    size per-vCPU: 1 vCPU(s), 2 GiB per task | 2x c8g.large spot | $0.0866/h | oldest task waiting 2 min | running tasks could cost up to $0.95 more
     last scaling activity: Successful: Launching a new EC2 instance: i-0123456789abcdef0
   spot vCPU quota 32, in use 4; pools can use up to 8
   result queue aegc-e2e-res-1a2b3c4d5e6f: 0 result(s)
@@ -24,13 +25,17 @@ deployment e2e (us-west-2): running
   When it isn't `running`, the next line says why and how to resume.
 - **spend** is the estimated rate of the workers running now, and the estimated spend today and this
   month from the [cost ledger](../concepts/cost.md#cost-ledger), followed by the limits.
+- **grants** lists the deployment's [data-access grants](data.md), or says
+  `grants: none (workers reach only aegc's own bucket)`.
 - **lease** and **TTL** show when the deployment will expire unless an endpoint renews it.
 - **queued / running** are the task queue's visible and in-flight messages (SQS's approximate
   counts).
 - **dead-lettered** counts messages in the pool's dead-letter queue. It should be 0.
 - **workers** shows instances in service, desired capacity and the pool's maximum, in vCPUs (in
   workers for a pool deployed by v0.1).
-- **The second pool line** lists the workers by instance type and Spot or on-demand, their
+- **The second pool line** starts with the pool's [size class](configuration.md#size-classes) and
+  what one task gets (`size per-vCPU` for a pool without `size=`; for `whole`, `one task per
+  instance, at least N vCPUs`). Then it lists the workers by instance type and Spot or on-demand, their
   estimated $/h, the age of the oldest waiting task (CloudWatch's `ApproximateAgeOfOldestMessage`
   over the last 10 minutes), and a worst case for the running tasks: each running for the pool's
   default walltime at its share of the pool's rate.
@@ -124,11 +129,16 @@ deployment expires; `aegc resume` brings it back.
     ```
 
 - **Workers:** CloudWatch Logs group `/aegc/<d>`, one stream per instance, `<pool>/<instance-id>`,
-  kept for 14 days. Each claim and its outcome are logged with the duration:
+  kept for 14 days. Workers from aegc 0.4 images log one JSON object per line, with a
+  `task finished` line per task; the tasks' own output is in the same stream. See
+  [Watch tasks](observability.md#worker-logs):
 
     ```sh
     aws logs tail /aegc/e2e --follow
     ```
+
+- **One task:** `aegc provenance e2e <task id>` finds where and how it ran; `aegc metrics e2e`
+  sums up the pools. See [Watch tasks](observability.md).
 
 - **Worker boot:** the user-data script logs to `/var/log/aegc-boot.log` on the instance. Instances
   have no SSH access; the script's output usually also appears in the EC2 console output
@@ -185,7 +195,7 @@ destroys anyway, and those tasks are lost. Then it deletes, in order:
 3. the security group (retrying while the terminated instances' network interfaces go away),
 4. all of the deployment's queues: task, dead-letter and result queues,
 5. the lease's schedules, schedule group and scheduler role,
-6. the worker instance profile and role,
+6. the worker instance profile and role, and the task role,
 7. the log group,
 8. the deployment's `inuse-` tags on its images (the images stay),
 9. every parameter under `/aegc/<d>/`: the manifest and the state.
@@ -197,7 +207,8 @@ days. Cost ledger records stay until they expire after 400 days.
 **Verification.** After deleting, `destroy` re-lists everything it's responsible for: instances,
 volumes and network interfaces tagged with the deployment (waiting up to 10 minutes while any are
 still terminating or detaching), groups, launch templates, the security group, queues, the log
-group, `/aegc/<d>/` parameters, the worker role and instance profile, the lease's group and role,
+group, `/aegc/<d>/` parameters, the worker role and instance profile, the task role, the lease's
+group and role,
 and in-use image tags. Anything still there is reported as `remaining`, and the command exits 1.
 `--no-verify` skips the check. `aegc destroy e2e --verify`, without `--yes`, only runs the check,
 for example to confirm an earlier destroy.
@@ -216,6 +227,38 @@ Resource Groups Tagging API (everything tagged `aegc:deployment=<d>`) with a sca
 queues, Auto Scaling groups, launch templates and `/aegc/<d>/` parameters. Each line is `owned`
 (aegc's name and tags) or `look-alike` (aegc's name without its tags, which aegc never deletes).
 For a while after a destroy, the tagging API can still list terminated instances.
+
+## Upgrade from v0.3
+
+v0.4's [task isolation](../concepts/security.md#task-isolation), JSON logs, metrics and provenance
+are worker features, and the `python` option is an endpoint feature, so rebuild both images.
+From an updated source tree:
+
+1. Update the IAM policies you attached yourself: the
+   [operator policy](../reference/iam.md#operator) gains `logs:FilterLogEvents` on the
+   deployment's log group (for `aegc provenance`), and the
+   [deployer policy](../reference/iam.md#deployer) `autoscaling:EnableMetricsCollection` (for
+   `aegc metrics`' capacity figures). `aegc iam-policy operator --deployment <d>` and
+   `aegc iam-policy deployer` print them.
+2. `aegc image build --env <env> ...` for each env and Python minor, as before. Images built with
+   aegc 0.4 isolate tasks; `aegc image list --env <env>` shows each image's aegc version.
+3. `aegc deploy <d> --pool <env> ...`. This creates the task role, gives the worker role
+   `AssumeTaskRole`, pins the new images, turns on the groups' metrics, and adds a launch
+   template version to every pool, because the user data changed (the log format and
+   `AEGC_IMAGE`) even for pools you didn't rebuild. Pools still on older images get a warning.
+4. `aegc endpoint ... build`, then `configure` again (the schema and template changed: `python`),
+   then `stop` and `start`.
+
+Running workers keep their old launch template version until they leave. While any of them is
+still running, `deploy` keeps your grants on the worker role as well
+(`kept  iam role policy  aegc-grants (worker role) (N pre-0.4 instance(s) still running; deploy
+again after they leave)`). Once they've gone (idle workers leave after 5 minutes; `aegc status`
+shows what's running), run `aegc deploy <d> --pool <env>` again: the grants then live only on the
+task role.
+
+Code in tasks may notice the change: tasks no longer reach instance metadata, and get
+`AccessDenied` for anything outside their grants. See
+[Isolated tasks](troubleshooting.md#isolated-tasks).
 
 ## Upgrade a v0.1 deployment
 

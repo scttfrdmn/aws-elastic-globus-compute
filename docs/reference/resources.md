@@ -71,8 +71,9 @@ Deleted by `aegc destroy`.
 
 | Resource | Name | `aegc:role` |
 |---|---|---|
-| IAM role, path `/aegc/`, inline policies `aegc-worker` and, with [grants](../how-to/data.md), `aegc-grants`; trusts EC2 | `aegc-<d>-worker-<region>` | `worker-role` |
+| IAM role, path `/aegc/`, inline policies `aegc-worker` and, with [grants](../how-to/data.md) while pools with images from before aegc 0.4 remain, `aegc-grants`; trusts EC2 | `aegc-<d>-worker-<region>` | `worker-role` |
 | IAM instance profile, path `/aegc/` | `aegc-<d>-worker-<region>` | `worker-role` |
+| IAM role, path `/aegc/`, inline policies `aegc-task` and, with grants, `aegc-grants`; trusts only the worker role; 1-hour sessions (see [Task role](iam.md#task-role)) | `aegc-<d>-task-<region>` | `task-role` |
 | EC2 security group, no ingress, in the default VPC | `aegc-<d>-workers` | `sg` |
 | CloudWatch log group, 14-day retention | `/aegc/<d>` | `logs` |
 | SSM parameter (the manifest the engine reads) | `/aegc/<d>/manifest` | `manifest` |
@@ -101,6 +102,10 @@ Deleted by `aegc destroy`. These also carry `aegc:pool=<pool>`.
 The group's tags propagate to instances except `aegc:role`, so instances keep `aegc:role=worker`
 from the launch template. Launch template versions record a content hash in their description, so
 a redeploy with no changes adds no version.
+
+Workers of pools that [isolate tasks](../concepts/security.md#task-isolation) also carry
+`aegc:isolated=true`, which `deploy` uses to tell when no worker runs tasks with the worker role
+any more. Groups have 1-minute group metrics enabled.
 
 ## Endpoint process: AWSEngine
 
@@ -135,7 +140,8 @@ a redeploy with no changes adds no version.
 region, account, bucket, instance profile ARN, security group and subnets; for each pool its
 settings (env, Python, image digest, `min_vcpus`/`max_vcpus` and `capacity_type: vcpu`, sizes,
 slots, idle timeout, volume, walltimes, lifetime, instance types, and the size class:
-`size_class`, `task_cpus`, `task_memory_gib`, `memory_gib_per_vcpu_min`) and the URLs and names
+`size_class`, `task_cpus`, `task_memory_gib`, `memory_gib_per_vcpu_min`, and `isolate_tasks`,
+true for images with aegc 0.4 or later) and the URLs and names
 of its queues, launch template and group; `limits` (`max_usd_day`, `max_usd_month`,
 `max_instance_hours_day`, `on_cap`); `lease` (`lease_s`, `ttl_at`); `grants`
 (`{access, bucket, prefix}` each); and `generation`, a hash of the rest, which engines compare to notice a redeploy. `aegc limits` rewrites it. `AWSEngine` and
