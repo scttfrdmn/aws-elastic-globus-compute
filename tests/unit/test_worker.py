@@ -568,3 +568,16 @@ def test_ledger_records_the_instance(rig: Rig) -> None:
     assert rec["instance_id"] == me and rec["instance_type"] == "c8g.large"
     assert rec["lifecycle"] == "spot" and rec["exit_reason"] == "lifetime"
     assert rec["last_seen"] >= rec["launched_at"]
+
+
+@pytest.mark.timeout(60)
+def test_a_task_finishing_after_stop_posts_its_result(rig: Rig) -> None:
+    # Found live: SIGTERM raced a claim, stop() released nothing, the task finished and its result
+    # was dropped as "released" with its message hidden for the full visibility timeout.
+    a = rig.agent()
+    tid = rig.submit(pow, 2, 5)
+    a._stop.set()  # the stop has already happened when this claim lands
+    a.claim_once()
+    a.wait_idle()
+    assert value_of(rig.final(1)[tid], rig.s3) == (False, 32)
+    assert rig.task_queue_empty()

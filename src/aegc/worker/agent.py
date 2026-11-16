@@ -184,6 +184,9 @@ class Agent:
         finally:
             self._pool.shutdown(wait=not self._stop.is_set())
             self._stop.set()
+            # Anything still claimed (still running, or claimed while stop() was releasing) goes
+            # back to the queue now, not when its visibility timeout runs out.
+            self._release_all()
             self._exit_reason = self._drain_reason or "stopped"
             self.write_ledger(final=True)
             self._emf.emit(
@@ -335,9 +338,10 @@ class Agent:
         posted = False
         try:
             prov = self._provenance(job, timings)
-            if job.released or self._stop.is_set():
+            if job.released:
                 status = "released"
-                return  # another worker will run it
+                return  # its message is visible again: another worker will run it
+            # Stopping, but this one finished (a claim can race the stop's release): post it.
             if outcome.outcome == "crashed":
                 self.stats.failed += 1
                 self._post_failure(msg, "CHILD_CRASHED", outcome.detail, job.receive_count, timings)
