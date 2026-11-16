@@ -413,7 +413,7 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
                 None,
                 0,
                 (
-                    f"unsupported resource_specification keys {sorted(unknown)}; "
+                    f"unsupported task options {sorted(unknown)}; "
                     f"AWSEngine accepts {sorted(RESOURCE_KEYS)}"
                     + (f" (did you mean {', '.join(hints)}?)" if hints else "")
                 ),
@@ -425,7 +425,7 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
                 except (TypeError, ValueError):
                     ok = False
                 if not ok:
-                    return None, 0, f"resource_specification {key} must be a positive number"
+                    return None, 0, f"task option {key} must be a positive number"
         pools: dict[str, dict[str, Any]] = self._manifest.get("pools", {})
         if "pool" in spec:
             name = str(spec["pool"])
@@ -1137,7 +1137,7 @@ def _strip_mpi_keys(spec: dict[str, Any]) -> tuple[dict[str, Any], str]:
         nodes = int(mpi.get("num_nodes", 1))
         ranks = max(int(mpi.get("ranks_per_node") or 1), int(mpi.get("num_ranks") or 1))
     except (TypeError, ValueError):
-        return rest, "resource_specification num_nodes, ranks_per_node and num_ranks are numbers"
+        return rest, "num_nodes, ranks_per_node and num_ranks must be numbers"
     if nodes != 1:
         return rest, f"AWSEngine runs each task on one instance; num_nodes must be 1, not {nodes}"
     if ranks > 1 or mpi.get("launcher_options"):

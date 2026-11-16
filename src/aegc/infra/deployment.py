@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+import urllib.parse
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any
@@ -36,6 +37,7 @@ LOG_RETENTION_DAYS = 14
 ROOT_GIB_RANGE = (30, 16384)
 THROUGHPUT_RANGE = (125, 1000)
 BASE_IOPS = 3000
+GROUP_METRICS_NOTE = "1-minute group metrics"
 
 
 @dataclass(frozen=True)
@@ -199,7 +201,6 @@ def _retry(fn: Callable[[], Any], *, codes: set[str], attempts: int, delay_s: fl
 def ensure_worker_role(c: Clients, spec: DeploymentSpec, report: Report, *, dry_run: bool) -> str:
     d, name = spec.deployment, naming.worker_role(spec.deployment, spec.region)
     tags = naming.tag_list(naming.tags(d, "worker-role", extra=spec.extra_tags))
-    policy = json.dumps(spec.worker_policy())
     profile_arn = f"arn:aws:iam::{spec.account}:instance-profile{naming.IAM_PATH}{name}"
     try:
         found = naming.tag_dict(c.iam.list_role_tags(RoleName=name)["Tags"])
@@ -219,21 +220,16 @@ def ensure_worker_role(c: Clients, spec: DeploymentSpec, report: Report, *, dry_
                 Tags=tags,
             )
     report.add("iam role", name, role_outcome)
+    _put_role_policy(c, name, iam.WORKER_POLICY, spec.worker_policy(), report, dry_run=dry_run)
+    if (grants := spec.grants_policy()) is not None:
+        _put_role_policy(
+            c, name, iam.GRANTS_POLICY, grants, report, dry_run=dry_run,
+            detail=f"{len(spec.grants)} grant(s)",
+        )  # fmt: skip
+    else:
+        _delete_role_policy(c, name, iam.GRANTS_POLICY, report, dry_run=dry_run)
     if dry_run:
         return profile_arn
-    c.iam.put_role_policy(RoleName=name, PolicyName=iam.WORKER_POLICY, PolicyDocument=policy)
-    if (grants := spec.grants_policy()) is not None:
-        c.iam.put_role_policy(
-            RoleName=name, PolicyName=iam.GRANTS_POLICY, PolicyDocument=json.dumps(grants)
-        )
-        report.add("iam role policy", iam.GRANTS_POLICY, "updated", f"{len(spec.grants)} grant(s)")
-    else:
-        try:
-            c.iam.delete_role_policy(RoleName=name, PolicyName=iam.GRANTS_POLICY)
-            report.add("iam role policy", iam.GRANTS_POLICY, "deleted")
-        except Exception as e:
-            if not is_not_found(e):
-                raise
 
     try:
         prof = c.iam.get_instance_profile(InstanceProfileName=name)["InstanceProfile"]
@@ -251,6 +247,76 @@ def ensure_worker_role(c: Clients, spec: DeploymentSpec, report: Report, *, dry_
     if name not in [r["RoleName"] for r in prof.get("Roles", [])]:
         c.iam.add_role_to_instance_profile(InstanceProfileName=name, RoleName=name)
     return str(prof.get("Arn", profile_arn))
+
+
+def _policy_document(raw: Any) -> Any:
+    """An inline policy as GetRolePolicy returns it: a dict (boto3 decodes it), or JSON text,
+    URL-encoded as IAM sends it. Unreadable text comes back as is (so it compares unequal)."""
+    if isinstance(raw, dict):
+        return raw
+    text = str(raw)
+    for candidate in (text, urllib.parse.unquote(text)):
+        try:
+            return json.loads(candidate)
+        except ValueError:
+            continue
+    return text
+
+
+def _put_role_policy(
+    c: Clients,
+    role: str,
+    policy_name: str,
+    doc: dict[str, Any],
+    report: Report,
+    *,
+    dry_run: bool,
+    detail: str = "",
+) -> Outcome:
+    """Put an inline role policy only if it's missing or different, and report which.
+
+    An unchanged redeploy reports ``exists``; a dry run reports what a deploy would do.
+    """
+    try:
+        raw = c.iam.get_role_policy(RoleName=role, PolicyName=policy_name)["PolicyDocument"]
+        current = _policy_document(raw)
+    except Exception as e:
+        if not is_not_found(e):  # also the role itself, in a dry run before it exists
+            raise
+        current = None
+    outcome: Outcome
+    if current == json.loads(json.dumps(doc)):
+        outcome = "exists"
+    elif current is None:
+        outcome = "would-create" if dry_run else "created"
+    else:
+        outcome = "would-update" if dry_run else "updated"
+    if outcome in ("created", "updated"):
+        c.iam.put_role_policy(RoleName=role, PolicyName=policy_name, PolicyDocument=json.dumps(doc))
+    report.add("iam role policy", policy_name, outcome, detail)
+    return outcome
+
+
+def _delete_role_policy(
+    c: Clients, role: str, policy_name: str, report: Report, *, dry_run: bool
+) -> Outcome | None:
+    """Delete an inline role policy if it's there (reported); None if there was none."""
+    try:
+        c.iam.get_role_policy(RoleName=role, PolicyName=policy_name)
+    except Exception as e:
+        if not is_not_found(e):
+            raise
+        return None
+    outcome: Outcome = "would-delete" if dry_run else "deleted"
+    if not dry_run:
+        try:
+            c.iam.delete_role_policy(RoleName=role, PolicyName=policy_name)
+        except Exception as e:
+            if not is_not_found(e):
+                raise
+            return None
+    report.add("iam role policy", policy_name, outcome)
+    return outcome
 
 
 def default_subnets(ec2: Any) -> tuple[str, list[str]]:
@@ -699,6 +765,8 @@ def ensure_auto_scaling_group(
             raise OwnershipError(f"auto scaling group {name} exists but isn't tagged as {d}'s")
         if dry_run:
             report.add("auto scaling group", name, "exists")
+            if not groups[0].get("EnabledMetrics"):
+                report.add("auto scaling group metrics", name, "would-update", GROUP_METRICS_NOTE)
             return name
         # Desired capacity is the engine's and the workers' to manage; don't reset it.
         c.autoscaling.update_auto_scaling_group(AutoScalingGroupName=name, **req)
@@ -707,7 +775,24 @@ def ensure_auto_scaling_group(
     # Rebalancing would terminate instances that are running tasks.
     c.autoscaling.suspend_processes(AutoScalingGroupName=name, ScalingProcesses=["AZRebalance"])
     report.add("auto scaling group", name, outcome)
+    if not (groups and groups[0].get("EnabledMetrics")):
+        enable_group_metrics(c, name, report)
     return name
+
+
+def enable_group_metrics(c: Clients, name: str, report: Report) -> bool:
+    """Turn on the group's Auto Scaling metrics, every minute (free), for ``aegc metrics`` (#39).
+
+    Best effort: a deployer policy from before 0.4 lacks ``EnableMetricsCollection``, and that
+    shouldn't stop a deploy. Returns whether it worked.
+    """
+    try:
+        c.autoscaling.enable_metrics_collection(AutoScalingGroupName=name, Granularity="1Minute")
+    except Exception as e:
+        report.add("auto scaling group metrics", name, "kept", f"not enabled: {error_code(e) or e}")
+        return False
+    report.add("auto scaling group metrics", name, "updated", GROUP_METRICS_NOTE)
+    return True
 
 
 # --- manifest ----------------------------------------------------------------------------------

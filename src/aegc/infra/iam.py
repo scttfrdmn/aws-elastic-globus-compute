@@ -474,6 +474,16 @@ def operator_policy(*, deployment: str, region: str, account: str, bucket: str) 
                 "Condition": {"StringEquals": {"iam:PassedToService": "scheduler.amazonaws.com"}},
             },
             {
+                # `aegc provenance`: a task's task_finished lines, in this deployment's logs only.
+                "Sid": "ReadTaskLogs",
+                "Effect": "Allow",
+                "Action": "logs:FilterLogEvents",
+                "Resource": [
+                    f"arn:aws:logs:{region}:{account}:log-group:{naming.log_group(d)}",
+                    f"arn:aws:logs:{region}:{account}:log-group:{naming.log_group(d)}:*",
+                ],
+            },
+            {
                 # `aegc status` finds result queues by name prefix. ListQueues has no resource.
                 "Sid": "FindResultQueues",
                 "Effect": "Allow",
@@ -725,6 +735,7 @@ def _admin_policy(*, region: str, account: str) -> dict[str, Any]:
                     "autoscaling:SuspendProcesses",
                     "autoscaling:SetDesiredCapacity",
                     "autoscaling:TerminateInstanceInAutoScalingGroup",
+                    "autoscaling:EnableMetricsCollection",  # aegc metrics (#39)
                 ],
                 "Resource": "*",
                 "Condition": {

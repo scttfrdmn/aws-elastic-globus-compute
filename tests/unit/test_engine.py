@@ -227,7 +227,7 @@ def test_missing_deployment_fails_tasks_not_the_endpoint(
     ("python", "spec", "expect"),
     [
         ("3.13", {}, "no worker image for Python 3.13"),
-        ("3.14", {"vcpus": 8}, "unsupported resource_specification keys ['vcpus']"),
+        ("3.14", {"vcpus": 8}, "unsupported task options ['vcpus']"),
         ("3.14", {"env": "climate"}, "no pool for env 'climate'"),
         ("3.14", {"pool": "nope"}, "no pool 'nope'"),
         ("3.14", {"walltime_s": 99_999}, "walltime_s must be between"),

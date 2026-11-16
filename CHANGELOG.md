@@ -26,8 +26,25 @@ All notable changes to this project are documented here. The format follows
   task's share of its instance at the static on-demand price, Spot's ceiling). User data passes
   the image to the worker as `AEGC_IMAGE`; result messages also carry `timings.queue_wait_s`
   (#40).
+- **`aegc metrics <d> [--since 1h|1d|...] [--json]`:** per-pool task counts by outcome, average
+  and maximum execution and queue-wait times, boot-to-first-claim, interruptions, releases,
+  poison tasks, worker exits and the group's capacity, read with GetMetricData (already in the
+  operator policy). `aegc deploy` turns on 1-minute Auto Scaling group metrics
+  (EnableMetricsCollection, added to the deployer policy); with an older deployer policy it
+  reports them as not enabled and carries on (#39).
+- **`aegc provenance <d> <task_uuid> [--json]`:** a task's `task_finished` records, one per
+  attempt, from `/aegc/<d>` with FilterLogEvents, for clients that don't see `details`. The
+  operator policy gains `logs:FilterLogEvents` on that log group only (#40).
+- **`aegc status` shows grants and size classes:** the deployment's data-access grants, and each
+  pool's size class with the vCPUs and GiB one task gets (also in `--json`) (#69).
 
 ### Changed
+- **`aegc deploy` reports role policies accurately:** `aegc-worker` and `aegc-grants` are compared
+  with what the role has, so an unchanged redeploy reports `exists` (not `updated`), a first put
+  `created`, and a dry run `would-create`, `would-update` or `would-delete` (#69).
+- **Engine error texts** name task options instead of `resource_specification` (they now come from
+  `user_endpoint_config`): `unsupported task options [...]`, `task option cpus must be a positive
+  number`, `num_nodes, ranks_per_node and num_ranks must be numbers` (#69).
 - **Worker user data changes** (the awslogs format and `AEGC_IMAGE`), so the next `aegc deploy`
   adds a launch template version to every pool. Running workers keep the old one until they
   leave; workers from images built before 0.4 log plain text and emit no metrics.

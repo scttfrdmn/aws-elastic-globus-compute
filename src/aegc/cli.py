@@ -737,6 +737,66 @@ def _status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _metrics(args: argparse.Namespace) -> int:
+    import time
+
+    from aegc import awsutil, control, observability
+    from aegc.infra.deployment import read_manifest
+
+    sess, region, _ = _ctx(args)
+    end = time.time()
+    try:
+        start = control.window_start(args.since, end)
+    except ValueError as e:
+        raise SystemExit(f"aegc: {e}") from None
+    summary = observability.metrics(
+        cw=awsutil.client(sess, "cloudwatch"),  # type: ignore[arg-type]
+        manifest=read_manifest(awsutil.client(sess, "ssm"), args.deployment),  # type: ignore[arg-type]
+        deployment=args.deployment,
+        region=region,
+        start=start,
+        end=end,
+    )
+    if args.json:
+        print(json.dumps(summary.to_dict(), indent=2, sort_keys=True))
+    else:
+        print(summary.render())
+    return 0
+
+
+def _provenance(args: argparse.Namespace) -> int:
+    import time
+    import uuid
+
+    from aegc import awsutil, control, observability
+
+    try:
+        tid = str(uuid.UUID(args.task_uuid))
+        start = control.window_start(args.since, time.time())
+    except ValueError as e:
+        raise SystemExit(f"aegc: {e}") from None
+    sess, _, _ = _ctx(args)
+    records = observability.provenance(
+        logs=awsutil.client(sess, "logs"),  # type: ignore[arg-type]
+        deployment=args.deployment,
+        task_uuid=tid,
+        start=start,
+    )
+    if args.json:
+        print(json.dumps(records, indent=2, sort_keys=True))
+    elif records:
+        print(observability.render_provenance(tid, args.deployment, records))
+    if not records:
+        print(
+            f"aegc: no task_finished line for {tid} in /aegc/{args.deployment} since "
+            f"{args.since} (logs are kept 14 days; workers from images built before aegc 0.4 "
+            "don't write them)",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 def _reap(args: argparse.Namespace) -> int:
     from aegc import awsutil, ops
 
@@ -912,11 +972,42 @@ def build_parser() -> argparse.ArgumentParser:
     fp.set_defaults(func=_footprint)
 
     st = sub.add_parser(
-        "status", help="state, spend, limits, lease, pools, queues, workers and waiting results"
+        "status",
+        help="state, spend, limits, grants, lease, pools and their size classes, queues, workers "
+        "and waiting results",
     )
     st.add_argument("deployment")
     st.add_argument("--json", action="store_true", help="machine-readable output")
     st.set_defaults(func=_status)
+
+    mt = sub.add_parser(
+        "metrics",
+        help="per-pool task counts, times, interruptions and capacity from CloudWatch",
+        description=(
+            "Reads the metrics workers emit (namespace aegc; dimensions Deployment, Pool and, "
+            "on task counts, Outcome) and the Auto Scaling group metrics, with GetMetricData."
+        ),
+    )
+    mt.add_argument("deployment")
+    mt.add_argument("--since", default="1h", help="a duration like 90m, 1h (default), 1d, 7d")
+    mt.add_argument("--json", action="store_true", help="machine-readable output")
+    mt.set_defaults(func=_metrics)
+
+    pv = sub.add_parser(
+        "provenance",
+        help="where and how a task ran: image, instance, timings, estimated cost",
+        description=(
+            "Finds the task's task_finished log lines in /aegc/<deployment> (FilterLogEvents), "
+            "one per attempt. The same record is in the Result's details['aegc']."
+        ),
+    )
+    pv.add_argument("deployment")
+    pv.add_argument("task_uuid")
+    pv.add_argument(
+        "--since", default="14d", help="how far back to look (default 14d, the retention)"
+    )
+    pv.add_argument("--json", action="store_true", help="the records as JSON")
+    pv.set_defaults(func=_provenance)
 
     rp = sub.add_parser("reap", help="delete idle result queues of finished endpoint processes")
     rp.add_argument("deployment")

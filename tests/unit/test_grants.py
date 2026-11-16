@@ -177,7 +177,7 @@ def test_deploy_puts_redeploy_clears_destroy_removes(env: tuple[Clients, Deploym
     grants = (Grant.parse("read=s3://open-data/in/"), Grant.parse("write=s3://lab/out/"))
     with_grants = DeploymentSpec(**{**spec.__dict__, "grants": grants})
     r = outcomes(deployment.deploy(c, with_grants))
-    assert r[("iam role policy", iam.GRANTS_POLICY)] == "updated"
+    assert r[("iam role policy", iam.GRANTS_POLICY)] == "created"
     assert role_policies(c) == [iam.GRANTS_POLICY, iam.WORKER_POLICY]
     doc = c.iam.get_role_policy(RoleName=ROLE, PolicyName=iam.GRANTS_POLICY)["PolicyDocument"]
     doc = json.loads(doc) if isinstance(doc, str) else doc

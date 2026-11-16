@@ -6,7 +6,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from aegc import naming, quotas
+from aegc import naming, quotas, sizes
 from aegc.awsutil import error_code, is_not_found, paginate
 from aegc.infra import Outcome, Report
 from aegc.infra.deployment import _owned_ec2_filters, read_manifest
@@ -33,6 +33,19 @@ class PoolStatus:
     oldest_task_s: float | None = None
     usd_per_hour: float = 0.0
     exposure_usd: float = 0.0  # worst case for running tasks: walltime x their share of $/h
+    size_class: str = ""  # aegc.sizes; empty: deployed without size= (one task per vCPU)
+    task_vcpus: float = 0.0  # what one task is sure to get (aegc.sizes.per_task)
+    task_memory_gib: float = 0.0
+
+    @property
+    def size_text(self) -> str:
+        name = self.size_class or "per-vCPU"
+        if self.size_class == "whole":
+            return (
+                f"size whole: one task per instance, at least {self.task_vcpus:g} vCPUs, "
+                f"{self.task_memory_gib:g} GiB"
+            )
+        return f"size {name}: {self.task_vcpus:g} vCPU(s), {self.task_memory_gib:g} GiB per task"
 
 
 @dataclass
@@ -50,6 +63,16 @@ class DeploymentStatus:
     usd_per_hour: float = 0.0
     lease_expires: float | None = None
     ttl_expires: float | None = None
+    #: The workers' data-access grants, from the manifest: ``{"access", "bucket", "prefix"}``.
+    grants: list[dict[str, str]] = field(default_factory=list)
+
+    @property
+    def grants_text(self) -> str:
+        if not self.grants:
+            return "grants: none (workers reach only aegc's own bucket)"
+        return "grants: " + ", ".join(
+            f"{g.get('access')} s3://{g.get('bucket')}/{g.get('prefix', '')}" for g in self.grants
+        )
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -70,6 +93,7 @@ class DeploymentStatus:
         if self.spend_month is not None:
             spend += f", this month ${self.spend_month:.4f}"
         lines.append(f"  spend: {spend} (estimates) | {self.limits}")
+        lines.append(f"  {self.grants_text}")
         if self.lease_expires or self.ttl_expires:
             parts = []
             if self.lease_expires:
@@ -83,7 +107,7 @@ class DeploymentStatus:
                 f"running {p.running}, dead-lettered {p.dead_letters} | workers {p.in_service} "
                 f"in service, {p.desired} {p.unit} desired, max {p.max_capacity}"
             )
-            extra = []
+            extra = [p.size_text]
             if p.workers:
                 extra.append(", ".join(f"{n}x {k}" for k, n in sorted(p.workers.items())))
             if p.usd_per_hour:
@@ -142,6 +166,10 @@ def status(
         out.state_detail = st.explain(deployment)
     limits = Limits.from_dict(m.get("limits"))
     out.limits = describe_limits(limits)
+    out.grants = [
+        {"access": str(g["access"]), "bucket": str(g["bucket"]), "prefix": str(g.get("prefix", ""))}
+        for g in m.get("grants") or []
+    ]
     for name, pool in sorted(m.get("pools", {}).items()):
         ps = PoolStatus(
             name=name,
@@ -149,7 +177,9 @@ def status(
             python_minor=str(pool.get("python_minor")),
             max_capacity=int(pool.get("max_vcpus", pool.get("max_workers", 0))),
             unit="vCPUs" if pool.get("capacity_type") == "vcpu" else "workers",
+            size_class=str(pool.get("size_class") or ""),
         )
+        ps.task_vcpus, ps.task_memory_gib = sizes.per_task(pool)
         ps.queued, ps.running = _counts(sqs, pool["task_queue_url"])
         ps.dead_letters, _ = _counts(sqs, pool["dlq_url"])
         groups = autoscaling.describe_auto_scaling_groups(

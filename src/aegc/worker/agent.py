@@ -316,10 +316,11 @@ class Agent:
             "exec_s": finished - started,
             "queue_wait_s": job.queue_wait_s,
         }
-        prov = self._provenance(job, timings)
+        prov: dict[str, Any] = {}
         status: str = outcome.outcome  # what the task_finished line and the metrics report
         posted = False
         try:
+            prov = self._provenance(job, timings)
             if job.released or self._stop.is_set():
                 status = "released"
                 return  # another worker will run it
