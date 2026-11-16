@@ -1,6 +1,6 @@
 # IAM policies
 
-aegc uses five policies, printed by `aegc iam-policy {worker,operator,deployer,bootstrap,builder}`.
+aegc uses six policies, printed by `aegc iam-policy {worker,operator,deployer,bootstrap,builder,task}`.
 Each is scoped to one account and region, and the worker and operator policies to one deployment.
 The documents below were generated with:
 
@@ -244,8 +244,8 @@ else: no queues, payloads, cost ledger, deployment state or Auto Scaling.
 }
 ```
 
-With grants it also has [`aegc-grants`](#aegc-grants). `aegc iam-policy` doesn't print these
-documents; `deploy` writes them. A new worker role can take a few seconds to become a valid
+With grants it also has [`aegc-grants`](#aegc-grants). `aegc iam-policy task` prints
+`aegc-task`; the trust policy and `aegc-grants` come from `deploy`, which writes them. A new worker role can take a few seconds to become a valid
 principal, so `deploy` retries the trust policy while IAM reports `MalformedPolicyDocument`.
 `aegc destroy` deletes the role with its inline policies.
 

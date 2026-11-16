@@ -363,8 +363,8 @@ failed` meanwhile.
   register images with aegc 0.4) and deploy again.
 - **`kept  iam role policy  aegc-grants (worker role) (N pre-0.4 instance(s) still running; deploy
   again after they leave)`:** every pool is isolated now, but older workers still run tasks with
-  the worker role, so it keeps its grants (as they were). Deploy again once those workers have
-  left (`aegc status` shows the workers) to remove them.
+  the worker role, so it keeps the deployment's grants (changes and `--grant none` reach it too).
+  Deploy again once those workers have left (`aegc status` shows the workers) to remove them.
 - **`no default VPC in this region`:** aegc needs the region's default VPC.
 - **`max_vcpus=N is smaller than one worker`** or **`vcpu=LO-HI allows workers larger than
   max_vcpus=N`:** no worker may be larger than the pool; lower the top of `vcpu=` or raise

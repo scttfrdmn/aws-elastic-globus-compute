@@ -250,8 +250,8 @@ From an updated source tree:
    then `stop` and `start`.
 
 Running workers keep their old launch template version until they leave. While any of them is
-still running, `deploy` keeps your grants on the worker role as well
-(`kept  iam role policy  aegc-grants (worker role) (N pre-0.4 instance(s) still running; deploy
+still running, `deploy` keeps your grants on the worker role as well, updated to match any
+change (`kept  iam role policy  aegc-grants (worker role) (N pre-0.4 instance(s) still running; deploy
 again after they leave)`). Once they've gone (idle workers leave after 5 minutes; `aegc status`
 shows what's running), run `aegc deploy <d> --pool <env>` again: the grants then live only on the
 task role.
