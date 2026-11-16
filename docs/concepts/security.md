@@ -2,13 +2,16 @@
 
 ## Network
 
-- **Nothing listens.** The endpoint container makes outbound connections only: AMQPS on port 5671 to
-  Globus, and HTTPS to AWS APIs. Workers make outbound HTTPS calls to SQS, S3, ECR, CloudWatch Logs
-  and Auto Scaling.
+- **Nothing listens on the network.** The endpoint container makes outbound connections only:
+  AMQPS on port 5671 to Globus, and HTTPS to AWS APIs. Workers make outbound HTTPS calls to SQS,
+  S3, ECR, CloudWatch Logs, STS and Auto Scaling. In isolated pools the worker agent serves task
+  credentials on `127.0.0.1` only, behind a token (see [Task isolation](#task-isolation)).
 - **Workers have no ingress.** The deployment's security group, `aegc-<d>-workers`, has no inbound
   rules. Instances have no SSH key pair. They run in the default VPC's default subnets, which give
   them public IPv4 addresses for outbound traffic.
-- **IMDSv2 only**, with a hop limit of 2 so the worker container can reach it.
+- **IMDSv2 only**, with a hop limit of 2 so the worker agent in its container can reach it, and the
+  IPv6 metadata endpoint off. In isolated pools the host's firewall rejects metadata requests from
+  task processes.
 
 ## Identities
 
@@ -17,8 +20,9 @@
 
 | Identity | Who uses it | Scope |
 |---|---|---|
-| **worker** role, `aegc-<d>-worker-<region>` | Worker instances, through an instance profile | The deployment's task queues (receive, delete, extend), its result queues (send), `payloads/<d>/tasks/*` (read) and `payloads/<d>/results/*` (write), pulls from `aegc/*` ECR repositories, its log group, terminating instances in groups tagged with the deployment, reading the deployment's state and manifest, and writing `ledger/<d>/*`; plus, with grants, reading or writing under your granted S3 prefixes (`aegc-grants`) |
-| **operator** | The endpoint container's AWS credentials | Reading the deployment's parameters, sending tasks, creating and reading its own result queues, payloads, `SetDesiredCapacity` and `UpdateAutoScalingGroup` on groups tagged with the deployment, receiving and deleting on its task queues, writing its state, reading its ledger, prices and Cost Explorer, and renewing its lease |
+| **worker** role, `aegc-<d>-worker-<region>` | The worker agent on each instance, through an instance profile | The deployment's task queues (receive, delete, extend), its result queues (send), `payloads/<d>/tasks/*` (read) and `payloads/<d>/results/*` (write), pulls from `aegc/*` ECR repositories, its log group, terminating instances in groups tagged with the deployment, reading the deployment's state and manifest, writing `ledger/<d>/*`, and assuming the task role; plus `aegc-grants` while pools or instances with images from before aegc 0.4 remain |
+| **task** role, `aegc-<d>-task-<region>` | Task code in [isolated](#task-isolation) pools, with credentials the agent hands it | Reading the deployment's manifest (`aegc-task`, for `aegc.outputs`), and with grants, reading or writing under your granted S3 prefixes (`aegc-grants`). Nothing else. Only the worker role may assume it |
+| **operator** | The endpoint container's AWS credentials | Reading the deployment's parameters, sending tasks, creating and reading its own result queues, payloads, `SetDesiredCapacity` and `UpdateAutoScalingGroup` on groups tagged with the deployment, receiving and deleting on its task queues, writing its state, reading its ledger, prices and Cost Explorer, renewing its lease, and searching its log group (`aegc provenance`) |
 | **deployer** | Whoever runs `aegc deploy`, `destroy`, `stop`, `resume` | Creates conditioned on the `aegc:managed=true` request tag, changes and deletes on the resource tag where the service supports it; IAM limited to the `/aegc/` path; roles passed only to EC2 and EventBridge Scheduler |
 | **bootstrap** | Whoever runs `aegc bootstrap`, `unbootstrap` | The payload bucket, the pull-through cache and its template and role, `/aegc/bootstrap`; roles passed only to ECR |
 | **scheduler** role, `aegc-<d>-scheduler-<region>` | EventBridge Scheduler, when the lease or TTL fires | Writing the deployment's state parameter and updating groups tagged with the deployment |
@@ -27,73 +31,128 @@ The endpoint container mounts `~/.aws` read-only and uses `AWS_PROFILE` if it's 
 beyond a trial, give it a profile with only the operator policy rather than an administrator
 profile. `aegc image build` uses the separate [builder policy](../reference/iam.md#builder).
 
-## Task code runs with the worker role
+## Task isolation
 
-A task is arbitrary Python from whoever submitted it. It runs in the worker container, which can
-read the instance's credentials from IMDS. So any task can do what the worker role allows, for the
-whole deployment:
+A task is arbitrary Python from whoever submitted it. In pools whose worker images were built with
+aegc 0.4 or later, it runs apart from the worker agent and without the worker role:
 
-- read other tasks' large payloads under `payloads/<d>/tasks/`,
-- receive or delete messages from the deployment's task queues,
-- send messages, including forged results, to the deployment's result queues,
-- terminate the deployment's worker instances,
-- overwrite cost ledger records under `ledger/<d>/`, which makes `aegc cost` wrong and can hide
-  spend from the [spend limits](cost.md#spend-limits) or trip them early,
-- read everything under the deployment's read grants, and overwrite anything under its write
-  grants (see [Data access](#data-access)).
+- **The agent runs as root, with little else.** The worker container runs with `--user 0`,
+  `no-new-privileges` and all capabilities dropped except the six it needs to start, own and
+  signal task processes (`SETUID`, `SETGID`, `KILL`, `CHOWN`, `DAC_OVERRIDE`, `FOWNER`). Its
+  state (the heartbeat file and the credentials token) lives in the root-owned `/run/aegc`.
+- **Tasks run as uid 57439.** Each task's process drops to uid 57439, for good, before it
+  deserializes the task, so your function never runs with the agent's rights. It can't read the
+  agent's environment (`/proc/1/environ`) or memory.
+- **No instance metadata.** The user data adds a host firewall rule (iptables) that rejects
+  connections from uid 57439 to the metadata service, and the launch template turns its IPv6
+  endpoint off. Tasks can't get the instance role's credentials.
+- **The task role instead.** The agent assumes the deployment's task role,
+  `aegc-<d>-task-<region>`, which only the worker role can assume, and serves its credentials on
+  `127.0.0.1` in the container-credentials format. Tasks get
+  `AWS_CONTAINER_CREDENTIALS_FULL_URI`, `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`, `AWS_REGION` and
+  `AWS_DEFAULT_REGION`, so boto3, the AWS CLI and GDAL find credentials and the region by
+  themselves and refresh them as needed. Sessions last an hour; the agent renews them with 15
+  minutes left, so long tasks keep working.
+- **The task role holds only your grants.** It has [`aegc-grants`](../reference/iam.md#aegc-grants)
+  and a read of the deployment's manifest (for `aegc.outputs`), nothing more: no queues, payloads,
+  cost ledger, deployment state or Auto Scaling.
+- **Results can't be forged by a neighbour.** A task's result comes back to the agent over a pipe,
+  not a file another task could overwrite. And the engine ignores a result message whose S3
+  payload isn't that task's own result key, so a forged message can neither return another
+  object nor make the engine delete it.
 
-Spend limits guard against runaway scaling and forgotten deployments, not against the code you run.
-Keep an AWS Budget on the account as well.
+The v0.4 live run checked this from inside a task: its identity was the task role, the metadata
+service refused the connection, SQS, Auto Scaling, the state parameter and the ledger returned
+`AccessDenied`, `/proc/1/environ` was unreadable, and reading under a read grant and
+`aegc.outputs.put` worked. See [Performance](../reference/performance.md#v04-live-run-2026-11-16).
 
-Tasks that share a worker also share its container, its `/scratch` volume and its host network;
-each task runs in its own process, not in its own sandbox.
+### What tasks still share
+
+Isolation separates tasks from the worker role, not from each other:
+
+- **Tasks on one worker share uid 57439.** They can see each other's processes and signal or kill
+  them, and read and write each other's run directories under `/scratch/tasks/` and anything else
+  in `/scratch`. Each task still runs in its own process, not in its own sandbox.
+- **Tasks in a deployment share the task role.** Every task can use every grant, whoever submitted
+  it (see [Data access](#data-access)).
+- **They share the worker's host network and memory.** There's no per-task memory limit.
+
+Separate tasks per uid, per-task session policies and a separate task container aren't
+implemented yet ([#32](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/32)).
 
 **Treat a deployment as one trust domain.** Anyone who can submit to an endpoint can run code with
-that deployment's worker role. Use separate deployments, and separate endpoints, for groups that
-shouldn't see each other's work. Globus Compute's own controls decide who may submit to an
-endpoint; aegc's endpoint template doesn't add any.
+that deployment's task role, and with its grants. Use separate deployments, and separate
+endpoints, for groups that shouldn't see each other's work. Globus Compute's own controls decide
+who may submit to an endpoint, and
+[`aegc endpoint configure --allow-function`](../how-to/flows.md#allow-only-your-functions) limits
+which registered functions it runs.
 
-That code can also do what the worker role allows (#32): read and write the deployment's payloads,
-post results, write cost ledger records, and set its groups' desired capacity (up to each pool's
-`max_vcpus`). Spend limits are enforced from the ledger, so they protect against mistakes, not
-against code that's trying to get around them.
+Spend limits guard against runaway scaling and forgotten deployments, not against the code you run:
+anyone who can submit can keep a pool busy up to its `max_vcpus`. Keep an AWS Budget on the
+account as well.
 
 The worker only ever invokes Globus Compute's `execute_task` on a message; it never imports a
 dotted path named in a message.
 
+### Pools with older images
+
+Workers from images built before aegc 0.4 run tasks in the worker container with the worker role,
+as before. Their tasks can do what the worker role allows, for the whole deployment:
+
+- read other tasks' large payloads under `payloads/<d>/tasks/`,
+- receive or delete messages from the deployment's task queues,
+- send messages, including forged results, to the deployment's result queues,
+- terminate the deployment's worker instances, and set its groups' desired capacity (up to each
+  pool's `max_vcpus`),
+- overwrite cost ledger records under `ledger/<d>/`, which makes `aegc cost` wrong and can hide
+  spend from the [spend limits](cost.md#spend-limits) or trip them early,
+- read everything under the deployment's read grants, and overwrite anything under its write
+  grants.
+
+`aegc deploy` warns about such pools
+(`warning: <pools>: images built before aegc 0.4 run tasks with the worker role's credentials
+...`); rebuild their images with `aegc image build` to isolate them. While any pool, or any
+running worker launched before its pool was isolated, still runs tasks with the worker role,
+`deploy` keeps `aegc-grants` on the worker role too. Workers of isolated pools carry the instance
+tag `aegc:isolated=true`; once no untagged workers remain, the next deploy deletes the worker
+role's copy of the grants. See [Upgrade from v0.3](../how-to/operations.md#upgrade-from-v03).
+
 ## Data access
 
-Without grants, the worker role has no access to S3 beyond the deployment's payload prefix:
+Without grants, task code has no S3 access at all in isolated pools, and the worker role reaches
+only the deployment's payload prefix and ledger:
 
-- **Open data must be read unsigned.** A signed request from the worker role is denied even for a
-  public bucket, because the role's own policy doesn't allow it. Use anonymous access in your code,
-  for example `s3fs.S3FileSystem(anon=True)`, `botocore.UNSIGNED` as the signature version in boto3,
-  or `AWS_NO_SIGN_REQUEST=YES` for GDAL.
+- **Open data must be read unsigned.** A signed request from the task role (or the worker role) is
+  denied even for a public bucket, because the role's own policy doesn't allow it. Use anonymous
+  access in your code, for example `s3fs.S3FileSystem(anon=True)`, `botocore.UNSIGNED` as the
+  signature version in boto3, or `AWS_NO_SIGN_REQUEST=YES` for GDAL.
 - **Your own buckets, and requester-pays data, need a grant.**
   `aegc deploy <d> --grant read=s3://bucket/prefix` and `--grant write=s3://bucket/prefix` add the
-  inline policy [`aegc-grants`](../reference/iam.md#aegc-grants) to the worker role. Read grants
-  allow getting and listing objects under the prefix, in any account whose bucket policy allows
-  it. Write grants allow putting them, multipart included, but not reading or deleting, and only
-  in buckets the deployment's own account owns (`s3:ResourceAccount`), so a mistyped or squatted
-  bucket name elsewhere can't receive outputs. See [Read and write your data](../how-to/data.md).
+  inline policy [`aegc-grants`](../reference/iam.md#aegc-grants) to the task role (and to the
+  worker role while pools with older images remain). Read grants allow getting and listing
+  objects under the prefix, in any account whose bucket policy allows it. Write grants allow
+  putting them, multipart included, but not reading or deleting, and only in buckets the
+  deployment's own account owns (`s3:ResourceAccount`), so a mistyped or squatted bucket name
+  elsewhere can't receive outputs. See [Read and write your data](../how-to/data.md).
 - **Large outputs** go to a write grant with [`aegc.outputs`](../how-to/data.md#return-large-outputs),
   and only their `s3://` URI comes back through Globus Compute.
 
-**A grant extends the deployment's trust domain.** It's granted to the worker role, and every task
-in the deployment runs with that role, so every task can use every grant, whoever submitted it.
-Anyone who can submit to the deployment's endpoints can read all of a read grant and overwrite
-anything under a write grant, including other tasks' outputs. Grant the narrowest prefixes that do
-the job, keep data some submitters mustn't see in a separate deployment, and consider S3
-Versioning on buckets you grant writes to.
+**A grant extends the deployment's trust domain.** Every task in the deployment runs with the same
+task role, so every task can use every grant, whoever submitted it. Anyone who can submit to the
+deployment's endpoints can read all of a read grant and overwrite anything under a write grant,
+including other tasks' outputs. Grant the narrowest prefixes that do the job, keep data some
+submitters mustn't see in a separate deployment, and consider S3 Versioning on buckets you grant
+writes to.
 
 Grants are checked before anything changes: no wildcards or policy variables, valid general
-purpose bucket names, not aegc's own bucket, at most 32, and no more than fit in the role's inline
-policies.
+purpose bucket names, not aegc's own bucket, at most 32, and no more than fit in either role's
+inline policies.
 aegc refers to granted buckets but never creates, changes or deletes them or their policies.
 
-aegc doesn't manage policies you add to the worker role yourself. `aegc deploy` rewrites
-`aegc-worker` and `aegc-grants` on every run, and a managed policy attached by hand makes
-`aegc destroy` fail when it deletes the role (it removes only inline policies). Use grants instead.
+aegc doesn't manage policies you add to the worker or task role yourself. `aegc deploy` puts
+`aegc-worker`, `aegc-task` and `aegc-grants` back as aegc would write them whenever they differ,
+and a managed policy attached by hand makes `aegc destroy` fail when it deletes the role (it
+removes only inline policies). Use grants instead.
 
 ## Data at rest and in transit
 

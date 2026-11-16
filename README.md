@@ -33,6 +33,11 @@ flowchart LR
   included), `aegc.outputs` returns results over Globus Compute's 10 MB limit as `s3://` URIs, and
   size classes give tasks up to 8 vCPUs and 32 GiB, or a whole instance, chosen per executor with
   `user_endpoint_config={"size": "mem"}`.
+- **Tasks get only your grants.** Task processes run as an unprivileged user without instance
+  metadata, with a task role that holds only the grants you gave, not the workers' own role.
+- **See what ran where.** Workers log JSON, emit CloudWatch metrics (`aegc metrics`), and record
+  each task's instance, image, timings and estimated cost (`aegc provenance`). Tasks can also come
+  from Globus Flows and Timers.
 - **Managed with boto3.** Every resource is tagged when it's created, and the tool only ever deletes
   resources that carry its tags.
 
@@ -43,9 +48,11 @@ flowchart LR
 
 ## Status
 
-Early release (0.x): v0.2.0 adds spend limits, stop and resume, a deployment lease and a cost
-ledger to v0.1.0. The main branch adds bring-your-own images, several Python minors per env,
-data-access grants, `aegc.outputs` and size classes, not yet released. Work is tracked in this repo's issues, milestones and project board.
+Early release (0.x): v0.3.0 adds bring-your-own images, several Python minors per env,
+data-access grants, `aegc.outputs` and size classes to v0.2.0's spend limits, stop and resume,
+lease and cost ledger. The main branch adds task isolation from the worker role, JSON logs,
+CloudWatch metrics, provenance, and support for Globus Flows and Timers, not yet released. Work is
+tracked in this repo's issues, milestones and project board.
 
 Sister projects:
 - [aws-elastic-gcs](https://github.com/scttfrdmn/aws-elastic-gcs): elastic Globus Connect Server.

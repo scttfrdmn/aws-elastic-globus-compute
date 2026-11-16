@@ -20,6 +20,7 @@ always-on instance.
 | S3 payloads (bodies over 700 KB) | Until deleted after use, or expired after 15 days | $0.023 per GB-month, plus request charges |
 | ECR storage | Worker images in `aegc/<env>` (the 10 most recent builds, plus any older image a deployment still uses) and the cached bases in `aegc-quay/…` | $0.10 per GB-month |
 | CloudWatch Logs | Worker logs, kept 14 days. **Your tasks' stdout and stderr go here too**, so a chatty task costs more than aegc's own few lines per task | $0.50 per GB ingested |
+| CloudWatch metrics | The workers' [metrics](../how-to/observability.md#metrics) in namespace `aegc`: up to 16 per pool and 9 per deployment, each billed only for the hours it gets data. Auto Scaling group metrics are free. `aegc metrics` reads 23 metrics per pool | $0.30 per metric-month, prorated by the hour; GetMetricData $0.01 per 1,000 metrics read |
 | Data transfer | Task and result bytes between your machine and AWS | Internet data transfer out applies to results; traffic between workers and S3, SQS and ECR in the region is free |
 
 The cost ledger adds one small S3 object per worker, rewritten every 5 minutes (about $0.00006 per
@@ -147,8 +148,11 @@ expire meanwhile.
   write is denied, the engine still keeps the cap for its own tasks, but workers don't see it. With no endpoint running nothing scales
   out, but workers kept by `min_vcpus` keep running until the lease expires (48 hours by default; see
   [Architecture](architecture.md#lease-and-ttl)).
-- **They aren't a security boundary.** Task code runs with the worker role, which can write ledger
-  records, so a task can make the estimate wrong. See [Security model](security.md).
+- **They aren't a security boundary.** In [isolated](security.md#task-isolation) pools tasks can't
+  write ledger records, but anyone who can submit can still keep a pool busy up to its
+  `max_vcpus`. On workers from images built before aegc 0.4, task code runs with the worker role,
+  which can write ledger records, so a task can make the estimate wrong. See
+  [Security model](security.md).
 - **They don't cover the account.** aegc doesn't create AWS Budgets or billing alarms. Set an AWS
   Budget on the account as well.
 

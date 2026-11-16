@@ -3,8 +3,8 @@
 Results from the live Globus Compute end-to-end run on 2026-11-14 in us-west-2
 ([#15](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/15)). They come from one
 deployment on one day; Spot capacity, instance types and image size all change the numbers.
-Later runs, for [v0.2](#v02-live-run-2026-11-15) and [v0.3](#v03-live-run-2026-11-15), are at the
-end.
+Later runs, for [v0.2](#v02-live-run-2026-11-15), [v0.3](#v03-live-run-2026-11-15) and
+[v0.4](#v04-live-run-2026-11-16), are at the end.
 
 ## Setup
 
@@ -108,3 +108,32 @@ us-west-2, deployment `v03`, the endpoint in Docker on a laptop with Python 3.13
 - The Globus Compute web service validates `resource_specification` as an MPI request: it refuses
   one without `num_nodes` (HTTP 422) and drops every other key. aegc's task options moved to
   `user_endpoint_config`; see [resource_specification](configuration.md#resource_specification).
+
+## v0.4 live run (2026-11-16)
+
+us-west-2, deployment `v04`, the endpoint in Docker on a laptop (`globus-compute-endpoint`
+4.21.0), Spot Graviton workers from images built with aegc 0.4, a read and a write grant on a
+test bucket, and Globus Flows with the Compute action provider v3.
+
+| Check | Result |
+|---|---|
+| Task isolation, probed from inside a task | the task's identity was the task role, `aegc-v04-task-us-west-2`; the instance metadata service refused the connection; SQS, Auto Scaling, the deployment's state parameter and the cost ledger returned `AccessDenied`; `/proc/1/environ` was unreadable; reading under the read grant and `aegc.outputs.put` under the write grant worked |
+| `aegc metrics` | per-pool task counts, times and capacity reported from the workers' EMF metrics and the group metrics |
+| `aegc provenance` | each attempt's record found in the log group; it showed the stop/claim race below |
+| `details["aegc"]` | in the SDK's `Client().get_task(task_id)["details"]["aegc"]`; not in the Flows action's output |
+| Globus Flows, one Compute action | `SUCCEEDED` in about **37 s** from start on a warm pool (`WaitTime` 900); the submission carried no Python version, and `user_endpoint_config` `{"env": ..., "python": "3.14"}` picked the 3.14 pool; the result was at `details.result[0]` |
+| Flows identity | a run started by another identity failed at once with `ENDPOINT_ACCESS_FORBIDDEN` |
+| Globus Timers | a timer with `--stop-after-runs 1` ran the flow once; the run `SUCCEEDED` |
+| `--allow-function` | the allowed function ran; another registered function got `403 FUNCTION_NOT_PERMITTED` at submission |
+| Cost | about **$0.016** (0.42 instance-hours, Spot) |
+| `destroy --yes` (verifies) and `footprint` | nothing remains |
+
+**Found and fixed during the run:**
+- Isolated tasks got `NoRegionError` from boto3: botocore had found the region through instance
+  metadata, which tasks can't reach any more. The agent now sets `AWS_REGION` and
+  `AWS_DEFAULT_REGION` for task processes.
+- `aegc provenance` showed a task released by a worker that was stopping, though it had finished:
+  SIGTERM raced a claim, so the stop released nothing, the task then finished, and its result was
+  dropped as if released, with its message hidden for the full visibility timeout (300 s). A task
+  that finishes while its worker stops now posts its result, and anything still claimed when the
+  worker exits goes back to the queue at once.

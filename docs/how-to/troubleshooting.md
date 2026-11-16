@@ -1,7 +1,8 @@
 # Troubleshooting
 
-Start with `aegc status <d>` and the worker logs (`aws logs tail /aegc/<d> --follow`). Errors that
-come back to the client as task failures carry a code:
+Start with `aegc status <d>`, the worker logs (`aws logs tail /aegc/<d> --follow`), and for one
+task, `aegc provenance <d> <task id>` (see [Watch tasks](observability.md)). Errors that come back
+to the client as task failures carry a code:
 
 | Code | Meaning | Retried | See |
 |---|---|---|---|
@@ -44,8 +45,10 @@ These fail the task at once, without a retry, as `AEGC_CONFIGURATION`:
 | `no pool 'x' in deployment 'd'` | `user_endpoint_config={"pool": "x"}` names a pool that doesn't exist | Use a name from `aegc status` |
 | `AWSEngine runs each task on one instance; num_nodes must be 1, not N` | `resource_specification` asks for several nodes | Use `{"num_nodes": 1}`, or leave `resource_specification` out |
 | `AWSEngine doesn't launch MPI ranks; use cpus= for a multi-core task` | `resource_specification` has `ranks_per_node` or `num_ranks` above 1, or `launcher_options` | Drop them; ask for cores with `user_endpoint_config={"cpus": N}` |
-| `unsupported resource_specification keys [...]` | A `resource_specification` key aegc doesn't know reached the engine. A "did you mean" hint follows for `vcpus`, `memory` and similar | Put aegc options in `user_endpoint_config` |
-| `resource_specification cpus must be a positive number` (or `memory_gib`) | Zero, negative or not a number | Pass a number above 0 |
+| `unsupported task options [...]; AWSEngine accepts [...]` | A key aegc doesn't know reached the engine (in a `resource_specification`). A "did you mean" hint follows for `vcpus`, `memory` and similar | Put aegc options in `user_endpoint_config` |
+| `task option cpus must be a positive number` (or `memory_gib`) | Zero, negative or not a number | Pass a number above 0 |
+| `num_nodes, ranks_per_node and num_ranks must be numbers` | A `resource_specification` MPI key isn't a number | Use `{"num_nodes": 1}`, or leave `resource_specification` out |
+| `this submission doesn't say its Python version (Globus Flows doesn't send one), and env 'x' has worker images for 3.13, 3.14; add "python": "3.14" ...` | The submission carried no Python version (from Globus Flows, say), and the env has images for several minors | Add `"python": "3.NN"` to `user_endpoint_config`; see [Flows](flows.md#write-the-flow) |
 | `no size='mem' pool for env 'x'; available: ...` | No pool of that size class for the env and the client's Python | Deploy one with `--pool x:size=mem`, or ask for another size |
 | `no pool for env 'x' gives a task N vCPUs and M GiB; available: ...` | Every pool's tasks get less than `cpus` or `memory_gib` | Deploy a larger [size class](configuration.md#size-classes), or ask for less |
 | `walltime_s must be between 1 and N` | Walltime out of range; N is the pool's `max_walltime`, at most 41,400 | Split the task, lower `walltime_s`, or redeploy the pool with a higher `max_walltime=` |
@@ -54,12 +57,12 @@ Running engines re-read the manifest every minute, so a fixed deployment takes e
 restart. The exceptions are `deployment ... not found` and `AWS setup failed`, which happen when
 the engine starts: restart the endpoint after fixing those.
 
-`user_endpoint_config` accepts only `env`, `pool`, `size`, `cpus`, `memory_gib` and
+`user_endpoint_config` accepts only `env`, `python`, `pool`, `size`, `cpus`, `memory_gib` and
 `walltime_s`, with the types in the
 [configuration reference](../reference/configuration.md#user_endpoint_config); Globus Compute
-rejects anything else before it reaches aegc. If it rejects `size`, `cpus` or `memory_gib`, the
-endpoint was configured by an older aegc: run `aegc endpoint ... build` and `configure`, then
-`stop` and `start`.
+rejects anything else before it reaches aegc. If it rejects `python` (or `size`, `cpus` or
+`memory_gib`), the endpoint was configured by an older aegc: run `aegc endpoint ... build` and
+`configure`, then `stop` and `start`.
 
 ### Options in resource_specification are ignored, or the submission fails with HTTP 422
 
@@ -222,9 +225,10 @@ requests to other buckets are denied, even public ones.
   `AWS_REQUEST_PAYER=requester` (GDAL). Without it, S3 denies the request.
 - **Reading back what tasks wrote:** a write grant doesn't allow reads; add a read grant on the
   same prefix.
-- **Another account's bucket, or a KMS key:** for reads, the bucket policy must allow the worker
-  role, and a customer managed key must allow `kms:Decrypt`. Writes to another account's bucket
-  are always denied.
+- **Another account's bucket, or a KMS key:** for reads, the bucket policy must allow the task
+  role, `arn:aws:iam::<account>:role/aegc/aegc-<d>-task-<region>` (and the worker role while
+  pools with images from before aegc 0.4 remain), and a customer managed key must allow
+  `kms:Decrypt`. Writes to another account's bucket are always denied.
 
 See [Read and write your data](data.md).
 
@@ -240,6 +244,67 @@ See [Read and write your data](data.md).
   exists. To upload text, pass `text.encode()`.
 - **`AccessDenied` on a write:** the bucket isn't in the deployment's account; write grants only
   reach your own account's buckets.
+
+## Isolated tasks
+
+Tasks in pools with images built by aegc 0.4 or later run with the task role, not the worker role
+(see [Task isolation](../concepts/security.md#task-isolation)). Some code notices:
+
+- **`AccessDenied` on SQS, Auto Scaling, the deployment's state or ledger, or aegc's payloads:**
+  expected. The task role holds only your grants and a read of the manifest.
+- **Code that asks the instance metadata service directly** (for the instance id, its region or
+  credentials) gets its connection refused: the host's firewall blocks it for task processes, and
+  `AWS_EC2_METADATA_DISABLED=true` stops the AWS SDKs from trying. Use `AWS_REGION` for the
+  region, and [`details["aegc"]`](observability.md#provenance) or `aegc provenance` for the
+  instance.
+- **`NoCredentialsError`, or `task credentials unavailable` (HTTP 503 from `127.0.0.1`):** the agent
+  couldn't renew the task role's session. Check the worker's log for the STS error.
+- **Presigned URLs from a task stop working early:** they last only as long as the task role's
+  session, at most an hour. Presign on your own machine.
+- **The worker exits at start with an `AssumeRole` error:** the worker role couldn't assume the
+  task role, so the worker claims nothing rather than run tasks unisolated. systemd restarts it
+  (up to three times in 10 minutes), which covers IAM's delay right after a first deploy; after
+  that the watchdog replaces the instance. If it persists, check that the worker role's
+  `aegc-worker` policy has `AssumeTaskRole`, and run `aegc deploy` again.
+- **`this pool isolates tasks, but the agent isn't root; tasks run as uid N with the agent's
+  credentials`** in a worker's log: the worker container didn't start as root, so tasks weren't
+  isolated. The user data runs it with `--user 0`; this means something else started it.
+- **Tasks can see each other's processes and files** on a worker: they share uid 57439. Isolation
+  separates tasks from the worker role, not from each other.
+
+## Flows and Timers
+
+- **`ENDPOINT_ACCESS_FORBIDDEN (Forbidden)`** as soon as the action starts: the run was started by
+  an identity other than the endpoint owner's. Start it as the endpoint owner; see
+  [Use the right identity](flows.md#use-the-right-identity).
+- **`NOT_FOUND` for a flow that exists:** your identity isn't one of the flow's starters (or
+  viewers), so Flows doesn't show it.
+- **`403 FUNCTION_NOT_PERMITTED`** at submission: the endpoint was configured with
+  `--allow-function`, and this function isn't on the list. Add its id with `configure
+  --allow-function ...` (every id you want, not just the new one), then `stop` and `start`.
+- **The action times out:** `WaitTime` (300 s by default) is shorter than a cold start, the wait in
+  the queue and the task's walltime together. Raise it.
+- **The Python refusal** (`this submission doesn't say its Python version ...`): add `"python"` to
+  the action's `user_endpoint_config`.
+- **The run fails on the size of its state:** the result is too large for Flows (about 200 KB).
+  Return an `s3://` URI from [`aegc.outputs`](data.md#return-large-outputs) instead.
+- **No `details["aegc"]` in the action's output:** Flows doesn't pass it. Use
+  `aegc provenance <d> <task id>`.
+- **`aegc: --allow-function takes function ids (UUIDs), or none to allow any`:** pass the ids
+  `register_function` printed.
+
+## Metrics and provenance
+
+- **`aegc metrics` says `no data in this window`:** no tasks ran in the window, or the workers'
+  images predate aegc 0.4 and emit no metrics. Metrics also arrive a few minutes late; try
+  `--since 1d`.
+- **The capacity figures are missing:** the groups' metrics aren't enabled. `deploy` reports
+  `kept  auto scaling group metrics ... (not enabled: ...)` when the deployer policy lacks
+  `autoscaling:EnableMetricsCollection`; update the policy and deploy again.
+- **`aegc: no task_finished line for <uuid> in /aegc/<d> since 14d`:** the task ran on a worker
+  from an image older than 0.4, ran more than 14 days ago (or before `--since`), or hasn't
+  finished. An `AccessDeniedException` means the credentials lack the operator policy's
+  `logs:FilterLogEvents`.
 
 ## Credentials in the endpoint
 
@@ -291,8 +356,15 @@ failed` meanwhile.
   give s3://x/PREFIX, or s3://x/ to grant the whole bucket`, `grants can't use wildcards`,
   `not a valid general purpose S3 bucket name`, `... is aegc's own bucket`, `--grant none clears
   the grants; don't combine it with others`, and `deployment d's N grants need a ...-character IAM
-  policy, but the worker role has room for ...`, and `deployment d has N grants; at most 32`: fix
-  the `--grant` values; nothing was changed.
+  policy, but the worker and task roles have room for ...`, and `deployment d has N grants; at
+  most 32`: fix the `--grant` values; nothing was changed.
+- **`warning: <pools>: images built before aegc 0.4 run tasks with the worker role's credentials
+  ...`:** those pools' tasks aren't isolated. Rebuild their images with `aegc image build` (or
+  register images with aegc 0.4) and deploy again.
+- **`kept  iam role policy  aegc-grants (worker role) (N pre-0.4 instance(s) still running; deploy
+  again after they leave)`:** every pool is isolated now, but older workers still run tasks with
+  the worker role, so it keeps its grants (as they were). Deploy again once those workers have
+  left (`aegc status` shows the workers) to remove them.
 - **`no default VPC in this region`:** aegc needs the region's default VPC.
 - **`max_vcpus=N is smaller than one worker`** or **`vcpu=LO-HI allows workers larger than
   max_vcpus=N`:** no worker may be larger than the pool; lower the top of `vcpu=` or raise

@@ -265,7 +265,8 @@ with Executor(
   endpoint process for each distinct `user_endpoint_config`, so use one `Executor` per
   combination, for example one for small tasks and one for `size: mem`.
 - The client's Python minor version picks the pool among the env's minors, and must match one of
-  them. It's taken from the client automatically; you don't pass it.
+  them. The SDK sends it automatically; you don't pass it. Submissions that don't carry one, such
+  as those from [Globus Flows](flows.md), say it with `python` (`"python": "3.14"`).
 
 !!! warning "Not `resource_specification`"
     The Globus Compute web service treats `resource_specification` as an MPI request: it requires
