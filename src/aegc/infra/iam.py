@@ -981,7 +981,7 @@ def builder_policy(*, region: str, account: str) -> dict[str, Any]:
     }  # fmt: skip
 
 
-POLICIES = {"worker", "operator", "deployer", "bootstrap", "builder"}
+POLICIES = {"worker", "operator", "deployer", "bootstrap", "builder", "task"}
 
 
 def policy(kind: str, *, deployment: str, region: str, account: str) -> dict[str, Any]:
@@ -996,4 +996,6 @@ def policy(kind: str, *, deployment: str, region: str, account: str) -> dict[str
         return builder_policy(region=region, account=account)
     if kind == "bootstrap":
         return bootstrap_policy(region=region, account=account)
+    if kind == "task":
+        return task_policy(deployment=deployment, region=region, account=account)
     raise ValueError(f"unknown policy {kind!r}; choose from {sorted(POLICIES)}")

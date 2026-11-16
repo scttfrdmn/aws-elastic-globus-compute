@@ -159,6 +159,14 @@ def run_task(
         msg = f"task exceeded its walltime of {walltime_s} s and was killed"
         return RunOutcome("walltime", failed_result(task_uuid, "AEGC_WALLTIME_EXCEEDED", msg), msg)
     proc.join(KILL_GRACE_S)
+    if packed is not None and proc.exitcode is None:
+        # It sent its result but won't exit (e.g. a non-daemon thread): keep the result.
+        _kill_group(proc.pid)
+        proc.join(KILL_GRACE_S)
+        if proc.is_alive():
+            proc.kill()
+            proc.join()
+        return RunOutcome("result", packed)
     if packed is not None and proc.exitcode == 0:
         return RunOutcome("result", packed)
     if proc.exitcode is not None and proc.exitcode < 0:

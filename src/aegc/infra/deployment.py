@@ -322,14 +322,15 @@ def ensure_worker_role(c: Clients, spec: DeploymentSpec, report: Report, *, dry_
     # Tasks of isolated pools get grants through the task role; unisolated pools' tasks still
     # run with this role, so it keeps them while there are any.
     old = [] if spec.unisolated_pools else _unisolated_instances(c, d)
-    if old:  # pools are all isolated now, but instances launched before still use this role
+    # Pools may all be isolated now while instances launched before still use this role: they
+    # keep the deployment's current grants (a change or revoke reaches them too) until they leave.
+    grants = spec.grants_policy() if (spec.unisolated_pools or old) else None
+    _set_grants(c, name, grants, len(spec.grants), report, role_kind="worker", dry_run=dry_run)
+    if old and grants is not None:
         report.add(
             "iam role policy", f"{iam.GRANTS_POLICY} (worker role)", "kept",
-            f"{len(old)} pre-0.4 instance(s) still running; deploy again after they leave",
+            f"for {len(old)} pre-0.4 instance(s) still running; deploy again after they leave",
         )  # fmt: skip
-    else:
-        grants = spec.grants_policy() if spec.unisolated_pools else None
-        _set_grants(c, name, grants, len(spec.grants), report, role_kind="worker", dry_run=dry_run)
     if dry_run:
         return profile_arn
 
@@ -1490,15 +1491,12 @@ def verify_destroyed(
         except Exception as e:
             if not is_not_found(e):
                 raise
-    if True:  # the task role (#32)
-        try:
-            if naming.is_owned(
-                task, naming.tag_dict(c.iam.list_role_tags(RoleName=task)["Tags"]), d
-            ):
-                report.add("iam role", task, "remaining")
-        except Exception as e:
-            if not is_not_found(e):
-                raise
+    try:  # the task role (#32)
+        if naming.is_owned(task, naming.tag_dict(c.iam.list_role_tags(RoleName=task)["Tags"]), d):
+            report.add("iam role", task, "remaining")
+    except Exception as e:
+        if not is_not_found(e):
+            raise
     if c.ecr is not None:
         for repo, tags in images.inuse_tags(c.ecr, d).items():
             for t in tags:

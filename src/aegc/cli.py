@@ -800,6 +800,9 @@ def _provenance(args: argparse.Namespace) -> int:
 
     try:
         tid = str(uuid.UUID(args.task_uuid))
+    except ValueError:
+        raise SystemExit(f"aegc: {args.task_uuid!r} isn't a task id (a UUID)") from None
+    try:
         start = control.window_start(args.since, time.time())
     except ValueError as e:
         raise SystemExit(f"aegc: {e}") from None
@@ -848,9 +851,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="print an IAM policy document for one of aegc's roles",
         description="worker: on worker instances. operator: the endpoint's credentials. "
         "deployer: aegc deploy/destroy/stop/resume/reap/footprint. "
-        "bootstrap: aegc bootstrap/unbootstrap. builder: aegc image build.",
+        "bootstrap: aegc bootstrap/unbootstrap. builder: aegc image build. task: task code on "
+        "isolated pools, besides the grants (aegc-task on the task role).",
     )
-    p.add_argument("kind", choices=["worker", "operator", "deployer", "bootstrap", "builder"])
+    p.add_argument(
+        "kind", choices=["worker", "operator", "deployer", "bootstrap", "builder", "task"]
+    )
     p.add_argument("--deployment", default="default", help="deployment name (worker, operator)")
     p.add_argument("--account", help="AWS account id (default: the caller's)")
     p.set_defaults(func=_iam_policy)
@@ -1017,7 +1023,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     mt.add_argument("deployment")
-    mt.add_argument("--since", default="1h", help="a duration like 90m, 1h (default), 1d, 7d")
+    mt.add_argument(
+        "--since", default="1h", help="a duration like 90m, 1h (default), 1d, 7d; or today, month"
+    )
     mt.add_argument("--json", action="store_true", help="machine-readable output")
     mt.set_defaults(func=_metrics)
 

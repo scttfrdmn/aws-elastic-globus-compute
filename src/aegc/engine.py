@@ -460,7 +460,10 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
                 )
             candidates = {n: candidates[n] for n in matching}
         else:
-            minors = sorted({str(p.get("python_minor")) for p in candidates.values()})
+            minors = sorted(
+                {str(p.get("python_minor")) for p in candidates.values()},
+                key=lambda m: tuple(int(x) if x.isdigit() else 0 for x in m.split(".")),
+            )
             if len(minors) > 1:
                 return None, (
                     f"this submission doesn't say its Python version (Globus Flows doesn't send "

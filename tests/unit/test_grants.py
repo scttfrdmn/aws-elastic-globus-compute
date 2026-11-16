@@ -363,6 +363,12 @@ def test_worker_role_keeps_grants_while_pre_04_instances_run(
     r = outcomes(deployment.deploy(c, new))
     assert r[("iam role policy", WORKER_GRANTS)] == "kept"
     assert iam.GRANTS_POLICY in role_policies(c)
+    # A revoke during the transition reaches the old workers too.
+    revoked = DeploymentSpec(**{**new.__dict__, "grants": ()})
+    deployment.deploy(c, revoked)
+    assert role_policies(c) == [iam.WORKER_POLICY]
+    deployment.deploy(c, new)
+    assert iam.GRANTS_POLICY in role_policies(c)
     # The old worker leaves; the next deploy removes them.
     g = c.autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[ASG])
     for i in g["AutoScalingGroups"][0]["Instances"]:

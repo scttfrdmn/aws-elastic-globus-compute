@@ -274,3 +274,25 @@ def test_worker_cli_gives_tasks_a_region(monkeypatch: pytest.MonkeyPatch, tmp_pa
     assert wcli.main(["run"]) == 0
     env = captured["task_env"]
     assert env["AWS_DEFAULT_REGION"] == env["AWS_REGION"] == "us-west-2"
+
+
+def lingering() -> int:
+    import threading
+    import time
+
+    threading.Thread(target=time.sleep, args=(120,)).start()  # non-daemon: blocks exit
+    return 7
+
+
+@pytest.mark.timeout(120)
+def test_a_child_that_wont_exit_keeps_its_result(tmp_path: Path) -> None:
+    # Docs review: a child that sent its result but didn't exit was reported CHILD_CRASHED
+    # ("exit code None") and left running.
+    tid = str(uuid.uuid4())
+    t0 = time.monotonic()
+    out = runner.run_task(
+        ctx=runner.context(), task_body=pack_task(lingering, task_uuid=tid), task_uuid=tid,
+        endpoint_id=str(uuid.uuid4()), run_dir=tmp_path / "t", walltime_s=60,
+    )  # fmt: skip
+    assert out.outcome == "result" and unpack_result(out.result or b"") == (False, 7)
+    assert time.monotonic() - t0 < 60
