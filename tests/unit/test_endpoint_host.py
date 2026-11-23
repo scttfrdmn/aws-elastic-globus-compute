@@ -16,7 +16,7 @@ from aegc import evaluator, lease, ledger, naming, state
 from aegc.infra import OwnershipError, Report, deployment, endpoint_host, secrets, userdata
 from aegc.infra.deployment import Clients, DeploymentSpec
 from tests.conftest import ACCOUNT, REGION
-from tests.substrate_gaps import instance_refreshes, secret_resource_policies, secrets_with_tags
+from tests.substrate_gaps import instance_refreshes
 from tests.unit.test_deployment import ASG
 from tests.unit.test_deployment import env as env  # the fixture
 
@@ -37,7 +37,7 @@ def host_spec(**kw: Any) -> endpoint_host.EndpointHostSpec:
 @pytest.fixture
 def cloud(env: tuple[Clients, DeploymentSpec], aws: Callable[[str], Any]) -> Clients:
     c, _ = env
-    return replace(c, secretsmanager=secrets_with_tags(aws("secretsmanager")),
+    return replace(c, secretsmanager=aws("secretsmanager"),
                    cloudwatch=aws("cloudwatch"), sns=aws("sns"))  # fmt: skip
 
 
@@ -45,7 +45,7 @@ def cloud(env: tuple[Clients, DeploymentSpec], aws: Callable[[str], Any]) -> Cli
 
 
 def test_login_round_trip(aws: Callable[[str], Any]) -> None:
-    sm = secrets_with_tags(aws("secretsmanager"))
+    sm = aws("secretsmanager")
     r = Report()
     secrets.put_login(sm, "dev", LOGIN, r, dry_run=False)
     assert secrets.get_login(sm, "dev") == LOGIN
@@ -58,7 +58,7 @@ def test_login_round_trip(aws: Callable[[str], Any]) -> None:
 
 
 def test_login_refuses_foreign_and_oversized(aws: Callable[[str], Any]) -> None:
-    sm = secrets_with_tags(aws("secretsmanager"))
+    sm = aws("secretsmanager")
     sm.create_secret(Name="aegc-dev-endpoint", SecretString="{}")  # untagged: not aegc's
     with pytest.raises(OwnershipError):
         secrets.put_login(sm, "dev", LOGIN, Report(), dry_run=False)
@@ -109,8 +109,7 @@ def test_deploy_and_undeploy(cloud: Clients) -> None:
         "MetricAlarms"
     ]
     assert alarm["MetricName"] == "EndpointOnline" and alarm["Threshold"] == 1
-    # substrate#1620: DescribeAlarms omits TreatMissingData (AWS returns it).
-    assert alarm.get("TreatMissingData", "breaching") == "breaching"
+    assert alarm["TreatMissingData"] == "breaching"
     assert alarm["AlarmActions"] and alarm["AlarmActions"][0].endswith(":aegc-dev-endpoint-alarm")
     again = {(a.resource, a.name): a.outcome for a in endpoint_host.deploy(c, host_spec()).actions}
     assert again[("auto scaling group", "aegc-dev-endpoint")] == "exists"
@@ -226,8 +225,7 @@ def test_evaluator_reports_globus_errors(env: tuple[Clients, DeploymentSpec],
 
 
 def test_secret_policy_denies_everyone_but_the_endpoint_role(aws: Callable[[str], Any]) -> None:
-    sm = secrets_with_tags(aws("secretsmanager"))
-    secret_resource_policies(sm)
+    sm = aws("secretsmanager")
     role = f"arn:aws:iam::{ACCOUNT}:role/aegc/aegc-dev-endpoint-us-west-2"
     secrets.put_login(sm, "dev", LOGIN, Report(), dry_run=False, endpoint_role_arn=role)
     pol = json.loads(sm.get_resource_policy(SecretId="aegc-dev-endpoint")["ResourcePolicy"])

@@ -15,7 +15,7 @@ from aegc import images, lambda_pools, naming, state
 from aegc.infra import OwnershipError, Report, deployment, iam
 from aegc.infra.deployment import Clients, DeploymentSpec, PoolSpec
 from tests.conftest import ACCOUNT, REGION
-from tests.substrate_gaps import lambda_echoes, no_network_interfaces
+from tests.substrate_gaps import lambda_echoes
 from tests.unit.test_deployment import outcomes
 from tests.unit.test_iam import decide, principal
 from tests.unit.test_images import push_fake
@@ -38,7 +38,7 @@ def env(aws: Callable[[str], Any]) -> tuple[Clients, DeploymentSpec, dict[str, l
     lam = aws("lambda")
     sent = lambda_echoes(lam)  # substrate#1659: echoes what was sent; records the requests
     c = Clients(
-        iam=aws("iam"), ec2=no_network_interfaces(aws("ec2")), autoscaling=aws("autoscaling"),
+        iam=aws("iam"), ec2=aws("ec2"), autoscaling=aws("autoscaling"),
         sqs=aws("sqs"), logs=aws("logs"), ssm=aws("ssm"), ecr=aws("ecr"), lambda_=lam,
     )  # fmt: skip
     images.ensure_repository(c.ecr, "geospatial", Report())

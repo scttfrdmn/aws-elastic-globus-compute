@@ -12,7 +12,7 @@ from aegc.awsutil import paginate
 from aegc.infra import OwnershipError, Report, deployment
 from aegc.infra.deployment import Clients, DeploymentSpec, PoolSpec
 from tests.conftest import ACCOUNT, REGION
-from tests.substrate_gaps import instance_type_offerings, no_network_interfaces
+from tests.substrate_gaps import instance_type_offerings
 from tests.unit.test_images import push_fake, tags_of
 
 IMAGE = f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/aegc/geospatial@sha256:" + "b" * 64
@@ -24,7 +24,7 @@ ASG = "aegc-dev-sci-py314"
 def env(aws: Callable[[str], Any]) -> tuple[Clients, DeploymentSpec]:
     c = Clients(
         iam=aws("iam"),
-        ec2=no_network_interfaces(aws("ec2")),  # substrate gap: no DescribeNetworkInterfaces
+        ec2=aws("ec2"),
         autoscaling=aws("autoscaling"),
         sqs=aws("sqs"),
         logs=aws("logs"),
@@ -122,7 +122,7 @@ def east(substrate: Any) -> tuple[Clients, DeploymentSpec, list[dict[str, Any]]]
     def make(service: str) -> Any:
         return boto3.client(service, region_name=EAST)  # type: ignore[call-overload]
 
-    ec2 = no_network_interfaces(make("ec2"))
+    ec2 = make("ec2")
     calls = instance_type_offerings(ec2, EAST_OFFERINGS)  # substrate gap: no Graviton offerings
     c = Clients(
         iam=make("iam"), ec2=ec2, autoscaling=make("autoscaling"), sqs=make("sqs"),
@@ -660,9 +660,6 @@ def test_verify_lists_every_kind_before_destroy(env: tuple[Clients, DeploymentSp
     }  # fmt: skip
 
 
-@pytest.mark.xfail(
-    strict=True, reason="substrate#1522: no DescribeNetworkInterfaces (InvalidAction)"
-)
 def test_verify_sees_worker_network_interfaces(aws: Callable[[str], Any]) -> None:
     ec2 = aws("ec2")
     eni = ec2.describe_network_interfaces(

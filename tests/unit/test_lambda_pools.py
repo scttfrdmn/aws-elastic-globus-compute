@@ -29,7 +29,6 @@ from aegc import (
 from aegc.infra import Report, deployment
 from aegc.infra.deployment import Clients, DeploymentSpec
 from tests.conftest import ACCOUNT, REGION
-from tests.substrate_gaps import no_network_interfaces
 from tests.unit.test_deployment import ASG, POOL
 from tests.unit.test_engine import BUCKET, IMAGE, NOON, Env, code_of, submit, triple
 from tests.unit.test_engine import set_limits as engine_limits
@@ -298,7 +297,7 @@ def test_scaler_doesnt_enable_a_mapping_of_a_stopped_deployment(env: Env) -> Non
 def dep_env(aws: Callable[[str], Any]) -> tuple[Clients, DeploymentSpec]:
     """As test_deployment's env: an EC2 pool sci-py314 in the default VPC."""
     c = Clients(
-        iam=aws("iam"), ec2=no_network_interfaces(aws("ec2")), autoscaling=aws("autoscaling"),
+        iam=aws("iam"), ec2=aws("ec2"), autoscaling=aws("autoscaling"),
         sqs=aws("sqs"), logs=aws("logs"), ssm=aws("ssm"),
     )  # fmt: skip
     spec = DeploymentSpec(deployment="dev", account=ACCOUNT, region=REGION,

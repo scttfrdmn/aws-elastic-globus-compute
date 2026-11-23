@@ -19,7 +19,6 @@ from aegc.infra import deployment as dep
 from aegc.infra.deployment import Clients, DeploymentSpec
 from aegc.infra.iam import Grant
 from tests.conftest import ACCOUNT, REGION
-from tests.substrate_gaps import metrics_collection, no_network_interfaces
 from tests.unit.test_deployment import POOL
 from tests.unit.test_iam import decide, principal
 from tests.unit.test_sizes import sized
@@ -32,7 +31,7 @@ GRANTS = (Grant.parse("read=s3://open-data/in/"), Grant.parse("write=s3://lab/ou
 def env(aws: Callable[[str], Any]) -> tuple[Clients, DeploymentSpec]:
     c = Clients(
         iam=aws("iam"),
-        ec2=no_network_interfaces(aws("ec2")),  # substrate gap: no DescribeNetworkInterfaces
+        ec2=aws("ec2"),
         autoscaling=aws("autoscaling"),
         sqs=aws("sqs"),
         logs=aws("logs"),
@@ -139,23 +138,26 @@ def test_policy_comparison_reads_every_encoding(encode: Callable[[Any], Any]) ->
 
 def test_deploy_enables_group_metrics(env: tuple[Clients, DeploymentSpec]) -> None:
     c, spec = env
-    calls = metrics_collection(c.autoscaling)  # substrate gap: no EnableMetricsCollection
     r = outcomes(dep.deploy(c, spec))
     assert r[("auto scaling group metrics", "aegc-dev-sci-py314")] == "updated"
-    assert calls == [
-        {
-            "Action": "EnableMetricsCollection",
-            "Version": "2011-01-01",
-            "AutoScalingGroupName": "aegc-dev-sci-py314",
-            "Granularity": "1Minute",
-        }
+    (g,) = c.autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=["aegc-dev-sci-py314"])[
+        "AutoScalingGroups"
     ]
+    assert {m["Granularity"] for m in g["EnabledMetrics"]} == {"1Minute"}
 
 
 def test_group_metrics_are_best_effort(env: tuple[Clients, DeploymentSpec]) -> None:
-    # Unshimmed, substrate refuses the call, as AWS does for a deployer policy from before 0.4:
-    # the deploy still completes, and says the metrics aren't on.
+    # A deployer policy from before 0.4 is refused EnableMetricsCollection: the deploy still
+    # completes, and says the metrics aren't on.
+    from botocore.exceptions import ClientError
+
     c, spec = env
+
+    def denied(**_: Any) -> None:
+        raise ClientError({"Error": {"Code": "AccessDenied", "Message": "no"}},
+                          "EnableMetricsCollection")  # fmt: skip
+
+    c.autoscaling.meta.events.register("before-call.auto-scaling.EnableMetricsCollection", denied)
     report = dep.deploy(c, spec)
     (a,) = [a for a in report.actions if a.resource == "auto scaling group metrics"]
     assert a.outcome == "kept" and "not enabled" in a.detail

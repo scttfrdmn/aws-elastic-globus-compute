@@ -7,7 +7,6 @@ import pytest
 from aegc import cli, naming, ops
 from aegc.infra import deployment
 from tests.conftest import ACCOUNT, REGION
-from tests.substrate_gaps import no_network_interfaces
 from tests.unit.test_deployment import POOL
 
 
@@ -54,7 +53,7 @@ def test_reap_only_idle_empty_owned_queues(aws: Callable[[str], Any]) -> None:
 def env(aws: Callable[[str], Any]) -> tuple[deployment.Clients, deployment.DeploymentSpec]:
     c = deployment.Clients(
         iam=aws("iam"),
-        ec2=no_network_interfaces(aws("ec2")),  # substrate gap: no DescribeNetworkInterfaces
+        ec2=aws("ec2"),
         autoscaling=aws("autoscaling"),
         sqs=aws("sqs"),
         logs=aws("logs"),

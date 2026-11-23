@@ -18,7 +18,7 @@ engine = ["globus-compute-endpoint>=4.21,<5"]
 cli = ["click>=8.1", "globus-compute-sdk>=4.21,<5"]
 dev = [
     # AWS emulator for tests (https://github.com/scttfrdmn/substrate); binary: `make tools`.
-    "pytest-substrate @ git+https://github.com/scttfrdmn/substrate@v0.129.0#subdirectory=python",
+    "pytest-substrate @ git+https://github.com/scttfrdmn/substrate@v0.131.0#subdirectory=python",
     # Real packed tasks and execute_task in worker tests.
     "globus-compute-endpoint>=4.21,<5",
     "pytest>=8",
