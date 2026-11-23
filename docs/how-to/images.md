@@ -46,8 +46,9 @@ The steps:
    pull-through cache of `quay.io/aarchsci/<env>:<base-tag>`.
 3. Inside the build: install `globus-compute-endpoint` from conda-forge with micromamba, then fail
    if any package that was already in the image changed version or disappeared, except `click`
-   (`globus-compute-endpoint` pins an older one). Then install the aegc wheel, constrained to the
-   installed packages, and run `pip check`.
+   (`globus-compute-endpoint` pins an older one) and any you name with `--allow-change`. Then
+   install the aegc wheel, constrained to the installed packages (other than those), and run
+   `pip check`.
 4. Still inside the build: import `execute_task` and the worker, run the image's own
    `/opt/aarchsci/smoke.py` if it has one, and run `aegc-worker selftest`, which pushes a real packed
    task through `execute_task`.
@@ -89,6 +90,22 @@ aegc runs the base once to see what kind it is, then picks a Dockerfile:
 If the base has a package at a version `globus-compute-endpoint` can't use, pip can't resolve the
 install and the build fails with pip's conflict report. Change the base, or build the image
 yourself and [register it](#register-an-image-you-built).
+
+### Let one package change
+
+When the conflict is a single package you don't mind changing, name it with `--allow-change`
+(repeatable), and the build leaves it out of the constraints, so pip may pick a version that
+works:
+
+```sh
+aegc image build --env earth-observation --base-tag 2026.11.21.153534 \
+  --allow-change python-dateutil
+```
+
+That one is real: aarchsci's `earth-observation` 2026.11.21.153534 ships python-dateutil 4.0, and
+botocore, which aegc needs, accepts only versions below 3. Every other package of the base still
+stays as it is, and `click` is always allowed to change. See the
+[NDVI tutorial](../tutorials/sentinel2-ndvi.md#1-build-the-worker-image).
 
 The base needs a shell (`sh`): aegc runs one in it to see what kind it is, so distroless images
 are refused with `couldn't run a shell in <base>: a base image needs sh ...`.

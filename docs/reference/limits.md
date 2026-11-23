@@ -75,7 +75,9 @@ Globus Compute limits are the services'.
 | Spot price cache | 1 h (latest `DescribeSpotPriceHistory` price per type and AZ) |
 | On-demand price cache | 24 h (Price List API) |
 | `aegc stop --hard` grace | 120 s before remaining instances are terminated |
-| Lease | 48 h by default, at least 3 h (`--lease`); renewed every min(1 h, lease / 3) by each running engine while running or capped |
+| Lease | 48 h by default, at least 3 h (`--lease`); renewed every min(1 h, lease / 3) by each running engine while running or capped, and by a cloud endpoint's `aegc evaluate` while Globus reports it online |
+| Cloud endpoint's `aegc evaluate` | 3 min after boot, then every 5 min; each pass times out after 240 s |
+| Cloud endpoint offline alarm | `EndpointOnline` below 1, or missing, for 3 periods of 5 min; fires about 20 to 25 min after the endpoint goes offline |
 | TTL | none by default (`--ttl`); never renewed; not scheduled once passed |
 | Lease and TTL schedule retries | 10 (EventBridge Scheduler `MaximumRetryAttempts`) |
 | Ledger record expiry | 400 days (S3 lifecycle) |
@@ -110,7 +112,7 @@ Globus Compute limits are the services'.
 
 | Limit | Value |
 |---|---|
-| `aegc reap` | deletes result queues that are empty and unmodified for 14 days |
+| `aegc reap` | deletes result queues that are empty and unmodified for 14 days; a cloud endpoint's `aegc evaluate` does the same every 5 min |
 | Result queue keep-alive | a running engine refreshes its queue daily |
 | Worker log retention | 14 days |
 | `aegc provenance` search | 14 days back by default (`--since`) |

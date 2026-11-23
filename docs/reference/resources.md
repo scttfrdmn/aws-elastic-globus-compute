@@ -15,7 +15,7 @@ Every resource gets these tags on its create call:
 | `aegc:role` | what the resource is (below) |
 | `aegc:version` | the aegc version that created it, e.g. `0.1.0` |
 | `aegc:pool` | the pool name, on pool resources |
-| `aegc:endpoint-id` | the user endpoint process's id, on result queues |
+| `aegc:endpoint-id` | the user endpoint process's id, on result queues; the endpoint's id, on a cloud endpoint's secret |
 
 User tags can't use the `aegc:` prefix.
 
@@ -126,6 +126,31 @@ any more. Groups have 1-minute group metrics enabled.
 |---|---|---|
 | S3 objects in your bucket, under a write grant | `<grant prefix>/<task uuid>/<name>` | you; aegc never deletes them, and never creates, changes or deletes the buckets it's granted |
 
+## Cloud endpoint: aegc endpoint deploy
+
+One per deployment, from [`aegc endpoint deploy`](../how-to/cloud-endpoint.md). Deleted by
+`aegc endpoint undeploy --yes` or `aegc destroy` (the secret, alarm and topic need the
+[endpoint-deployer](iam.md#endpoint-deployer) policy).
+
+| Resource | Name | `aegc:role` |
+|---|---|---|
+| IAM role, path `/aegc/`, inline policy `aegc-endpoint`; trusts EC2 | `aegc-<d>-endpoint-<region>` | `endpoint-role` |
+| IAM instance profile, path `/aegc/` | `aegc-<d>-endpoint-<region>` | `endpoint-role` |
+| EC2 launch template (the deployment's security group, IMDSv2 with hop limit 2, 30 GiB encrypted gp3); also tagged `aegc:pool=endpoint` | `aegc-<d>-endpoint` | `lt` |
+| Auto Scaling group: one instance, EC2 health checks, `AZRebalance` suspended | `aegc-<d>-endpoint` | `endpoint-asg` |
+| EC2 instance and EBS volume (launched by the group; `t4g.micro` by default, on demand) | — | `endpoint` |
+| Secrets Manager secret: JSON with `name`, `endpoint_id`, `storage_db_b64` (the Globus token storage) and `metric_token`; a resource policy denies reading it to all but the endpoint role; deleted without a recovery window. Also tagged `aegc:endpoint-id`, `aegc:endpoint-name`, `aegc:metric-token` and `aegc:login-sha256` | `aegc-<d>-endpoint` | `endpoint-secret` |
+| CloudWatch alarm on `EndpointOnline` (namespace `aegc/endpoint`, dimensions `Deployment` and `Token`) | `aegc-<d>-endpoint-offline` | `endpoint-alarm` |
+| SNS topic, with an email subscription per `--alarm-email` | `aegc-<d>-endpoint-alarm` | `endpoint-alarm` |
+| ECR image tag on the endpoint image | `inuse-<d>-<first 12 hex of the digest>` in `aegc/endpoint` | — |
+| CloudWatch log streams in `/aegc/<d>` | `endpoint/<instance-id>`, `endpoint/<instance-id>/evaluate` | — |
+
+The ECR repository `aegc/endpoint` (immutable tags, scan on push, the worker repositories'
+lifecycle policy; `aegc:role=image-repo`, `aegc:deployment=_bootstrap`) is created by the first
+`endpoint deploy` in the region and, like worker image repositories, not deleted by any aegc
+command. The env name `endpoint` is reserved for it. On the instance, the endpoint's files are
+under `/var/lib/aegc-endpoint/`, and the boot log is `/var/log/aegc-boot.log`.
+
 ## On your machine: aegc endpoint
 
 | Resource | Name |
@@ -150,7 +175,7 @@ of its queues, launch template and group; `limits` (`max_usd_day`, `max_usd_mont
 ## State
 
 `/aegc/<d>/state` is JSON: `mode` (`running`, `capped`, `stopped` or `expired`), `reason`, `since`,
-`until` (for `capped`, the end of the cap's period), `by` (`aegc deploy`, `engine`, `aegc stop`,
-`aegc resume`, `lease` or `ttl`) and `kill` (fail running tasks too). `aegc deploy` creates it;
-engines, `aegc stop`, `aegc resume`, `aegc limits --resume` and the lease schedules overwrite it.
+`until` (for `capped`, the end of the cap's period), `by` (`aegc deploy`, `engine`, `evaluator`,
+`aegc stop`, `aegc resume`, `lease` or `ttl`) and `kill` (fail running tasks too). `aegc deploy` creates it;
+engines, `aegc evaluate`, `aegc stop`, `aegc resume`, `aegc limits --resume` and the lease schedules overwrite it.
 A missing parameter reads as `running`.

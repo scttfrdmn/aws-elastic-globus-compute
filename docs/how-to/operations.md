@@ -118,6 +118,11 @@ when idle, and results wait in the result queue for up to 14 days. Spend limits 
 while no endpoint runs, and if none runs for the length of the lease (48 hours by default), the
 deployment expires; `aegc resume` brings it back.
 
+To keep an endpoint up with your laptop closed, run it in the cloud:
+`aegc endpoint ... deploy --stop-local` moves it to a small EC2 instance with the same endpoint id,
+which also checks the spend limits every 5 minutes, task or no task. See
+[Run the endpoint in the cloud](cloud-endpoint.md).
+
 ## Read logs
 
 - **Endpoint:** `ep logs` follows the container's output. Engine messages
@@ -136,6 +141,10 @@ deployment expires; `aegc resume` brings it back.
     ```sh
     aws logs tail /aegc/e2e --follow
     ```
+
+- **Cloud endpoint:** streams `endpoint/<instance-id>` (the endpoint, with user endpoint
+  process lines prefixed `[uep]`) and `endpoint/<instance-id>/evaluate` in the same log group. See
+  [Logs](cloud-endpoint.md#logs).
 
 - **One task:** `aegc provenance e2e <task id>` finds where and how it ran; `aegc metrics e2e`
   sums up the pools. See [Watch tasks](observability.md).
@@ -190,15 +199,17 @@ aegc destroy e2e --yes
 destroys anyway, and those tasks are lost. Then it deletes, in order:
 
 1. the Auto Scaling groups (force-deleted, which terminates their instances; it waits up to
-   10 minutes for each to go),
+   10 minutes for each to go), the [cloud endpoint](cloud-endpoint.md)'s included,
 2. the launch templates,
 3. the security group (retrying while the terminated instances' network interfaces go away),
 4. all of the deployment's queues: task, dead-letter and result queues,
 5. the lease's schedules, schedule group and scheduler role,
 6. the worker instance profile and role, and the task role,
-7. the log group,
-8. the deployment's `inuse-` tags on its images (the images stay),
-9. every parameter under `/aegc/<d>/`: the manifest and the state.
+7. the cloud endpoint's alarm, SNS topic, image `inuse-` tag, instance profile and role, and its
+   login secret, if it has one,
+8. the log group,
+9. the deployment's `inuse-` tags on its images (the images stay),
+10. every parameter under `/aegc/<d>/`: the manifest and the state.
 
 Every deletion requires the name prefix and the ownership tags; anything else is reported as `kept`.
 Payload objects aren't deleted by `destroy`; the bucket's lifecycle rule removes them after 15
@@ -208,13 +219,28 @@ days. Cost ledger records stay until they expire after 400 days.
 volumes and network interfaces tagged with the deployment (waiting up to 10 minutes while any are
 still terminating or detaching), groups, launch templates, the security group, queues, the log
 group, `/aegc/<d>/` parameters, the worker role and instance profile, the task role, the lease's
-group and role,
+group and role, the cloud endpoint's role, secret, alarm and topic,
 and in-use image tags. Anything still there is reported as `remaining`, and the command exits 1.
 `--no-verify` skips the check. `aegc destroy e2e --verify`, without `--yes`, only runs the check,
 for example to confirm an earlier destroy.
 
 Stop the endpoint before you destroy its deployment. An engine that's still running recreates its
-result queue if it finds it missing.
+result queue if it finds it missing. A cloud endpoint goes with the deployment; you don't need to
+undeploy it first.
+
+**Without the endpoint-deployer policy.** The cloud endpoint's secret, alarm and topic need the
+[endpoint-deployer](../reference/iam.md#endpoint-deployer) policy. With the deployer policy alone,
+`destroy` still removes everything else and reports
+
+```
+        kept  cloud endpoint             e2e (not checked: needs the endpoint-deployer policy (aegc iam-policy endpoint-deployer))
+```
+
+For a deployment that never had a cloud endpoint, that's all, and verification passes. If it did
+have one, its host goes with the groups, but its secret, alarm and topic stay, and so do its role,
+instance profile and the endpoint image's `inuse-` tag, which verification reports as
+`remaining`. Run `aegc destroy <d> --yes`
+again with both policies to finish.
 
 ## Find what exists
 
@@ -236,7 +262,10 @@ Every aegc resource is regional, so a second region (us-east-1, say, next to ROD
 
 1. **Bootstrap it.** `aegc --region us-east-1 bootstrap` creates that region's payload bucket
    `aegc-<account>-us-east-1`, its pull-through cache rule, the ECR template role
-   `aegc-ecr-template-us-east-1`, and the region's `/aegc/bootstrap` parameter.
+   `aegc-ecr-template-us-east-1`, and the region's `/aegc/bootstrap` parameter. In us-east-1 the
+   bucket is created without a location and tagged straight after (us-east-1 takes no
+   `LocationConstraint`); if the tagging fails, the empty bucket is deleted again, so a retry
+   doesn't find an untagged bucket it would refuse.
 2. **Build the images there.** Images live in the region's ECR and their records
    (`/aegc/images/<env>`) in the region's SSM, so an image built in us-west-2 isn't visible in
    us-east-1. Run `aegc --region us-east-1 image build --env <env> ...` again, or
@@ -245,7 +274,8 @@ Every aegc resource is regional, so a second region (us-east-1, say, next to ROD
    lease are the region's, and the IAM roles carry the region in their names, so the same
    deployment name can exist in two regions without clashing.
 4. **Run an endpoint per region.** `aegc --region us-east-1 endpoint ... configure` writes the
-   region into the endpoint's config. One endpoint serves one deployment in one region.
+   region into the endpoint's config. One endpoint serves one deployment in one region, and a
+   [cloud endpoint](cloud-endpoint.md) runs in its deployment's region.
 
 **Zones without Graviton.** Not every Availability Zone offers the pool's instance families
 (us-east-1's use1-az3 has no Graviton at all). `deploy` asks EC2 which zones offer at least one of
@@ -253,8 +283,12 @@ the pool's `allowed_instance_types` and leaves default subnets in other zones ou
 Auto Scaling group:
 
 ```
-     skipped  subnet                     subnet-0abc (us-east-1c, use1-az3) (pool geospatial-py314: the zone offers none of c8g.*, m8g.*, ...)
+     skipped  subnet                     subnet-0abc (us-east-1e, use1-az3) (pool geospatial-py314: the zone offers none of c8g.*, m8g.*, ...)
 ```
+
+Zone names map to zone ids differently in each account; the id (`use1-az3`) is the same
+everywhere. The live run in us-east-1 skipped one subnet this way, in `us-east-1e`. The cloud
+endpoint's host is filtered the same way, by its instance type.
 
 Subnets you pass explicitly are all used; `deploy` reports one in such a zone as `kept`, as a
 warning. If EC2 won't say (a deployer policy from before 0.6 lacks

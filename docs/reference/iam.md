@@ -1,7 +1,9 @@
 # IAM policies
 
-aegc uses six policies, printed by `aegc iam-policy {worker,operator,deployer,bootstrap,builder,task}`.
-Each is scoped to one account and region, and the worker and operator policies to one deployment.
+aegc uses eight policies, printed by
+`aegc iam-policy {worker,operator,deployer,bootstrap,builder,task,endpoint,endpoint-deployer}`.
+Each is scoped to one account and region, and the worker, operator, task and endpoint policies to
+one deployment.
 The documents below were generated with:
 
 ```sh
@@ -19,6 +21,8 @@ the command makes no AWS calls. The tests check these documents with the IAM pol
 | [deployer](#deployer) | The credentials you run `aegc deploy`, `destroy`, `stop`, `resume`, `limits`, `status`, `metrics`, `reap` and `footprint` with | The `aegc` CLI |
 | [bootstrap](#bootstrap) | The credentials you run `aegc bootstrap` and `unbootstrap` with | The `aegc` CLI |
 | [builder](#builder) | The credentials you run `aegc image build`, `register`, `list` and `forget` with | The `aegc` CLI |
+| [endpoint](#endpoint) | Created by `aegc endpoint deploy` as the inline policy `aegc-endpoint` on the role `aegc-<d>-endpoint-<region>` | The [cloud endpoint](../how-to/cloud-endpoint.md)'s host: `AWSEngine` and `aegc evaluate` |
+| [endpoint-deployer](#endpoint-deployer) | The credentials you run `aegc endpoint deploy`, `undeploy` and `status` with, next to the deployer policy | The `aegc` CLI |
 
 `aegc deploy` also creates the [task role](#task-role), `aegc-<d>-task-<region>`, whose
 credentials task code gets in [isolated](../concepts/security.md#task-isolation) pools, with its
@@ -28,7 +32,7 @@ while pools with images from before aegc 0.4 remain). Two more roles of aegc's o
 end: the [scheduler role](#scheduler-role) for the deployment lease, and (from `aegc bootstrap`)
 the [ECR creation template role](#ecr-creation-template-role).
 
-## Why five
+## Why so many
 
 Customer managed policies are limited to 6,144 characters, not counting whitespace. In v0.1 one
 deployer policy covered `bootstrap` as well as `deploy` and `destroy`; with v0.2's additions (the
@@ -37,16 +41,22 @@ longer fits. It's now split by when you need it: **bootstrap** for the region-wi
 once per region, and **deployer** for everything about a deployment. Attach both to an
 administrator's credentials, or give the bootstrap policy only to whoever sets up the region.
 
+The cloud endpoint's secret, alarm and topic are in a separate **endpoint-deployer** policy for
+the same reason: the deployer policy is already within 300 characters of the limit. And only
+whoever moves endpoints to the cloud needs it.
+
 Sizes of the documents below, without whitespace:
 
 | Policy | Characters | Limit |
 |---|---|---|
-| worker | 2,108 | 10,240 for all of the role's inline policies, `aegc-grants` included |
+| worker | 2,192 | 10,240 for all of the role's inline policies, `aegc-grants` included |
 | task (`aegc-task`) | 182 | 10,240 for all of the role's inline policies, `aegc-grants` included |
-| operator | 3,262 | 6,144 |
-| deployer | 5,805 | 6,144 |
+| operator | 3,346 | 6,144 |
+| deployer | 5,841 | 6,144 |
 | bootstrap | 2,311 | 6,144 |
 | builder | 1,142 | 6,144 |
+| endpoint (`aegc-endpoint`) | 4,504 (4,734 with `--session-manager`) | 10,240 for the role's inline policies |
+| endpoint-deployer | 1,623 | 6,144 |
 
 The deployer is the closest to the limit; longer region names make it a little longer.
 
@@ -54,7 +64,8 @@ The deployer is the closest to the limit; longer region names make it a little l
 
 What a worker may do: consume the deployment's task queues, post to its result queues, read task
 payloads and write result payloads under `payloads/<d>/`, pull `aegc/*` images, write to its log
-group, terminate itself in an Auto Scaling group tagged with the deployment, read the deployment's
+group, terminate itself in a worker Auto Scaling group of the deployment (tagged with the
+deployment and `aegc:role=asg`, so never the [cloud endpoint](#endpoint)'s group), read the deployment's
 state and manifest (for [`aegc.outputs`](../how-to/data.md#return-large-outputs)' current
 grants on workers from before aegc 0.4), write its cost ledger record under `ledger/<d>/`, and
 assume the deployment's [task role](#task-role) (`AssumeTaskRole`), whose credentials it hands to
@@ -112,7 +123,8 @@ before aegc 0.4 (see [Security model](../concepts/security.md#pools-with-older-i
       "Resource": "*",
       "Condition": {
         "StringEquals": {
-          "autoscaling:ResourceTag/aegc:deployment": "e2e"
+          "autoscaling:ResourceTag/aegc:deployment": "e2e",
+          "autoscaling:ResourceTag/aegc:role": "asg"
         }
       }
     },
@@ -129,7 +141,8 @@ before aegc 0.4 (see [Security model](../concepts/security.md#pools-with-older-i
       "Resource": "*",
       "Condition": {
         "StringEquals": {
-          "autoscaling:ResourceTag/aegc:deployment": "e2e"
+          "autoscaling:ResourceTag/aegc:deployment": "e2e",
+          "autoscaling:ResourceTag/aegc:role": "asg"
         }
       }
     },
@@ -325,7 +338,7 @@ it is:
 - Grants can't contain `*`, `?` or `${`, so the only wildcard is the `*` aegc appends to each
   prefix.
 - IAM counts all of a role's inline policies against 10,240 characters, without whitespace.
-  `aegc-worker` takes about 2,110 and `aegc-task` about 180, and `deploy` refuses grants that
+  `aegc-worker` takes about 2,190 and `aegc-task` about 180, and `deploy` refuses grants that
   don't fit next to either, before it changes anything. The policy above is 564 characters.
 - Requester-pays buckets need nothing more. Buckets in another account (read grants only) must
   also allow the task role in their bucket policy (and the worker role while pools with older
@@ -343,7 +356,10 @@ under `/aegc/`, so grants need no extra permissions to deploy.
 
 What `AWSEngine` needs at runtime: read the deployment's parameters (manifest and state), send
 tasks and read queue depth, create and use its own result queues, move payloads, and raise desired
-capacity on the deployment's Auto Scaling groups. For spend limits and the lease it also:
+capacity on the deployment's worker Auto Scaling groups. Every Auto Scaling statement here and in
+the worker policy requires the group's tags `aegc:deployment=<d>` and `aegc:role=asg`, so neither
+policy can change the [cloud endpoint](#endpoint)'s group (`aegc:role=endpoint-asg`). For spend
+limits and the lease it also:
 
 - writes the deployment's state (`CapState`), to cap it; it reads the parameter's tags first, to
   check that aegc created it, and tags it if it has to create it (a v0.1 deployment has none);
@@ -426,7 +442,8 @@ For [`aegc provenance`](cli.md#aegc-provenance), it may also search the deployme
       "Resource": "*",
       "Condition": {
         "StringEquals": {
-          "autoscaling:ResourceTag/aegc:deployment": "e2e"
+          "autoscaling:ResourceTag/aegc:deployment": "e2e",
+          "autoscaling:ResourceTag/aegc:role": "asg"
         }
       }
     },
@@ -493,7 +510,8 @@ For [`aegc provenance`](cli.md#aegc-provenance), it may also search the deployme
       "Resource": "*",
       "Condition": {
         "StringEquals": {
-          "autoscaling:ResourceTag/aegc:deployment": "e2e"
+          "autoscaling:ResourceTag/aegc:deployment": "e2e",
+          "autoscaling:ResourceTag/aegc:role": "asg"
         }
       }
     },
@@ -911,6 +929,13 @@ Scheduler.
 - `ec2:DescribeInstances`, `DescribeVolumes`, `DescribeNetworkInterfaces` and `tag:GetResources`
   are for `destroy`'s verification and `aegc footprint`. `deploy` also uses `DescribeInstances` to
   find workers launched before their pool was isolated.
+- `ec2:DescribeInstanceTypeOfferings` tells `deploy` which Availability Zones offer a pool's
+  instance types, so it can leave subnets in other zones out of the pool's group
+  ([Other regions](../how-to/operations.md#other-regions)). With a deployer policy from before
+  0.6, `deploy` keeps every subnet and reports `kept  subnet offerings ... (... failed (deployer
+  policy before 0.6?))`.
+- The deployer policy covers the [cloud endpoint](#endpoint)'s role, instance profile, launch
+  template and group too; its secret, alarm and topic need [endpoint-deployer](#endpoint-deployer).
 - `autoscaling:EnableMetricsCollection` turns on the groups' 1-minute Auto Scaling metrics for
   [`aegc metrics`](cli.md#aegc-metrics). With a deployer policy from before 0.4, `deploy` reports
   `kept  auto scaling group metrics ... (not enabled: AccessDenied)` and carries on.
@@ -1122,6 +1147,395 @@ login from aegc, and needs pull access to that repository.
   ]
 }
 ```
+
+## endpoint
+
+The role of the [cloud endpoint](../how-to/cloud-endpoint.md)'s host,
+`/aegc/aegc-<d>-endpoint-<region>`, with its instance profile of the same name and the inline
+policy `aegc-endpoint`. It trusts EC2, like the worker role. The host runs `AWSEngine`, so the
+policy starts with the whole [operator](#operator) policy, and adds:
+
+- `ReadOwnLogin`: `GetSecretValue` on its own secret, `aegc-<d>-endpoint`. The secret's resource
+  policy denies it to everyone else.
+- `PullEndpointImage` and `EcrAuth`: pull from `aegc/endpoint`.
+- `EndpointLogs`: write its log streams in `/aegc/<d>`.
+- `ReplaceSelf`: `SetInstanceHealth` on its own group (tagged `aegc:role=endpoint-asg`), so a boot
+  that fails marks the instance unhealthy and the group replaces it.
+- `LivenessMetric`: `PutMetricData` in the namespace `aegc/endpoint` only, for `EndpointOnline`.
+  Workers have no `PutMetricData` at all.
+- `ReapResultQueues`: `DeleteQueue` on the deployment's result queues, for `aegc evaluate`.
+
+`aegc iam-policy endpoint --deployment <d>` prints it:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadManifest",
+      "Effect": "Allow",
+      "Action": "ssm:GetParameter",
+      "Resource": "arn:aws:ssm:us-west-2:123456789012:parameter/aegc/e2e/*"
+    },
+    {
+      "Sid": "SubmitTasks",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:SendMessage",
+        "sqs:GetQueueAttributes",
+        "sqs:GetQueueUrl"
+      ],
+      "Resource": [
+        "arn:aws:sqs:us-west-2:123456789012:aegc-e2e-*-tasks",
+        "arn:aws:sqs:us-west-2:123456789012:aegc-e2e-*-dlq"
+      ]
+    },
+    {
+      "Sid": "OwnResultQueues",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:CreateQueue",
+        "sqs:TagQueue",
+        "sqs:ListQueueTags",
+        "sqs:SetQueueAttributes",
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:GetQueueAttributes",
+        "sqs:GetQueueUrl"
+      ],
+      "Resource": "arn:aws:sqs:us-west-2:123456789012:aegc-e2e-res-*"
+    },
+    {
+      "Sid": "TaskPayloads",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:DeleteObject"
+      ],
+      "Resource": "arn:aws:s3:::aegc-123456789012-us-west-2/payloads/e2e/tasks/*"
+    },
+    {
+      "Sid": "ResultPayloads",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:DeleteObject"
+      ],
+      "Resource": "arn:aws:s3:::aegc-123456789012-us-west-2/payloads/e2e/results/*"
+    },
+    {
+      "Sid": "ScaleOut",
+      "Effect": "Allow",
+      "Action": "autoscaling:SetDesiredCapacity",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "autoscaling:ResourceTag/aegc:deployment": "e2e",
+          "autoscaling:ResourceTag/aegc:role": "asg"
+        }
+      }
+    },
+    {
+      "Sid": "Observe",
+      "Effect": "Allow",
+      "Action": [
+        "autoscaling:DescribeAutoScalingGroups",
+        "autoscaling:DescribeScalingActivities"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CapState",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:PutParameter",
+        "ssm:ListTagsForResource",
+        "ssm:AddTagsToResource"
+      ],
+      "Resource": "arn:aws:ssm:us-west-2:123456789012:parameter/aegc/e2e/state"
+    },
+    {
+      "Sid": "ReadCostLedger",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::aegc-123456789012-us-west-2/ledger/e2e/*"
+    },
+    {
+      "Sid": "ListCostLedger",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::aegc-123456789012-us-west-2",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": "ledger/e2e/*"
+        }
+      }
+    },
+    {
+      "Sid": "Prices",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeSpotPriceHistory",
+        "pricing:GetProducts",
+        "ce:GetCostAndUsage"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "PurgeOwnTasks",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:ChangeMessageVisibility"
+      ],
+      "Resource": "arn:aws:sqs:us-west-2:123456789012:aegc-e2e-*-tasks"
+    },
+    {
+      "Sid": "CapMinimum",
+      "Effect": "Allow",
+      "Action": "autoscaling:UpdateAutoScalingGroup",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "autoscaling:ResourceTag/aegc:deployment": "e2e",
+          "autoscaling:ResourceTag/aegc:role": "asg"
+        }
+      }
+    },
+    {
+      "Sid": "RenewLease",
+      "Effect": "Allow",
+      "Action": [
+        "scheduler:GetSchedule",
+        "scheduler:UpdateSchedule"
+      ],
+      "Resource": "arn:aws:scheduler:us-west-2:123456789012:schedule/aegc-e2e/*"
+    },
+    {
+      "Sid": "ListLease",
+      "Effect": "Allow",
+      "Action": "scheduler:ListSchedules",
+      "Resource": "*"
+    },
+    {
+      "Sid": "PassLeaseRole",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::123456789012:role/aegc/aegc-e2e-scheduler-us-west-2",
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "scheduler.amazonaws.com"
+        }
+      }
+    },
+    {
+      "Sid": "ReadTaskLogs",
+      "Effect": "Allow",
+      "Action": "logs:FilterLogEvents",
+      "Resource": [
+        "arn:aws:logs:us-west-2:123456789012:log-group:/aegc/e2e",
+        "arn:aws:logs:us-west-2:123456789012:log-group:/aegc/e2e:*"
+      ]
+    },
+    {
+      "Sid": "FindResultQueues",
+      "Effect": "Allow",
+      "Action": "sqs:ListQueues",
+      "Resource": "*"
+    },
+    {
+      "Sid": "VcpuQuotaPreflight",
+      "Effect": "Allow",
+      "Action": [
+        "servicequotas:GetServiceQuota",
+        "servicequotas:GetAWSDefaultServiceQuota",
+        "cloudwatch:GetMetricData"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ReadOwnLogin",
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "arn:aws:secretsmanager:us-west-2:123456789012:secret:aegc-e2e-endpoint-??????"
+    },
+    {
+      "Sid": "PullEndpointImage",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchGetImage",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:BatchCheckLayerAvailability"
+      ],
+      "Resource": "arn:aws:ecr:us-west-2:123456789012:repository/aegc/endpoint"
+    },
+    {
+      "Sid": "EcrAuth",
+      "Effect": "Allow",
+      "Action": "ecr:GetAuthorizationToken",
+      "Resource": "*"
+    },
+    {
+      "Sid": "EndpointLogs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:us-west-2:123456789012:log-group:/aegc/e2e:*"
+    },
+    {
+      "Sid": "ReplaceSelf",
+      "Effect": "Allow",
+      "Action": "autoscaling:SetInstanceHealth",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "autoscaling:ResourceTag/aegc:deployment": "e2e",
+          "autoscaling:ResourceTag/aegc:role": "endpoint-asg"
+        }
+      }
+    },
+    {
+      "Sid": "LivenessMetric",
+      "Effect": "Allow",
+      "Action": "cloudwatch:PutMetricData",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "cloudwatch:namespace": "aegc/endpoint"
+        }
+      }
+    },
+    {
+      "Sid": "ReapResultQueues",
+      "Effect": "Allow",
+      "Action": "sqs:DeleteQueue",
+      "Resource": "arn:aws:sqs:us-west-2:123456789012:aegc-e2e-res-*"
+    }
+  ]
+}
+```
+
+With `aegc endpoint deploy --session-manager` it also has a `SessionManager` statement
+(`ssm:UpdateInstanceInformation` and the four `ssmmessages` channel actions, on `*`), so Session
+Manager can open shells on the host. Whoever may `ssm:StartSession` there gets root on the host,
+and with it the stored Globus login; it's off unless you ask for it.
+
+## endpoint-deployer
+
+What `aegc endpoint deploy`, `undeploy` and `status` need besides the [deployer](#deployer) policy,
+which already covers the host's role, launch template and group: the login secret, the liveness
+metric's first datapoint, the instance refresh, the offline alarm and its SNS topic. Attach it
+next to the deployer policy, to whoever moves endpoints to the cloud.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CreateLoginTagged",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:CreateSecret",
+        "secretsmanager:TagResource"
+      ],
+      "Resource": "arn:aws:secretsmanager:us-west-2:123456789012:secret:aegc-*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/aegc:managed": "true"
+        }
+      }
+    },
+    {
+      "Sid": "ChangeOwnedLogin",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:PutSecretValue",
+        "secretsmanager:DeleteSecret",
+        "secretsmanager:PutResourcePolicy",
+        "secretsmanager:UntagResource"
+      ],
+      "Resource": "arn:aws:secretsmanager:us-west-2:123456789012:secret:aegc-*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/aegc:managed": "true"
+        }
+      }
+    },
+    {
+      "Sid": "ListLogins",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:ListSecrets",
+        "sns:ListTopics"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "LivenessSeed",
+      "Effect": "Allow",
+      "Action": "cloudwatch:PutMetricData",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "cloudwatch:namespace": "aegc/endpoint"
+        }
+      }
+    },
+    {
+      "Sid": "RollEndpointHost",
+      "Effect": "Allow",
+      "Action": [
+        "autoscaling:StartInstanceRefresh",
+        "autoscaling:SuspendProcesses"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "autoscaling:ResourceTag/aegc:role": "endpoint-asg"
+        }
+      }
+    },
+    {
+      "Sid": "OfflineAlarm",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:PutMetricAlarm",
+        "cloudwatch:DeleteAlarms",
+        "cloudwatch:DescribeAlarms",
+        "cloudwatch:TagResource",
+        "cloudwatch:ListTagsForResource"
+      ],
+      "Resource": "arn:aws:cloudwatch:us-west-2:123456789012:alarm:aegc-*"
+    },
+    {
+      "Sid": "AlarmTopic",
+      "Effect": "Allow",
+      "Action": [
+        "sns:CreateTopic",
+        "sns:DeleteTopic",
+        "sns:Subscribe",
+        "sns:GetTopicAttributes",
+        "sns:ListTagsForResource",
+        "sns:TagResource",
+        "sns:ListSubscriptionsByTopic"
+      ],
+      "Resource": "arn:aws:sns:us-west-2:123456789012:aegc-*"
+    }
+  ]
+}
+```
+
+- It never allows `secretsmanager:GetSecretValue`: only the endpoint host reads the login. `status`
+  reads the endpoint's name and id from the secret's tags (`ListSecrets`), and `deploy` finds
+  whether another deployment already runs the same endpoint id the same way.
+- Secrets are created only with the request tag `aegc:managed=true`, and changed or deleted only
+  when they carry it.
+- `aegc destroy` works without this policy, but leaves a cloud endpoint's secret, alarm and topic
+  (and, in that case, its role) in place; see
+  [Destroy a deployment](../how-to/operations.md#destroy-a-deployment).
 
 ## Scheduler role
 

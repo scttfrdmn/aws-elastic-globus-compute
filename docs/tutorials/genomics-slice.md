@@ -2,7 +2,7 @@
 
 The 1000 Genomes high-coverage call set keeps chromosome 22 for all 3,202 samples in one
 bgzipped VCF of 27.9 GB, in us-east-1. If you want one megabase of it, you don't need the other
-27.3 GB. You'll run `bcftools` on a Spot worker in us-east-1, next to the data, read just the
+27.2 GB. You'll run `bcftools` on a Spot worker in us-east-1, next to the data, read just the
 region you want over HTTPS, compute allele frequencies, and bring home only the answer.
 
 **What it shows:**
@@ -50,9 +50,10 @@ flowchart LR
     aws s3 mb s3://$BUCKET   # if it doesn't exist yet
     ```
 
-**Cost.** Well under $0.10: one 2-vCPU Spot worker for the task plus its 5 idle minutes, a few
-hundred MB of slice in your bucket ($0.023 per GB-month), and the new region's ECR storage for a
-small image. The region's bootstrap costs nothing while idle.
+**Cost.** Well under $0.10 (the live run cost $0.0062): one 2-vCPU Spot worker for the task
+plus its 5 idle minutes, about 700 MiB of slice in your bucket ($0.023 per GB-month, under 2 cents
+a month), and the new region's ECR storage for a small image. The region's bootstrap costs nothing
+while idle.
 
 ## Steps
 
@@ -222,20 +223,26 @@ Points to know:
   their URIs and sizes, a few hundred bytes of JSON.
 
 !!! abstract "Results"
-    Measured on TODO(live) (date), `chr22:20000000-21000000`.
+    Measured on 2026-11-23 in us-east-1, `chr22:20000000-21000000`.
 
     | Measure | Value |
     |---|---|
-    | Records in the slice / `PASS` | TODO(live) / TODO(live) |
-    | Allele frequencies: rare / low / common | TODO(live) / TODO(live) / TODO(live) |
+    | Records in the slice | 49,943 |
     | Whole file | 27.9 GB (26.0 GiB) |
-    | Slice written to your bucket | TODO(live) MiB (TODO(live) % of the file) |
-    | Shipped to your laptop (AF table) | TODO(live) KiB |
-    | Egress avoided, at $0.09/GB | about $2.34 (26.0 GiB; $2.51 per decimal GB) |
-    | bcftools time in the task (`slice_seconds`) | TODO(live) s |
-    | Wall time, submission to result (cold) | TODO(live) s |
-    | Instance | TODO(live) (type, Spot, zone) |
-    | Cost per run (`aegc cost`, including boot and idle) | $TODO(live) |
+    | Slice written to your bucket | 696.3 MiB (2.61 % of the file) |
+    | Shipped to your laptop (AF table) | 335.7 KiB |
+    | Egress avoided, at $0.09/GB | about $2.34 for the whole file (26.0 GiB; $2.51 per decimal GB), against $0.061 to download the slice and under $0.0001 for the AF table |
+    | bcftools time in the task (`slice_seconds`) | 145.2 s |
+    | Wall time, submission to result (cold) | 195.3 s, about 40 s of it the cold start |
+    | Instance | `c7g.large`, Spot, us-east-1f |
+    | Task's estimated cost (provenance, at the on-demand price) | $0.0033 |
+    | Cost of the run (`aegc cost`, including boot and idle) | $0.0062 (0.13 instance-hours, Spot) |
+
+Most of the wall time is bcftools reading the region over HTTPS and recomputing the tags across
+3,202 samples; the cold start (a worker booting and pulling the image) was about 40 s of it. The
+slice is 2.6 % of the file, and what came back to the laptop is a few hundred KiB. The task's
+estimate in provenance prices its share of the instance on demand, an upper bound; `aegc cost`
+counts the whole instance-hours at the Spot price, boot and 5 idle minutes included.
 
 ## What to look at
 

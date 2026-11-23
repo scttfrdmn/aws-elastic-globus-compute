@@ -39,6 +39,13 @@ submitter's Python minor version and the `user_endpoint_config` options (`env`, 
 `memory_gib`, `walltime_s`, `pool`) to the engine. They go there, not in `resource_specification`,
 because the Globus Compute web service keeps only MPI fields in a task's `resource_specification`.
 
+**Cloud endpoint (optional).** `aegc endpoint deploy` runs the same endpoint container on a
+small on-demand Graviton instance, in an Auto Scaling group of one, with the same endpoint id
+and your Globus login from Secrets Manager. The instance also runs `aegc evaluate` every
+5 minutes, which checks spend limits, renews the lease and reaps idle result queues without
+waiting for an engine, and publishes a liveness metric for an offline alarm. See
+[Run the endpoint in the cloud](../how-to/cloud-endpoint.md).
+
 **AWSEngine** ([src/aegc/engine.py](../../src/aegc/engine.py)) has three parts:
 
 - `_submit` picks the pool and sends the task to its SQS queue *before returning*, because the
@@ -195,8 +202,10 @@ parameter and update groups tagged with the deployment. No Lambda function is in
 
 Every running engine pushes the lease schedules forward while the deployment is `running` or
 `capped`, every hour (or every third of the lease, if that's shorter), so a deployment with an
-endpoint up never expires, and one capped until the end of the month doesn't expire meanwhile. If
-every endpoint stops (or loses its credentials) for the length of the lease, the schedules fire.
+endpoint up never expires, and one capped until the end of the month doesn't expire meanwhile. A
+[cloud endpoint](../how-to/cloud-endpoint.md#the-evaluator)'s `aegc evaluate` renews it too, but
+only while Globus reports the endpoint online. If every endpoint stops (or loses its credentials)
+for the length of the lease, the schedules fire.
 `aegc resume` sets the state back to `running` and pushes the lease forward.
 
 `--ttl DURATION` (for example `--ttl 7d`) adds the same schedules under `ttl-*`, at a fixed time

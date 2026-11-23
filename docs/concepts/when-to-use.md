@@ -29,10 +29,11 @@ These are the current limits. Numbers come from the live run in
 - **Cold start.** From zero workers, the first result took 39 s (46 s on a second cold run). Larger
   images take longer to pull. Set `min_vcpus=` on a pool to keep workers warm, at the cost of paying for
   them.
-- **The endpoint runs on your machine.** The endpoint is a container on your laptop. Tasks
-  reach AWS only while it's running. Results produced while it's down wait in SQS for up to 14 days
-  and are delivered when it comes back. A cloud-hosted endpoint is tracked in
-  [#22](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/22).
+- **The endpoint runs somewhere you keep running.** By default it's a container on your laptop,
+  and tasks reach AWS only while it's running. Results produced while it's down wait in SQS for up
+  to 14 days and are delivered when it comes back. To take tasks with the laptop closed, for
+  Globus Flows and Timers for example, [run it in the cloud](../how-to/cloud-endpoint.md) on a
+  small instance (about $12 a month, outside `aegc cost` and the spend limits).
 - **Python must match.** The submitter's Python minor version must match a worker image. The
   aarchsci images run 3.14; for other minors, build or register an image per minor (an env can
   have several). A client on a minor with no image gets an error, not a result.

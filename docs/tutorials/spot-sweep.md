@@ -12,8 +12,8 @@ task still came back, with the same answers.
   answers must match the undisturbed run's exactly.
 - **What an interruption costs you.** aegc's workers watch for the notice, hand their running
   tasks back to the queue at once and leave; other workers pick the tasks up. `aegc metrics`
-  counts the interruptions and the released tasks, and the wall time shows how much the
-  interruptions added.
+  counts the released tasks, the workers that left and the interruption notices they saw, and the
+  wall time shows how much the interruptions added.
 - **Spot vs on-demand.** `aegc cost` for the same sweep both ways, and what FIS itself costs
   ($0.10 per action-minute).
 
@@ -27,12 +27,16 @@ sequenceDiagram
     You->>Q: 200 tasks (via Globus Compute and the endpoint)
     W->>Q: claim 2 tasks
     You->>FIS: start experiment (after 40 results)
-    FIS->>W: Spot interruption notice (2 minutes)
+    FIS->>W: rebalance recommendation
+    ASG->>ASG: launch replacement Spot workers (capacity rebalancing)
+    alt replaced before the notice (most workers)
+        ASG->>W: terminate
+    else still running at the notice
+        FIS->>W: Spot interruption notice (2 minutes)
+    end
     W->>Q: release both tasks (visible again at once)
     W->>W: exit
-    ASG->>ASG: launch replacement Spot workers
     Note over Q: other workers claim the released tasks
-    FIS->>W: interrupt (instance terminated)
     Q-->>You: all 200 results
 ```
 
@@ -51,9 +55,9 @@ sequenceDiagram
 export AWS_DEFAULT_REGION=us-west-2
 ```
 
-**Cost.** Each run is about 2.5 vCPU-hours of work (200 tasks of 30 to 60 s) on up to sixteen
-2-vCPU Spot workers, plus each worker's boot and 5 idle minutes: roughly $0.10 to $0.20 per run
-on Spot. FIS charges $0.10 per action-minute, and the interruption action lasts about 2 minutes,
+**Cost.** Each run is about 3.2 vCPU-hours of work (200 tasks of about a minute each) on up to
+sixteen 2-vCPU Spot workers, plus each worker's boot and 5 idle minutes: roughly $0.10 to $0.20
+per run on Spot (the live run's two runs cost $0.23 together). FIS charges $0.10 per action-minute, and the interruption action lasts about 2 minutes,
 so about $0.20 per experiment. The optional on-demand run costs roughly twice the Spot run.
 
 ## Steps
@@ -100,7 +104,8 @@ ran and how many ran more than once. Note the wall time.
 
 Wait until the pool is back to zero (`aegc status sweep`, about 5 minutes after the last task),
 then read this run's cost. `--since` counts back from now, so give it the minutes since the run
-started (the script prints the start time):
+started (the script prints the start time). Or go straight on to step 5 and read both runs' cost
+together at the end, as the live run did:
 
 ```sh
 aegc cost sweep --since 15m --by type
@@ -133,18 +138,26 @@ python examples/spot-sweep/run_sweep.py --endpoint $ENDPOINT_ID \
 ```
 
 Once 40 results are in (`--fis-after`), the script starts the experiment. FIS picks half the
-running workers and sends each a Spot interruption notice; two minutes later it interrupts them.
-Watch the workers react in another terminal:
+running workers and sends each a rebalance recommendation first, then a Spot interruption notice;
+two minutes after the notice it interrupts them. Watch the workers react in another terminal:
 
 ```sh
 aws logs tail /aegc/sweep --follow --filter-pattern '"releasing in-flight"'
 ```
 
-Each interrupted worker logs `interruption: releasing in-flight tasks and exiting`, makes its
-tasks visible in the queue again, and leaves. The pool has capacity rebalancing on, so Auto
-Scaling launches replacements, and the engine keeps scaling from the queue's depth. At the end
-the script compares all 200 answers with the baseline, waits for the experiment to finish, and
-prints which instances it interrupted.
+The pool has capacity rebalancing on, so on the rebalance recommendation Auto Scaling launches a
+replacement for each worker and then terminates the old one. A worker only logs the
+recommendation (`rebalance recommendation: Auto Scaling will replace this instance`) and keeps
+working until that termination, when it logs `lifecycle-terminating: releasing in-flight tasks and
+exiting`. One still running when the interruption notice arrives logs `interruption: releasing
+in-flight tasks and exiting` instead. Either way it makes its tasks visible in the queue again and
+leaves, and the engine keeps scaling from the queue's depth. At the end the script compares all
+200 answers with the baseline, waits for the experiment to finish, and prints which instances it
+interrupted.
+
+If you want the interrupted run's wall time to compare with the baseline's, start it from zero
+workers too (wait for `aegc status sweep` to show none). The live run started it on the workers
+the baseline had left running.
 
 Wait for zero workers again and read the cost, as in step 4.
 
@@ -196,8 +209,9 @@ def collatz_chunk(index, size):
     }
 ```
 
-With the default `--size 5000000`, a task takes 25 to 40 s on an Apple M-series laptop; later
-chunks hold bigger numbers with longer chains, so they take longer. The experiment template, from
+With the default `--size 5000000`, a task takes 25 to 40 s on an Apple M-series laptop and
+about a minute on a 2-vCPU Graviton worker running two at a time (58 s on average in the live
+run); later chunks hold bigger numbers with longer chains, so they take longer. The experiment template, from
 [fis.py](../../examples/spot-sweep/fis.py):
 
 ```python
@@ -243,19 +257,34 @@ def template_request(
 on workers, without calling AWS.
 
 !!! abstract "Results"
-    Measured on TODO(live) (date), 200 tasks, `--size 5000000`, pool `plain:max_vcpus=32,vcpu=2`.
+    Measured on 2026-11-23 in us-west-2, 200 tasks, `--size 5000000`, pool
+    `plain:max_vcpus=32,vcpu=2`. The optional on-demand run (step 7) wasn't part of it.
 
-    | Measure | Undisturbed (Spot) | With FIS (Spot) | On demand |
-    |---|---|---|---|
-    | Tasks completed, answers matching | TODO(live)/200 | TODO(live)/200, TODO(live) | TODO(live)/200 |
-    | Wall time | TODO(live) min | TODO(live) min | TODO(live) min |
-    | Time added by the interruptions | | TODO(live) min | |
-    | Workers interrupted (FIS) | | TODO(live) of TODO(live) | |
-    | `Interruptions` / `Releases` (`aegc metrics`) | 0 / 0 | TODO(live) / TODO(live) | 0 / 0 |
-    | Tasks that ran more than once (`--provenance`) | TODO(live) | TODO(live) | TODO(live) |
-    | Task time, avg / max | TODO(live) s / TODO(live) s | TODO(live) s / TODO(live) s | TODO(live) s / TODO(live) s |
-    | Cost (`aegc cost`) | $TODO(live) | $TODO(live) | $TODO(live) |
-    | FIS | | $TODO(live) (TODO(live) action-minutes) | |
+    | Measure | Undisturbed (Spot) | With FIS (Spot) |
+    |---|---|---|
+    | Tasks completed, answers matching | 200/200 | 200/200, all matching the undisturbed run |
+    | Wall time | 446 s (7.4 min) | 427 s (7.1 min) |
+    | Experiment started | | 99 s into the run |
+    | Instances interrupted (FIS) | | 8 |
+    | Tasks that ran more than once (`--provenance`) | 0 | 16 |
+    | `aegc metrics`: releases / worker exits / interruptions | | 16 / 8 / 2 |
+    | Workers | Spot, 6 instance types | |
+    | Task time, average | 58.3 s | |
+    | Cost (`aegc cost`) | $0.2313 for both runs (5.37 instance-hours, Spot), about $0.12 a run | |
+    | FIS | | about $0.20 (one action of about 2 minutes) |
+
+**What the run showed.** Every task came back, and all 200 answers matched the undisturbed run.
+FIS chose 8 workers. Each had two tasks running, so 16 tasks were handed back and ran again
+elsewhere: `Releases` 16 and `WorkerExit` 8 in `aegc metrics`. Only 2 `Interruptions`, though:
+FIS sends the rebalance recommendation first, and Auto Scaling replaced most of the 8 workers on
+it, so they released their tasks and left before any interruption notice reached them. Only 2
+were still there to see one. `Interruptions` counts notices seen, not instances lost; `Releases`
+and `WorkerExit` tell you what an interruption cost.
+
+The interrupted run wasn't slower: it took 19 s less than the baseline. It started on the
+workers the baseline had left warm, so no task waited for a worker to boot, and that saved more
+than the 16 reruns cost. To measure the time interruptions add, start both runs from zero
+workers.
 
 ## What to look at
 
@@ -267,8 +296,10 @@ aegc status sweep                 # workers by type and the last scaling activit
 
 A task that was running on an interrupted worker has two `task_finished` lines: one marked
 `(released: not reported)` on the interrupted instance, and the one that posted the result on
-another. `aegc metrics` counts each interruption notice under `Interruptions` and each task handed
-back under `Releases`. See [Watch tasks](../how-to/observability.md).
+another. `aegc metrics` counts each task handed back under `Releases`, each worker that left
+under `WorkerExit`, and each Spot interruption notice a worker saw under `Interruptions`. A
+worker that Auto Scaling replaced on the rebalance recommendation shows up under the first two
+only. See [Watch tasks](../how-to/observability.md).
 
 ## Teardown
 

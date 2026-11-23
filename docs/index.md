@@ -28,7 +28,8 @@ flowchart LR
 
 - **Every connection is outbound.** The endpoint talks to Globus over AMQPS and to AWS APIs over
   HTTPS. Workers talk to AWS APIs. Nothing connects in to the laptop, and the workers' security group
-  has no ingress rules.
+  has no ingress rules. The endpoint can also
+  [run in the cloud](how-to/cloud-endpoint.md), on a small instance with the same endpoint id.
 - **Containers on stock AMIs.** Worker images are thin layers over any arm64 image with Python
   3.11 or later, such as the environments from [aarch.science](https://aarch.science/) and
   [aarch.bio](https://aarch.bio/) or your own, with `globus-compute-endpoint` and the aegc worker
@@ -42,12 +43,13 @@ It replaces the HTEX-based setup from
 submit host, which needs tunnels or exposed ports.
 
 !!! note "Status"
-    An early 0.x release: v0.3.0 adds bring-your-own images, several Python minors per env,
-    data-access grants, `aegc.outputs` and size classes to v0.2.0's spend limits, `aegc stop`,
-    lease and cost ledger. These pages describe the main branch, which adds
-    [task isolation](concepts/security.md#task-isolation),
+    An early 0.x release: v0.4.0 adds [task isolation](concepts/security.md#task-isolation),
     [logs, metrics and provenance](how-to/observability.md), and
-    [Globus Flows and Timers](how-to/flows.md) (not yet released). Expect more changes before
+    [Globus Flows and Timers](how-to/flows.md) to v0.3.0's bring-your-own images, grants and size
+    classes. These pages describe the main branch, which adds a
+    [cloud-hosted endpoint](how-to/cloud-endpoint.md) with an offline alarm and cloud-side spend
+    checks, [other regions](how-to/operations.md#other-regions) and the
+    [tutorials](tutorials/index.md) (not yet released). Expect more changes before
     later 0.x versions.
     Work is tracked in the repository's
     [issues](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues) and

@@ -2,7 +2,9 @@
 
 With no tasks, an aegc deployment has no running instances. You pay for workers while they run,
 plus small amounts for storage and API requests. There is no NAT gateway, load balancer or
-always-on instance.
+always-on instance, unless you choose to
+[run the endpoint in the cloud](../how-to/cloud-endpoint.md): one small on-demand instance, about
+$12 a month.
 
 !!! note "Example prices"
     The figures below were read from the AWS Price List and Spot price history APIs for **us-west-2
@@ -22,6 +24,7 @@ always-on instance.
 | CloudWatch Logs | Worker logs, kept 14 days. **Your tasks' stdout and stderr go here too**, so a chatty task costs more than aegc's own few lines per task | $0.50 per GB ingested |
 | CloudWatch metrics | The workers' [metrics](../how-to/observability.md#metrics) in namespace `aegc`: up to 16 per pool and 9 per deployment, each billed only for the hours it gets data. Auto Scaling group metrics are free. `aegc metrics` reads 23 metrics per pool | $0.30 per metric-month, prorated by the hour; GetMetricData $0.01 per 1,000 metrics read |
 | Data transfer | Task and result bytes between your machine and AWS | Internet data transfer out applies to results; traffic between workers and S3, SQS and ECR in the region is free |
+| [Cloud endpoint](../how-to/cloud-endpoint.md#cost) (optional) | All the time, from `aegc endpoint deploy` until `undeploy` or `destroy`; **not counted by `aegc cost` or the spend limits** | `t4g.micro` on demand $0.0084 per hour, plus its IPv4 address and 30 GiB gp3 volume: about $12 a month; the secret, alarm and metric add under $1 |
 
 The cost ledger adds one small S3 object per worker, rewritten every 5 minutes (about $0.00006 per
 worker-hour in PUT requests). SSM parameters are standard-tier. Auto Scaling, the Price List API,
@@ -92,7 +95,9 @@ aegc limits e2e                             # show them
 The limits live in the deployment's manifest and are kept across redeploys. Running endpoints pick
 up a change within a minute. `aegc deploy` prints a note when a deployment has no limit.
 
-Limits are enforced in two steps, both by the engine in each running endpoint process.
+Limits are enforced in two steps, both by the engine in each running endpoint process. A
+[cloud endpoint](../how-to/cloud-endpoint.md#the-evaluator) also checks for the second, the cap,
+every 5 minutes, whether or not a task is running.
 
 **Admission, before scaling out.** Each time the scaler wants more capacity, it works out how much
 the deployment may still spend: for each dollar limit, the headroom (the limit minus what's spent
@@ -143,8 +148,11 @@ expire meanwhile.
   every 5 minutes, so a cap trips up to about 10 minutes after the limit is reached. With
   `--on-cap fail`, running tasks then finish, which can take up to their walltime. Auto Scaling can
   also launch an instance larger than the vCPUs asked for. Use `--on-cap kill` for a firmer limit.
-- **They need a running endpoint.** Only engines check spend, and the engine that trips a cap
-  writes the state with the [operator policy](../reference/iam.md#operator)'s permissions. If that
+- **They need a running endpoint.** Only engines check spend, and a cloud endpoint's
+  `aegc evaluate`, and the engine that trips a cap writes the state with the
+  [operator policy](../reference/iam.md#operator)'s permissions. Engines run only in user endpoint
+  processes, which start when a task arrives; with a cloud endpoint, `aegc evaluate` checks every
+  5 minutes even when none is running. If that
   write is denied, the engine still keeps the cap for its own tasks, but workers don't see it. With no endpoint running nothing scales
   out, but workers kept by `min_vcpus` keep running until the lease expires (48 hours by default; see
   [Architecture](architecture.md#lease-and-ttl)).
@@ -204,6 +212,9 @@ is active, its data lags by up to a day, and each request costs $0.01.
   cleanly, and the shutdown after a clean exit), and instances whose worker never started at all.
 - Price changes: past usage is priced at the current Spot price, not the one in effect at the time.
 - SQS, S3, ECR, CloudWatch Logs, data transfer, and Cost Explorer requests.
+- A [cloud endpoint](../how-to/cloud-endpoint.md#cost)'s host, secret, alarm and metric: the
+  ledger records workers only. `--actual` includes the host's instance and volume, which are
+  tagged with the deployment.
 - Discounts, credits, Savings Plans and taxes.
 
 ## Cost Explorer and cost allocation tags

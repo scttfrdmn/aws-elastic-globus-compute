@@ -1,6 +1,6 @@
 # CLI
 
-`aegc` manages AWS resources, worker images and the local endpoint. `aegc-worker` runs inside worker
+`aegc` manages AWS resources, worker images and the endpoint, on your machine or in the cloud. `aegc-worker` runs inside worker
 images. Both are installed with the package (`uv pip install -e '.[cli]'` from the source tree).
 
 ```
@@ -39,7 +39,8 @@ Each prints a report, one line per resource, with an outcome: `created`, `exists
 | [`provenance`](#aegc-provenance) | Where and how a task ran: image, instance, timings, estimated cost |
 | [`reap`](#aegc-reap) | Delete idle result queues of finished endpoint processes |
 | [`iam-policy`](#aegc-iam-policy) | Print an IAM policy document for one of aegc's roles |
-| [`endpoint`](#aegc-endpoint) | Run a Globus Compute endpoint with `AWSEngine` in Docker |
+| [`endpoint`](#aegc-endpoint) | Run a Globus Compute endpoint with `AWSEngine` in Docker, or deploy it to EC2 |
+| [`evaluate`](#aegc-evaluate) | Spend limits, lease, liveness and idle result queues, without an engine (the cloud endpoint runs it every 5 minutes) |
 
 ## aegc bootstrap
 
@@ -72,8 +73,8 @@ worker image repositories or image records.
 
 ```
 aegc image build --env ENV (--base-tag BASE_TAG | --base REF) [--source {aarchsci,aarchbio}]
-                 [--python PATH] [--gce-version GCE_VERSION] [--no-push] [--direct]
-                 [--project-dir PROJECT_DIR]
+                 [--allow-change PACKAGE ...] [--python PATH] [--gce-version GCE_VERSION]
+                 [--no-push] [--direct] [--project-dir PROJECT_DIR]
 ```
 
 Build, test, push and record a worker image for an environment, from an aarchsci env or aarchbio
@@ -86,6 +87,7 @@ tool (`--base-tag`) or from any `linux/arm64` image (`--base`). Give exactly one
 | `--base-tag BASE_TAG` | | Immutable aarchsci/aarchbio tag, e.g. `2026.11.13.154112`; `latest` is refused |
 | `--base REF` | | Any `linux/arm64` image with Python 3.11 or later, e.g. `python:3.13-slim@sha256:...`; not `latest` or untagged. aegc builds from the image the tag points to now |
 | `--source` | `aarchsci` | With `--base-tag`: `aarchsci` or `aarchbio` |
+| `--allow-change PACKAGE` | `click` only | Let installing aegc and `globus-compute-endpoint` change this package of the base (repeatable), for example `python-dateutil` when the base's is newer than botocore accepts. `click` may always change |
 | `--python PATH` | `python3` | With a non-conda `--base`: the base's Python |
 | `--gce-version` | `4.21.0` | `globus-compute-endpoint` version |
 | `--no-push` | off | Build and test locally only; record nothing |
@@ -95,8 +97,10 @@ tool (`--base-tag`) or from any `linux/arm64` image (`--base`). Give exactly one
 A `--base` in the `mambaorg/micromamba` layout is built with
 [templates/worker/Dockerfile](../../src/aegc/templates/worker/Dockerfile), like aarchsci; any
 other with [templates/worker/Dockerfile.pip](../../src/aegc/templates/worker/Dockerfile.pip).
-The base must be arm64 and have `sh`. Builds are identified by the base's image id, so a moved
-tag builds anew. The image is recorded under its Python minor, replacing only that minor's
+The base must be arm64 and have `sh`. Every package of the base must stay as it is, except
+`click` and those named with `--allow-change`: the conda build fails if one changes, and the pip
+step installs with the base's other packages as constraints. Builds are identified by the base's
+image id, so a moved tag builds anew. The image is recorded under its Python minor, replacing only that minor's
 record. Prints the pinned image (`<registry>/aegc/<env>@sha256:…`), or the local tag with
 `--no-push`.
 
@@ -367,7 +371,8 @@ from images built before aegc 0.4 don't write them)`. See
 aegc reap DEPLOYMENT [--yes]
 ```
 
-Delete the deployment's result queues that are empty and haven't been modified for 14 days.
+Delete the deployment's result queues that are empty and haven't been modified for 14 days. A
+[cloud endpoint](../how-to/cloud-endpoint.md) does this every 5 minutes through `aegc evaluate`.
 
 | Option | Meaning |
 |---|---|
@@ -376,7 +381,8 @@ Delete the deployment's result queues that are empty and haven't been modified f
 ## aegc iam-policy
 
 ```
-aegc iam-policy {worker,operator,deployer,bootstrap,builder} [--deployment DEPLOYMENT] [--account ACCOUNT]
+aegc iam-policy {worker,operator,deployer,bootstrap,builder,task,endpoint,endpoint-deployer}
+                [--deployment DEPLOYMENT] [--account ACCOUNT]
 ```
 
 Print an IAM policy document as JSON. See [IAM policies](iam.md).
@@ -388,7 +394,10 @@ Print an IAM policy document as JSON. See [IAM policies](iam.md).
 | `deployer` | | `aegc deploy`, `destroy`, `stop`, `resume`, `reap` and `footprint` |
 | `bootstrap` | | `aegc bootstrap` and `unbootstrap` |
 | `builder` | | `aegc image build`, `register`, `list` and `forget` |
-| `--deployment` | `default` | Deployment name (worker, operator) |
+| `task` | | `aegc-task` on the task role, besides the grants |
+| `endpoint` | | `aegc-endpoint` on the cloud endpoint host's role |
+| `endpoint-deployer` | | `aegc endpoint deploy`, `undeploy` and `status`, with the deployer policy |
+| `--deployment` | `default` | Deployment name (worker, operator, task, endpoint) |
 | `--account` | the caller's | AWS account id |
 
 With both `--region` and `--account` given, it makes no AWS calls.
@@ -396,12 +405,15 @@ With both `--region` and `--account` given, it makes no AWS calls.
 ## aegc endpoint
 
 ```
-aegc endpoint {build,login,configure,start,stop,logs,test,id}
+aegc endpoint {build,login,configure,start,stop,logs,test,id,deploy,undeploy,status}
               [--name NAME] [--deployment DEPLOYMENT] [--env ENV] [-n N]
               [--allow-function ID ...] [--project-dir PROJECT_DIR] [--python PYTHON]
+              [--instance-type TYPE] [--alarm-email ADDRESS] [--image IMAGE]
+              [--stop-local] [--session-manager] [--dry-run] [--yes]
 ```
 
-Run a Globus Compute endpoint with `AWSEngine` in Docker.
+Run a Globus Compute endpoint with `AWSEngine` in Docker, or deploy it to EC2 (`deploy`,
+`undeploy`, `status`; see [Run the endpoint in the cloud](../how-to/cloud-endpoint.md)).
 
 | Subcommand | What it does |
 |---|---|
@@ -413,16 +425,26 @@ Run a Globus Compute endpoint with `AWSEngine` in Docker.
 | `logs` | Follow the container's log |
 | `test` | Submit a probe task and `-n` squares from inside the container |
 | `id` | Print the endpoint id |
+| `deploy` | Run the endpoint `--name` on an EC2 instance for `--deployment`, with the same endpoint id, as your Globus login; needs `--env`. Builds and pushes the endpoint image (`aegc/endpoint`, `linux/arm64`) unless `--image`, stores the login in the secret `aegc-<d>-endpoint`, and creates or updates the host's role, launch template, Auto Scaling group of one and offline alarm. Refuses while the local endpoint runs, unless `--stop-local` |
+| `undeploy` | Remove the deployment's cloud endpoint: its group, launch template, alarm and topic, the image's `inuse-` tag, role and instance profile, and secret (dry run unless `--yes`) |
+| `status` | The cloud endpoint's instance and its state, the endpoint's name and id, and the offline alarm's state |
 
 | Option | Default | Meaning |
 |---|---|---|
 | `--name` | `aegc` | Globus Compute endpoint name |
-| `--deployment` | `default` | aegc deployment the engine uses (configure) |
-| `--env` | | Default science environment (configure); env to test (test) |
+| `--deployment` | `default` | aegc deployment the engine uses (configure, deploy, undeploy, status) |
+| `--env` | | Default science environment (configure, deploy); env to test (test) |
 | `-n` | 10 | Tasks to submit (test) |
-| `--allow-function ID` | | Only these registered function ids may run (configure); repeatable. `none` removes the list, so any function may run; without the option, `configure` leaves the list as it is. Globus refuses other functions with `403 FUNCTION_NOT_PERMITTED` once the endpoint restarts. See [Allow only your functions](../how-to/flows.md#allow-only-your-functions) |
-| `--project-dir` | `.` | aegc source tree (build) |
-| `--python` | `3.14` | Python in the endpoint image; `test` submits with it (build) |
+| `--allow-function ID` | | Only these registered function ids may run (configure, deploy); repeatable. `none` removes the list, so any function may run; without the option, `configure` leaves the list as it is, and `deploy` uses the local endpoint's list. Globus refuses other functions with `403 FUNCTION_NOT_PERMITTED` once the endpoint restarts. See [Allow only your functions](../how-to/flows.md#allow-only-your-functions) |
+| `--project-dir` | `.` | aegc source tree (build, deploy) |
+| `--python` | `3.14` | Python in the endpoint image (build, deploy); `test` submits with it |
+| `--instance-type` | `t4g.micro` | The cloud endpoint's instance type, Graviton (deploy) |
+| `--alarm-email` | | Email this address through SNS when the cloud endpoint goes offline and when it's back (deploy). A redeploy without it keeps the existing subscriptions |
+| `--image` | | An endpoint image in `aegc/endpoint`, pinned by digest, instead of building one (deploy) |
+| `--stop-local` | off | Stop the local endpoint first if it's running (deploy) |
+| `--session-manager` | off | Allow Session Manager shells on the host; whoever may `ssm:StartSession` there gets root, and with it your stored Globus login (deploy) |
+| `--dry-run` | off | Report what would change; stop, build and write nothing (deploy) |
+| `--yes` | off | Actually remove the cloud endpoint (undeploy; default: dry run) |
 
 The container mounts `~/.aws` read-only and gets `AWS_PROFILE` (from `--profile` or the
 environment), `AWS_REGION` and `AWS_DEFAULT_REGION`.
@@ -431,6 +453,44 @@ environment), `AWS_REGION` and `AWS_DEFAULT_REGION`.
 and prints `allowed functions: <ids>; restart the endpoint (stop, start) for Globus to enforce it`.
 A value that isn't a UUID fails with
 `aegc: --allow-function takes function ids (UUIDs), or none to allow any`.
+
+`deploy` needs the deployer and [endpoint-deployer](iam.md#endpoint-deployer) policies, and the
+builder policy to push the image; `undeploy` and `status` need the first two. Its errors:
+
+- `aegc: endpoint deploy needs --env (the default science environment)`.
+- `aegc: no deployment '<d>' in <region>; `aegc deploy <d> ...` first`.
+- `aegc: the local endpoint <name> is running (aegc-endpoint-<name>); one endpoint id can run in
+  one place. Stop it, or pass --stop-local`.
+- `endpoint <name> (<id>) is already the cloud endpoint of deployment <d2>; one endpoint id can
+  run in one place (`aegc endpoint undeploy` it there first)`.
+- `endpoint image must be pinned by digest, got '...'`, or `image '...' isn't in aegc's repository
+  aegc/endpoint`, for an `--image` that isn't `<registry>/aegc/endpoint@sha256:...`.
+
+## aegc evaluate
+
+```
+aegc evaluate DEPLOYMENT [--endpoint-id ENDPOINT_ID] [--dry-run]
+```
+
+One pass of the checks that don't need an engine. The [cloud endpoint](../how-to/cloud-endpoint.md#the-evaluator)
+runs it every 5 minutes; you can run it yourself, for example as a dry run with operator
+credentials:
+
+1. With `--endpoint-id`, ask Globus whether the endpoint is online (with this machine's Globus
+   Compute login) and, on the cloud endpoint, publish the `EndpointOnline` metric.
+2. If the deployment is running and has spend limits, check spend and trip a cap like an engine
+   would (state `capped`, `by: evaluator`, group minimums to 0).
+3. Renew the lease (hourly), only while Globus reports the endpoint online.
+4. Delete result queues that are empty and idle for 14 days, as `aegc reap --yes` does.
+
+| Option | Meaning |
+|---|---|
+| `--endpoint-id` | The endpoint to check with Globus; without it, no liveness check and no lease renewal |
+| `--dry-run` | Change nothing and publish nothing; the report says `would cap it`, `would renew the lease` or `would delete idle result queue` |
+
+It prints its report on stderr, for example `evaluate e2e: endpoint online, state running`, with
+one line per action and `error:` lines for steps that failed, and exits 1 if any did. The metric
+is published only when the environment has `AEGC_METRIC_TOKEN` (the cloud endpoint's token).
 
 ## aegc-worker
 

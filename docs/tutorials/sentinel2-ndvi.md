@@ -82,8 +82,12 @@ aegc image list --env earth-observation    # one line, for Python 3.14
 ```
 
 `--allow-change python-dateutil` lets the build downgrade one package of the base: this image
-ships python-dateutil 4.0, and botocore (which aegc needs) accepts only versions below 3. Every
-other package of the base stays exactly as it is.
+ships python-dateutil 4.0, and botocore (which aegc needs) accepts only versions below 3. Without
+it the build stops, because aegc never changes a base's packages unless told to. With it, that
+package is left out of the constraints the install runs under, so pip can pick a version botocore
+accepts. Every other package of the base stays exactly as it is, apart from `click`, which aegc
+always lets `globus-compute-endpoint` change. See
+[`image build`](../reference/cli.md#aegc-image-build).
 
 ### 2. Deploy a pool with a write grant
 
@@ -115,7 +119,7 @@ python examples/sentinel2-ndvi/run_ndvi.py --endpoint $ENDPOINT_ID
 The script submits `ndvi_latest` for a 9 km × 11 km area in California's Central Valley
 (`--bbox W S E N` for another one), waits for the result, prints it with the wall time and where
 the task ran, and downloads the NDVI GeoTIFF into the current directory. The first run includes
-a cold start: a worker boots and pulls the image.
+a cold start: a worker boots and pulls the image, about 35 s in the live run.
 
 In a notebook, the same thing is a cell (start Jupyter from the aegc `.venv` with
 `uv pip install jupyterlab && jupyter lab`, from the source tree's root):
@@ -268,24 +272,30 @@ Points to know:
   them.
 - **`bytes_read`** comes from the task process's `rchar` counter in `/proc/self/io`, so it's
   approximate: it includes TLS overhead and any small local files read during the window reads.
+  It needs a worker image built with this version of aegc: on older isolated workers, a task
+  couldn't read its own `/proc/self` files, and `bytes_read` came back `null`.
 
 !!! abstract "Results (part 1)"
-    Measured on TODO(live) (date), worker image `earth-observation` 2026.11.21.153534.
+    Measured on 2026-11-23, worker image `earth-observation` 2026.11.21.153534 (built with
+    `--allow-change python-dateutil`).
 
     | Measure | Value |
     |---|---|
-    | Scene | TODO(live) (item id, cloud cover) |
-    | Window | TODO(live) pixels, valid fraction TODO(live) |
-    | Bytes read (red, NIR, SCL windows) | TODO(live) MB |
-    | Full size of those three assets | TODO(live) MB (`asset_bytes`) |
-    | Share read | TODO(live) % |
-    | NDVI GeoTIFF written | TODO(live) MB |
-    | Wall time, cold (no workers) | TODO(live) s |
-    | Wall time, warm (second run within 5 minutes) | TODO(live) s |
-    | In-task time (`exec_s`) | TODO(live) s |
-    | Instance | TODO(live) (type, Spot) |
-    | Cost per run (`aegc cost`, including boot and idle) | $TODO(live) |
-    | Back to zero workers after the last task | TODO(live) min |
+    | Scene | `S2B_T10SGF_20261111T184941_L2A`, cloud cover 0.14 % |
+    | Window | 1,136 × 924 pixels at 10 m |
+    | Mean NDVI | 0.3767 |
+    | Bytes read (red, NIR, SCL windows) | 1.30 MB (1,299,223 bytes) |
+    | Full size of those three assets | 463.2 MB (`asset_bytes`) |
+    | Share read | 0.28 % |
+    | NDVI GeoTIFF written | 4.8 MB |
+    | Wall time, submission to result (cold) | 39.4 s, 34.5 s of it waiting in the queue for a worker |
+    | In-task time (`exec_s`) | 2.0 s |
+    | Instance | `c9g.large`, Spot |
+    | Task's estimated cost (provenance, at the on-demand price) | $0.000026 |
+
+The task read 0.28 % of the three assets it used, and spent 2 s doing it. Almost all of the
+39 s was the cold start: a worker launching, booting and pulling the image. A second run while
+that worker is still up skips it.
 
 ## What to look at
 
@@ -335,9 +345,13 @@ aegc endpoint --deployment ndvi status
 Globus login in Secrets Manager, stops the local endpoint (`--stop-local`; one endpoint id runs in
 one place), and starts a `t4g.micro` that runs the endpoint under the same id. It takes about
 3 minutes to come online. `--alarm-email` sends you an email (confirm the SNS subscription first)
-if the endpoint goes offline. The cloud endpoint renews the deployment's lease, like a local one.
+if the endpoint goes offline. Every 5 minutes the host also checks the deployment's spend limits,
+even with no task running, and renews its lease while Globus reports the endpoint online. The
+host costs about $0.40 a day, which `aegc cost` doesn't count. See
+[Run the endpoint in the cloud](../how-to/cloud-endpoint.md).
 
-With `--allow-function`, the endpoint runs only that function id. `run_ndvi.py` registers its own
+With `--allow-function`, the endpoint runs only that function id (without it, the cloud endpoint
+keeps the local endpoint's list). `run_ndvi.py` registers its own
 copy when it submits, with an id of its own, so the endpoint refuses it (`403
 FUNCTION_NOT_PERMITTED`) from now on; use the flow, or leave out `--allow-function` while you
 experiment.
@@ -387,7 +401,9 @@ aegc cost ndvi --since 3d
 aegc metrics ndvi --since 3d
 ```
 
-!!! abstract "Results (part 2)"
+!!! abstract "Results (part 2): not yet run live"
+    The nightly part hasn't been run live yet; the values marked `TODO(live)` will come from
+    that run.
     Measured on TODO(live) (dates), over TODO(live) nights.
 
     | Measure | Value |
@@ -412,8 +428,9 @@ aegc image forget --env earth-observation --python 3.14
 rm ~/aegc-ndvi-nightly.json
 ```
 
-`destroy` also removes the cloud endpoint: its instance group, launch template, role, login secret
-and alarm. If you stopped after part 1, run `ep stop` before `destroy`. The ECR repository
+`destroy` also removes the cloud endpoint: its instance group, launch template, role, login
+secret, alarm and alarm topic (the last three need the endpoint-deployer policy; see
+[Remove it](../how-to/cloud-endpoint.md#move-back-or-remove-it)). If you stopped after part 1, run `ep stop` before `destroy`. The ECR repository
 `aegc/earth-observation` stays after `image forget`, and its lifecycle policy expires old
 images; delete it with `aws ecr delete-repository --repository-name aegc/earth-observation --force`
 if you're done with it. Delete the bucket too if you made it for this.

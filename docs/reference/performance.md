@@ -3,8 +3,8 @@
 Results from the live Globus Compute end-to-end run on 2026-11-14 in us-west-2
 ([#15](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/15)). They come from one
 deployment on one day; Spot capacity, instance types and image size all change the numbers.
-Later runs, for [v0.2](#v02-live-run-2026-11-15), [v0.3](#v03-live-run-2026-11-15) and
-[v0.4](#v04-live-run-2026-11-16), are at the end.
+Later runs, for [v0.2](#v02-live-run-2026-11-15), [v0.3](#v03-live-run-2026-11-15),
+[v0.4](#v04-live-run-2026-11-16) and [v0.6](#v06-live-run-2026-11-23), are at the end.
 
 ## Setup
 
@@ -137,3 +137,45 @@ test bucket, and Globus Flows with the Compute action provider v3.
   dropped as if released, with its message hidden for the full visibility timeout (300 s). A task
   that finishes while its worker stops now posts its result, and anything still claimed when the
   worker exits goes back to the queue at once.
+
+## v0.6 live run (2026-11-23)
+
+The [cloud endpoint](../how-to/cloud-endpoint.md), its evaluator and offline alarm, a second
+region, and three of the [tutorials](../tutorials/index.md). Deployment `v06` in us-west-2 with a
+`t4g.micro` cloud endpoint, a us-east-1 deployment for the 1000 Genomes slice, Spot Graviton
+workers from images built with this version.
+
+| Check | Result |
+|---|---|
+| Cloud endpoint | `aegc endpoint deploy --stop-local` moved a laptop endpoint to EC2 with the **same endpoint id**, running as the user's Globus login from Secrets Manager. With the laptop endpoint stopped, a task from the SDK ran on an isolated worker and came back in **40 s** |
+| Host replacement | terminating the host: the group replaced it with the same endpoint id, and the new user endpoint process **recovered a result** the old host had left in the result queue |
+| Evaluator, cap without an engine | a $0.0001/day limit, with no user endpoint process running (a freshly replaced host has none until a task arrives): the first `aegc evaluate` pass tripped it, state `capped`, `by: evaluator`, `$0.0087 of $0.0001/day`, group minimums to 0 |
+| Evaluator, lease | renewed only while Globus reported the endpoint online |
+| Offline alarm | `EndpointOnline` arrived every 5 minutes. With the host scaled to 0, the alarm went to `ALARM` ("no datapoints were received for 3 periods ... treated as Breaching") about **25 minutes** after the last datapoint. Email delivery wasn't checked (the subscription was left unconfirmed) |
+| `destroy --yes` with a cloud endpoint | removed the group, launch template, role, secret, alarm and topic, and verified |
+| us-east-1 bootstrap | created the payload bucket without a location, then tagged it |
+| us-east-1 deploy | `skipped  subnet ... (us-east-1e, use1-az3)`: the zone offers no Graviton |
+| [1000 Genomes slice](../tutorials/genomics-slice.md) (us-east-1) | a 696.3 MiB slice of the 26.0 GiB chr22 VCF (2.61 %), 49,943 records; 335.7 KiB to the laptop; bcftools 145.2 s; **195.3 s** from submission to result, about 40 s of it the cold start; `c7g.large` Spot in us-east-1f; $0.0062 (0.13 instance-hours) |
+| [Spot sweep](../tutorials/spot-sweep.md) under FIS | 200 tasks in 446 s undisturbed (Spot, 6 instance types, average task 58.3 s) and in 427 s with FIS interrupting 8 workers 99 s in; 16 tasks reran and all 200 answers matched; `aegc metrics`: releases 16, worker exits 8, interruptions 2 (FIS sends a rebalance recommendation first, and Auto Scaling replaced most of the 8 before the notice); $0.2313 for both runs (5.37 instance-hours) |
+| [Sentinel-2 NDVI](../tutorials/sentinel2-ndvi.md), part 1 | 1.30 MB read of the scene's 463.2 MB red, NIR and SCL assets (0.28 %); a 4.8 MB NDVI GeoTIFF; 2.0 s in the task, **39.4 s** from submission to result (34.5 s waiting for a cold worker); `c9g.large` Spot |
+
+The cold starts, 35 to 40 s from zero workers to a running task, are in line with earlier runs
+(35 to 46 s). The cloud endpoint checks ran before the review fixes in the
+[changelog](../../CHANGELOG.md) (the liveness metric was still EMF rather than PutMetricData with
+a token, and Session Manager was always on); the alarm's settings are the same. The NDVI tutorial's nightly part and
+[One flow, two endpoints](../tutorials/two-endpoints.md) haven't been run live yet.
+
+**Found and fixed during the run:**
+- The host wrote the endpoint id (`endpoint.json`) before configuring the endpoint, so configure
+  thought the endpoint existed, skipped it, and `config.yaml` was never written. The id is now
+  written after configure.
+- User endpoint processes, where `AWSEngine` runs, log to files that didn't reach CloudWatch. The
+  endpoint container now copies them to its console, prefixed `[uep]`.
+- The host needed a shell for debugging without SSH; Session Manager is now available, opt-in with
+  `--session-manager`.
+- The earth-observation image ships python-dateutil 4.0, which botocore doesn't accept, and the
+  pip step pinned every base package, so the build failed. `image build --allow-change` now leaves
+  the named packages out of the pip constraints too.
+- `bytes_read` came back empty on isolated workers: after `setuid` from root, Linux marks a process
+  non-dumpable, and its own `/proc/self` files belong to root. Task processes restore the flag.
+- FIS returns the interrupted instances as ARNs; the sweep script now prints their ids.
