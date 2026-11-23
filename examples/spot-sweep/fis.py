@@ -190,9 +190,9 @@ def wait_for(sess: Any, experiment_id: str, poll_s: float = 10) -> dict[str, Any
         if state["status"] in ("completed", "stopped", "failed", "cancelled"):
             took = (exp.get("endTime") or exp["startTime"]) - exp["startTime"]
             targets = fis.list_experiment_resolved_targets(experimentId=experiment_id)
-            ids = [
-                t["targetInformation"].get("resource-id", "?") for t in targets["resolvedTargets"]
-            ]
+            info = [t["targetInformation"] for t in targets["resolvedTargets"]]
+            # FIS gives each target's ARN (arn:aws:ec2:...:instance/i-...).
+            ids = [str(i.get("resource-id") or i.get("arn", "?")).rsplit("/", 1)[-1] for i in info]
             print(
                 f"{state['status']}: fis experiment {experiment_id} in {took.total_seconds():.0f} s"
                 f" ({state.get('reason', '')}); interrupted {len(ids)}: {', '.join(ids)}"
