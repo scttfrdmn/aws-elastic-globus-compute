@@ -327,3 +327,28 @@ def test_cli_deploy_dry_run_changes_nothing_and_keeps_allowed_functions(
     assert fid in scripts[-1]  # the laptop's allowed functions carry over (#57)
     with pytest.raises(SystemExit, match="no deployment 'nope'"):
         cli.main([*argv[:-4], "nope", "--env", "geo", "--stop-local", "--dry-run"])
+
+
+def test_destroy_without_endpoint_policy_still_removes_the_endpoint_role(
+    cloud: Clients, env: tuple[Clients, DeploymentSpec],
+) -> None:  # fmt: skip
+    # Docs review: with a cloud endpoint, the denied alarm lookup skipped its role and profile.
+    from botocore.exceptions import ClientError
+
+    class Denied:
+        def __getattr__(self, name: str) -> Any:
+            def call(*a: Any, **kw: Any) -> Any:
+                raise ClientError({"Error": {"Code": "AccessDenied", "Message": "no"}}, name)
+
+            return call
+
+    c = cloud
+    _, spec = env
+    deployment.deploy(c, spec)
+    endpoint_host.deploy(c, host_spec())
+    denied = replace(c, secretsmanager=Denied(), cloudwatch=Denied(), sns=Denied())
+    r = deployment.destroy(denied, deployment="dev", region=REGION, dry_run=False, wait_s=30,
+                           poll_s=0.1)  # fmt: skip
+    done = {(a.resource, a.name, a.outcome) for a in r.actions}
+    assert ("iam role", "aegc-dev-endpoint-us-west-2", "deleted") in done
+    assert ("iam instance profile", "aegc-dev-endpoint-us-west-2", "deleted") in done

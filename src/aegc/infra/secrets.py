@@ -25,8 +25,9 @@ class EndpointLogin:
     name: str  # the Globus Compute endpoint name
     endpoint_id: str
     storage_db: bytes  # ~/.globus_compute/storage.db
-    # Dimension of the EndpointOnline metric that only the endpoint host knows, so no one else
-    # (e.g. task code printing EMF into worker logs) can keep the offline alarm quiet.
+    # Dimension of the EndpointOnline metric, so task code (printing EMF into worker logs, which
+    # has no Secrets Manager access) can't keep the offline alarm quiet. It's also a tag on the
+    # secret, readable by whoever may ListSecrets.
     metric_token: str = ""
 
     def to_json(self) -> str:

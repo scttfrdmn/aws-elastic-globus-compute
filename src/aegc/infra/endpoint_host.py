@@ -288,8 +288,10 @@ def deploy(
     sg = ensure_security_group(c, ds, vpc, report, dry_run=dry_run)
     ensure_log_group(c, ds, report, dry_run=dry_run)
     if c.ecr is not None and not dry_run:  # keep the image past the repository's lifecycle
-        images.protect(c.ecr, "", spec.image, spec.deployment, report=report,
-                       repository=naming.endpoint_repository())  # fmt: skip
+        tag = images.protect(c.ecr, "", spec.image, spec.deployment, report=report,
+                             repository=naming.endpoint_repository())  # fmt: skip
+        images.release(c.ecr, "", spec.deployment, {tag}, repository=naming.endpoint_repository(),
+                       report=report)  # fmt: skip
     data = launch_template_data(spec, ami=resolve_ami(c.ssm), sg=sg, profile_arn=profile)
     before = len(report.actions)
     lt = ensure_launch_template(c, ds, None, data, report, dry_run=dry_run)
@@ -347,20 +349,29 @@ def undeploy(
             if not dry_run:
                 c.ec2.delete_launch_template(LaunchTemplateName=lt["LaunchTemplateName"])
             report.add("launch template", lt["LaunchTemplateName"], verb)
+    from aegc.awsutil import error_code
+    from aegc.infra.deployment import ACCESS_DENIED
+
     alarm = naming.endpoint_alarm(d)
-    if c.cloudwatch is not None and c.cloudwatch.describe_alarms(AlarmNames=[alarm]).get(
-        "MetricAlarms"
-    ):
-        if not dry_run:
-            c.cloudwatch.delete_alarms(AlarmNames=[alarm])
-        report.add("cloudwatch alarm", alarm, verb)
-    arn = _topic_arn(c, d)
-    if arn:
-        tags = naming.tag_dict(c.sns.list_tags_for_resource(ResourceArn=arn).get("Tags"))
-        if naming.is_owned(naming.endpoint_topic(d), tags, d):
+    try:  # the alarm and topic need the endpoint-deployer policy; the rest doesn't
+        if c.cloudwatch is not None and c.cloudwatch.describe_alarms(AlarmNames=[alarm]).get(
+            "MetricAlarms"
+        ):
             if not dry_run:
-                c.sns.delete_topic(TopicArn=arn)
-            report.add("sns topic", naming.endpoint_topic(d), verb)
+                c.cloudwatch.delete_alarms(AlarmNames=[alarm])
+            report.add("cloudwatch alarm", alarm, verb)
+        arn = _topic_arn(c, d)
+        if arn:
+            tags = naming.tag_dict(c.sns.list_tags_for_resource(ResourceArn=arn).get("Tags"))
+            if naming.is_owned(naming.endpoint_topic(d), tags, d):
+                if not dry_run:
+                    c.sns.delete_topic(TopicArn=arn)
+                report.add("sns topic", naming.endpoint_topic(d), verb)
+    except Exception as e:
+        if error_code(e) not in ACCESS_DENIED:
+            raise
+        report.add("cloud endpoint alarm", alarm, "kept",
+                   "not checked: needs the endpoint-deployer policy")  # fmt: skip
     if c.ecr is not None:
         from aegc import images
 

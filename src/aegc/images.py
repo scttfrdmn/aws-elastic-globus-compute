@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -101,6 +102,9 @@ class ImageSpec:
             raise ValueError(f"source must be one of {sorted(SOURCES)}")
         if bool(self.base) == bool(self.base_tag):
             raise ValueError("give either --base REF or --base-tag TAG (with --source)")
+        for pkg in self.allow_change:
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", pkg):
+                raise ValueError(f"--allow-change takes package names, not {pkg!r}")
         if self.base_tag == "latest":
             raise ValueError("pin an immutable base tag, not 'latest'")
         if self.base and not _pinned(self.base):
@@ -160,7 +164,11 @@ def image_tag(
     ``base_id`` identifies a free-form base by its image id, so a moved tag builds anew.
     """
     b = base_id or spec.base_id
-    return f"py{python_minor}-gce{spec.gce_version}-aegc{__version__}-b{b}-w{wheel_hash}"
+    tag = f"py{python_minor}-gce{spec.gce_version}-aegc{__version__}-b{b}-w{wheel_hash}"
+    if tuple(sorted(spec.allow_change)) != tuple(sorted(DEFAULT_ALLOW_CHANGE)):
+        # Different --allow-change can make a different image from the same base and code.
+        tag += "-a" + hashlib.sha256(",".join(sorted(spec.allow_change)).encode()).hexdigest()[:6]
+    return tag
 
 
 def wheel_hash(wheel_dir: Path) -> str:

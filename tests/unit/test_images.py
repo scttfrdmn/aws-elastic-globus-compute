@@ -528,3 +528,14 @@ def test_allow_change_reaches_pip_too() -> None:
     a = p.parse_args(["image", "build", "--env", "eo", "--base-tag", "2026.11.21.153534",
                       "--allow-change", "python-dateutil"])  # fmt: skip
     assert a.allow_change == ["python-dateutil"]
+
+
+def test_allow_change_names_and_tags() -> None:
+    plain = images.ImageSpec(env="eo", base_tag="2026.11.21.153534")
+    wider = images.ImageSpec(env="eo", base_tag="2026.11.21.153534",
+                             allow_change=("click", "python-dateutil"))  # fmt: skip
+    # The same base and code with a different allowlist can be a different image: its own tag.
+    assert images.image_tag("3.14", plain, "w") != images.image_tag("3.14", wider, "w")
+    assert images.image_tag("3.14", plain, "w").endswith("-ww")  # unchanged for the default
+    with pytest.raises(ValueError, match="package names"):
+        images.ImageSpec(env="eo", base_tag="1", allow_change=("click|.*",))

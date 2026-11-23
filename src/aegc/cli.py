@@ -202,23 +202,33 @@ def _endpoint(args: argparse.Namespace) -> int:
 
 def _endpoint_cloud(args: argparse.Namespace, spec: Any) -> int:
     """``aegc endpoint deploy / undeploy / status``: the cloud-hosted endpoint (#22)."""
+
+    sess, region, account = _ctx(args)
+    c = _clients(sess)
+    d = args.deployment
+    try:
+        return _endpoint_cloud_cmd(args, spec, sess, c, d, region, account)
+    except ValueError as e:  # bad input, an endpoint id used elsewhere, an oversized login...
+        raise SystemExit(f"aegc: {e}") from None
+
+
+def _endpoint_cloud_cmd(
+    args: argparse.Namespace, spec: Any, sess: Any, c: Any, d: str, region: str, account: str
+) -> int:
     from pathlib import Path
 
     from aegc import awsutil
     from aegc import endpoint as ep
     from aegc.infra import Report, endpoint_host, secrets
 
-    sess, region, account = _ctx(args)
-    c = _clients(sess)
-    d = args.deployment
     cmd = args.endpoint_command
     if cmd == "status":
         print(_endpoint_status(c, d, region))
         return 0
     if cmd == "undeploy":
         dry = not args.yes
-        r = endpoint_host.undeploy(c, d, region, dry_run=dry)  # type: ignore[arg-type]
-        secrets.delete_login(c.secretsmanager, d, r, dry_run=dry)  # type: ignore[attr-defined]
+        r = endpoint_host.undeploy(c, d, region, dry_run=dry)
+        secrets.delete_login(c.secretsmanager, d, r, dry_run=dry)
         print(r)
         if dry:
             print("dry run; pass --yes to remove the cloud endpoint")
@@ -233,7 +243,7 @@ def _endpoint_cloud(args: argparse.Namespace, spec: Any) -> int:
     if not args.env:
         raise SystemExit("aegc: endpoint deploy needs --env (the default science environment)")
     try:
-        read_manifest(c.ssm, d)  # type: ignore[attr-defined]
+        read_manifest(c.ssm, d)
     except Exception as e:
         if not awsutil.is_not_found(e):
             raise
@@ -253,7 +263,7 @@ def _endpoint_cloud(args: argparse.Namespace, spec: Any) -> int:
     allowed = spec.allowed_functions
     if allowed is None:
         allowed = ep.local_allowed_functions(spec)
-    token = secrets.metric_token(c.secretsmanager, d) or _secrets.token_urlsafe(24)  # type: ignore[attr-defined]
+    token = secrets.metric_token(c.secretsmanager, d) or _secrets.token_urlsafe(24)
     login = _replace(login, metric_token=token)
     if args.image:
         image = args.image
@@ -262,7 +272,7 @@ def _endpoint_cloud(args: argparse.Namespace, spec: Any) -> int:
     else:
         image = ep.build_push(
             Path(args.project_dir),
-            ecr=awsutil.client(sess, "ecr"),  # type: ignore[arg-type]
+            ecr=awsutil.client(sess, "ecr"),
             python=args.python,
         )
     cloud = ep.EndpointSpec(
@@ -279,26 +289,28 @@ def _endpoint_cloud(args: argparse.Namespace, spec: Any) -> int:
     role_arn = f"arn:aws:iam::{account}:role{naming.IAM_PATH}{naming.endpoint_role(d, region)}"
     before = len(report.actions)
     secrets.put_login(
-        c.secretsmanager, d, login, report, dry_run=args.dry_run,  # type: ignore[attr-defined]
+        c.secretsmanager, d, login, report, dry_run=args.dry_run,
         endpoint_role_arn=role_arn,
     )  # fmt: skip
     login_changed = report.actions[before].outcome in ("updated", "would-update")
     report.actions.extend(
-        endpoint_host.deploy(c, host, dry_run=args.dry_run, roll=login_changed).actions  # type: ignore[arg-type]
+        endpoint_host.deploy(c, host, dry_run=args.dry_run, roll=login_changed).actions
     )
     print(report)
     if not args.dry_run:
         print(
             f"cloud endpoint {spec.name} ({login.endpoint_id}) is starting on "
-            f"{args.instance_type}; `aegc endpoint status --deployment {d}` shows when it's "
-            "online (about 3 minutes)"
+            f"{args.instance_type}; it's online in about 3 minutes (`aegc endpoint status "
+            f"--deployment {d}` shows the instance, and the alarm turns OK)"
         )
     return 0
 
 
 def _endpoint_status(c: Any, d: str, region: str) -> str:
     from aegc import naming
+    from aegc.awsutil import error_code
     from aegc.infra import secrets
+    from aegc.infra.deployment import ACCESS_DENIED
 
     lines = [f"cloud endpoint of {d} ({region}):"]
     g = c.autoscaling.describe_auto_scaling_groups(
@@ -312,11 +324,20 @@ def _endpoint_status(c: Any, d: str, region: str) -> str:
         + (", ".join(f"{i['InstanceId']} {i.get('InstanceType', '')} {i['LifecycleState']}"
                      for i in inst) or "none yet")
     )  # fmt: skip
-    meta = secrets.metadata(c.secretsmanager, d)
-    lines.append(f"  endpoint: {meta['name'] or '?'} ({meta['endpoint_id'] or 'no secret'})")
-    a = c.cloudwatch.describe_alarms(AlarmNames=[naming.endpoint_alarm(d)]).get("MetricAlarms", [])
-    if a:
-        lines.append(f"  alarm {a[0]['AlarmName']}: {a[0]['StateValue']}")
+    try:
+        meta = secrets.metadata(c.secretsmanager, d)
+        lines.append(f"  endpoint: {meta['name'] or '?'} ({meta['endpoint_id'] or 'no secret'})")
+        a = c.cloudwatch.describe_alarms(AlarmNames=[naming.endpoint_alarm(d)]).get(
+            "MetricAlarms", []
+        )
+        if a:
+            state = a[0]["StateValue"]
+            meaning = {"OK": "online", "ALARM": "OFFLINE"}.get(state, "no data yet")
+            lines.append(f"  alarm {a[0]['AlarmName']}: {state} ({meaning})")
+    except Exception as e:
+        if error_code(e) not in ACCESS_DENIED:
+            raise
+        lines.append("  endpoint and alarm: not shown (needs the endpoint-deployer policy)")
     return "\n".join(lines)
 
 
@@ -338,7 +359,7 @@ def _evaluate(args: argparse.Namespace) -> int:
         endpoint_id=args.endpoint_id or "", dry_run=args.dry_run,
         metric_token=os.environ.get("AEGC_METRIC_TOKEN", ""),
     )  # fmt: skip
-    print(ev.render(), file=sys.stderr)  # stdout carries the EMF metric line
+    print(ev.render(), file=sys.stderr)
     return 1 if ev.errors else 0
 
 
@@ -1231,8 +1252,9 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("-n", type=int, default=10, help="tasks to submit (test)")
     e.add_argument(
         "--allow-function", action="append", metavar="ID",
-        help="configure: only these registered function ids may run (repeatable; 'none' allows "
-        "any). Globus refuses others with 403 once the endpoint restarts",
+        help="configure, deploy: only these registered function ids may run (repeatable; "
+        "'none' allows any; deploy keeps the local endpoint's list by default). Globus refuses "
+        "others with 403 once the endpoint (re)starts",
     )  # fmt: skip
     e.add_argument("--project-dir", default=".", help="aegc source tree (build)")
     e.add_argument(

@@ -1437,12 +1437,12 @@ def destroy(
     # everything else.
     from aegc.infra import endpoint_host, secrets
 
+    report.actions.extend(
+        endpoint_host.undeploy(
+            c, d, region, dry_run=dry_run, wait_s=wait_s, poll_s=poll_s, host=False
+        ).actions
+    )
     try:
-        report.actions.extend(
-            endpoint_host.undeploy(
-                c, d, region, dry_run=dry_run, wait_s=wait_s, poll_s=poll_s, host=False
-            ).actions
-        )
         if c.secretsmanager is not None:
             secrets.delete_login(c.secretsmanager, d, report, dry_run=dry_run)
     except Exception as e:
