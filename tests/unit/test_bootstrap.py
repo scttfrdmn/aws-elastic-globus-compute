@@ -1,7 +1,9 @@
 import json
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 
+import boto3
 import pytest
 
 from aegc import naming
@@ -122,6 +124,68 @@ def test_dry_run_creates_nothing(aws: Callable[[str], Any]) -> None:
     assert BUCKET not in [b["Name"] for b in aws("s3").list_buckets()["Buckets"]]
     ecr = aws("ecr")
     assert pull_through_rules(ecr) == {} and creation_template(ecr) is None
+
+
+def created_buckets(s3: Any) -> list[dict[str, Any]]:
+    """The parameters of each CreateBucket call on this client."""
+    calls: list[dict[str, Any]] = []
+    s3.meta.events.register(
+        "provide-client-params.s3.CreateBucket", lambda params, **_: calls.append(dict(params))
+    )
+    return calls
+
+
+def east_clients(substrate: Any) -> dict[str, Any]:
+    del substrate  # requested for its side effects (reset + env)
+    made = {
+        s: boto3.client(s, region_name="us-east-1")  # type: ignore[call-overload]
+        for s in ("s3", "ecr", "ssm", "iam")
+    }
+    return {**made, "account": ACCOUNT, "region": "us-east-1"}
+
+
+def test_bucket_in_other_regions_is_created_tagged(aws: Callable[[str], Any]) -> None:
+    c = clients(aws)
+    calls = created_buckets(c["s3"])
+    bootstrap.bootstrap(**c)
+    (call,) = calls
+    cfg = call["CreateBucketConfiguration"]
+    assert cfg["LocationConstraint"] == REGION
+    assert naming.is_owned(BUCKET, naming.tag_dict(cfg["Tags"]), naming.BOOTSTRAP)
+
+
+def test_bootstrap_in_us_east_1(substrate: Any) -> None:
+    # us-east-1 takes no LocationConstraint: CreateBucket goes without a configuration, and the
+    # bucket is tagged straight after.
+    c = east_clients(substrate)
+    calls = created_buckets(c["s3"])
+    first = outcomes(bootstrap.bootstrap(**c))
+    bucket = naming.bucket_name(ACCOUNT, "us-east-1")
+    assert bucket == f"aegc-{ACCOUNT}-us-east-1"
+    assert first[("s3 bucket", bucket)] == "created"
+    (call,) = calls
+    assert "CreateBucketConfiguration" not in call
+    tags = naming.tag_dict(c["s3"].get_bucket_tagging(Bucket=bucket)["TagSet"])
+    assert naming.is_owned(bucket, tags, naming.BOOTSTRAP)
+    assert first[("iam role", naming.ecr_template_role("us-east-1"))] == "created"
+    second = outcomes(bootstrap.bootstrap(**c))
+    assert set(second.values()) == {"exists"}
+    assert len(calls) == 1
+
+
+def test_us_east_1_bucket_is_removed_if_tagging_fails(substrate: Any) -> None:
+    c = east_clients(substrate)
+
+    def denied(**_: Any) -> tuple[Any, dict[str, Any]]:
+        error = {"Code": "AccessDenied", "Message": "no s3:PutBucketTagging"}
+        return SimpleNamespace(status_code=403, headers={}), {"Error": error}
+
+    c["s3"].meta.events.register("before-call.s3.PutBucketTagging", denied)
+    with pytest.raises(Exception, match="AccessDenied"):
+        bootstrap.bootstrap(**c)
+    bucket = naming.bucket_name(ACCOUNT, "us-east-1")
+    # Not left behind untagged, where the next run would refuse it as not aegc's.
+    assert bucket not in [b["Name"] for b in c["s3"].list_buckets()["Buckets"]]
 
 
 def test_refuses_untagged_bucket_with_our_name(aws: Callable[[str], Any]) -> None:

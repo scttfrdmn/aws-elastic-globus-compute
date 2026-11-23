@@ -675,6 +675,7 @@ Scheduler.
         "ec2:DescribeLaunchTemplateVersions",
         "ec2:DescribeImages",
         "ec2:DescribeInstanceTypes",
+        "ec2:DescribeInstanceTypeOfferings",
         "ec2:DescribeInstances",
         "ec2:DescribeVolumes",
         "ec2:DescribeNetworkInterfaces"

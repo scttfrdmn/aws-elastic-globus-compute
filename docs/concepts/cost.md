@@ -188,8 +188,9 @@ caps use the same pricing function, so what you see is what's enforced.
 
 **Prices.** Spot prices come from `DescribeSpotPriceHistory` (the latest price for the instance type
 and Availability Zone, cached for an hour), on-demand prices from the AWS Price List API (cached for
-a day). If neither is reachable (a failed lookup is retried at most hourly), aegc uses a small static table of us-west-2 on-demand prices from
-November 2026, and Spot is charged at the on-demand price, its ceiling. The report lists which
+a day). If neither is reachable (a failed lookup is retried at most hourly), aegc uses a small
+static table of on-demand prices from November 2026 (us-west-2's, which are also us-east-1's for
+these types), and Spot is charged at the on-demand price, its ceiling. The report lists which
 sources it used: `spot`, `on-demand` or `static`. Every rate adds the root volume and the public
 IPv4 address.
 

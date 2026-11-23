@@ -2,8 +2,9 @@
 
 Spot prices come from ``DescribeSpotPriceHistory`` (latest price per type and AZ, cached for an
 hour), on-demand prices from the Price List API (cached for a day). If those aren't available, a
-small static table of Graviton on-demand prices (us-west-2, 2026-11) is used and labelled
-``static``. Every rate includes the worker's root volume and public IPv4 address.
+small static table of Graviton on-demand prices (2026-11) is used and labelled ``static``. It
+holds for us-west-2 and us-east-1, whose prices for these types are the same; other regions differ
+by a few percent. Every rate includes the worker's root volume and public IPv4 address.
 
 One function, :func:`accrue`, turns ledger records into dollars. Both ``aegc cost`` and the
 engine's spend caps use it, so what you see is what's enforced.
@@ -27,7 +28,8 @@ IPV4_HOUR = 0.005
 RUNNING_SLACK_S = 1200
 FAILED_LOOKUP_TTL_S = 3600  # retry a failed price lookup at most hourly
 
-#: On-demand $/h, us-west-2, read 2026-11-14 (Price List API). Fallback only.
+#: On-demand $/h, read 2026-11-14 (Price List API) for us-west-2; us-east-1's are the same
+#: (checked for c8g, m8g, c9g, r9g). Not region-specific: a fallback only, in any region.
 STATIC_ON_DEMAND = {
     "c7g.large": 0.0725,
     "m7g.large": 0.0816,

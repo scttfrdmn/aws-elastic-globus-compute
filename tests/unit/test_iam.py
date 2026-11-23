@@ -153,6 +153,7 @@ def test_deployer_policy(aws: Callable[[str], Any]) -> None:
     managed = {"aws:ResourceTag/aegc:managed": "true"}
     assert decide(c, arn, "ec2:DeleteSecurityGroup", "*", **managed) == "allowed"
     assert decide(c, arn, "ec2:DeleteSecurityGroup", "*") != "allowed"
+    assert decide(c, arn, "ec2:DescribeInstanceTypeOfferings", "*") == "allowed"  # subnets
     assert decide(c, arn, "sqs:DeleteQueue", f"{SQS}:aegc-dev-sci-py314-tasks") == "allowed"
     assert decide(c, arn, "sqs:DeleteQueue", f"{SQS}:someone-elses") != "allowed"
 

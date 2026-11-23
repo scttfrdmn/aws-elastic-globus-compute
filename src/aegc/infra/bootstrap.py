@@ -75,11 +75,23 @@ def ensure_bucket(s3: Any, bucket: str, region: str, report: Report, *, dry_run:
     elif dry_run:
         report.add("s3 bucket", bucket, "would-create")
         return
+    elif region == "us-east-1":
+        # us-east-1 takes no LocationConstraint (InvalidLocationConstraint, even for
+        # "us-east-1"), so send no CreateBucketConfiguration at all, the long-documented form
+        # there, and tag the bucket straight after.
+        s3.create_bucket(Bucket=bucket)
+        try:
+            s3.put_bucket_tagging(Bucket=bucket, Tagging={"TagSet": naming.tag_list(tags)})
+        except Exception:
+            # Untagged, the next run would refuse it as not aegc's; it's empty and ours.
+            s3.delete_bucket(Bucket=bucket)
+            raise
+        report.add("s3 bucket", bucket, "created")
     else:
-        cfg: dict[str, Any] = {"Tags": naming.tag_list(tags)}
-        if region != "us-east-1":
-            cfg["LocationConstraint"] = region
-        s3.create_bucket(Bucket=bucket, CreateBucketConfiguration=cfg)
+        s3.create_bucket(
+            Bucket=bucket,
+            CreateBucketConfiguration={"LocationConstraint": region, "Tags": naming.tag_list(tags)},
+        )
         report.add("s3 bucket", bucket, "created")
     if dry_run:
         return
