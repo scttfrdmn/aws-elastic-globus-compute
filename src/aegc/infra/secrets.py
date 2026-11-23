@@ -14,7 +14,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from aegc import naming
-from aegc.awsutil import is_not_found
 from aegc.infra import Outcome, OwnershipError, Report
 
 #: Secrets Manager's limit for a secret value.
@@ -26,6 +25,9 @@ class EndpointLogin:
     name: str  # the Globus Compute endpoint name
     endpoint_id: str
     storage_db: bytes  # ~/.globus_compute/storage.db
+    # Dimension of the EndpointOnline metric that only the endpoint host knows, so no one else
+    # (e.g. task code printing EMF into worker logs) can keep the offline alarm quiet.
+    metric_token: str = ""
 
     def to_json(self) -> str:
         return json.dumps(
@@ -33,6 +35,7 @@ class EndpointLogin:
                 "name": self.name,
                 "endpoint_id": self.endpoint_id,
                 "storage_db_b64": base64.b64encode(self.storage_db).decode(),
+                "metric_token": self.metric_token,
             },
             sort_keys=True,
         )
@@ -44,25 +47,85 @@ class EndpointLogin:
             name=str(d["name"]),
             endpoint_id=str(d["endpoint_id"]),
             storage_db=base64.b64decode(d["storage_db_b64"]),
+            metric_token=str(d.get("metric_token", "")),
         )
+
+
+def _describe(sm: Any, name: str) -> dict[str, Any] | None:
+    """The secret's metadata (never its value), found with ListSecrets so that no
+    resource-tag condition applies; None if there's no such secret."""
+    for page in sm.get_paginator("list_secrets").paginate(
+        Filters=[{"Key": "name", "Values": [name]}]
+    ):
+        for s in page.get("SecretList", []):
+            if s.get("Name") == name and not s.get("DeletedDate"):
+                return dict(s)
+    return None
 
 
 def _owned(sm: Any, name: str, deployment: str) -> bool | None:
     """True if aegc's, False if someone else's, None if there's no such secret."""
-    try:
-        d = sm.describe_secret(SecretId=name)
-    except Exception as e:
-        if is_not_found(e):
-            return None
-        raise
-    if d.get("DeletedDate"):
+    d = _describe(sm, name)
+    if d is None:
         return None
     return naming.is_owned(name, naming.tag_dict(d.get("Tags")), deployment)
 
 
+def resource_policy(*, endpoint_role_arn: str) -> dict[str, Any]:
+    """Only the endpoint host's role may read the login, whatever else IAM allows in the account
+    (account-wide GetSecretValue, the endpoint-deployer policy...)."""
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "OnlyTheEndpointHost",
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "secretsmanager:GetSecretValue",
+                "Resource": "*",
+                "Condition": {"StringNotEquals": {"aws:PrincipalArn": endpoint_role_arn}},
+            }
+        ],
+    }
+
+
+def metadata(sm: Any, deployment: str) -> dict[str, str]:
+    """The endpoint's name and id from the secret's tags (for status: no read of the value)."""
+    d = _describe(sm, naming.endpoint_secret(deployment))
+    tags = naming.tag_dict(d.get("Tags")) if d else {}
+    return {"name": tags.get(TAG_NAME, ""), "endpoint_id": tags.get(naming.TAG_ENDPOINT, "")}
+
+
+def find_endpoint(sm: Any, endpoint_id: str) -> list[str]:
+    """Deployments whose secret holds ``endpoint_id`` (one endpoint id runs in one place)."""
+    out = []
+    for page in sm.get_paginator("list_secrets").paginate(
+        Filters=[{"Key": "tag-key", "Values": [naming.TAG_ENDPOINT]}]
+    ):
+        for s in page.get("SecretList", []):
+            tags = naming.tag_dict(s.get("Tags"))
+            if (
+                tags.get(naming.TAG_ENDPOINT) == endpoint_id
+                and tags.get(naming.TAG_MANAGED) == "true"
+            ):
+                out.append(tags.get(naming.TAG_DEPLOYMENT, "?"))
+    return out
+
+
+TAG_NAME = "aegc:endpoint-name"
+TAG_TOKEN = "aegc:metric-token"
+TAG_LOGIN_HASH = "aegc:login-sha256"
+
+
+def metric_token(sm: Any, deployment: str) -> str:
+    """The deployment's liveness-metric token from the secret's tags ("" if none yet)."""
+    d = _describe(sm, naming.endpoint_secret(deployment))
+    return naming.tag_dict(d.get("Tags")).get(TAG_TOKEN, "") if d else ""
+
+
 def put_login(
     sm: Any, deployment: str, login: EndpointLogin, report: Report, *, dry_run: bool,
-    extra_tags: dict[str, str] | None = None,
+    extra_tags: dict[str, str] | None = None, endpoint_role_arn: str = "",
 ) -> str:  # fmt: skip
     """Create or update the secret; returns its ARN (or the name, in a dry run)."""
     name = naming.endpoint_secret(deployment)
@@ -75,6 +138,27 @@ def put_login(
     owned = _owned(sm, name, deployment)
     if owned is False:
         raise OwnershipError(f"secret {name} exists but isn't tagged as {deployment}'s")
+    elsewhere = [x for x in find_endpoint(sm, login.endpoint_id) if x != deployment]
+    if elsewhere:
+        raise ValueError(
+            f"endpoint {login.name} ({login.endpoint_id}) is already the cloud endpoint of "
+            f"deployment {', '.join(elsewhere)}; one endpoint id can run in one place "
+            "(`aegc endpoint undeploy` it there first)"
+        )
+    import hashlib
+
+    digest = hashlib.sha256(value.encode()).hexdigest()
+    tags = naming.tags(deployment, "endpoint-secret", extra=extra_tags)
+    tags.update({
+        naming.TAG_ENDPOINT: login.endpoint_id,
+        TAG_NAME: login.name,
+        TAG_TOKEN: login.metric_token,
+        TAG_LOGIN_HASH: digest,
+    })  # fmt: skip
+    current = _describe(sm, name)
+    unchanged = (
+        current is not None and naming.tag_dict(current.get("Tags")).get(TAG_LOGIN_HASH) == digest
+    )
     outcome: Outcome
     if owned is None:
         outcome = "would-create" if dry_run else "created"
@@ -84,14 +168,24 @@ def put_login(
                 Name=name,
                 Description=f"aegc: Globus login of deployment {deployment}'s cloud endpoint",
                 SecretString=value,
-                Tags=naming.tag_list(naming.tags(deployment, "endpoint-secret", extra=extra_tags)),
+                Tags=naming.tag_list(tags),
             )["ARN"]
+    elif unchanged:
+        outcome = "exists"
+        arn = str(current["ARN"]) if current else name
     else:
         outcome = "would-update" if dry_run else "updated"
         arn = name
         if not dry_run:
             sm.put_secret_value(SecretId=name, SecretString=value)
-            arn = sm.describe_secret(SecretId=name)["ARN"]
+            sm.tag_resource(SecretId=name, Tags=naming.tag_list(tags))
+            found = _describe(sm, name)
+            arn = str(found["ARN"]) if found else name
+    if endpoint_role_arn and not dry_run:
+        sm.put_resource_policy(
+            SecretId=name,
+            ResourcePolicy=json.dumps(resource_policy(endpoint_role_arn=endpoint_role_arn)),
+        )
     report.add("secret", name, outcome, f"endpoint {login.name} ({login.endpoint_id})")
     return str(arn)
 

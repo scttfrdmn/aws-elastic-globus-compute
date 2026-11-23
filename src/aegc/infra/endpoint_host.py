@@ -32,6 +32,12 @@ from aegc.infra.deployment import (
 )
 
 DEFAULT_INSTANCE_TYPE = "t4g.micro"
+
+
+class _NoTemplates(Exception):
+    pass
+
+
 ROOT_GIB = 30  # the ECS-optimized AMI's snapshot size
 
 
@@ -47,6 +53,8 @@ class EndpointHostSpec:
     instance_type: str = DEFAULT_INSTANCE_TYPE
     alarm_email: str = ""
     subnet_ids: tuple[str, ...] = ()
+    metric_token: str = ""  # the liveness metric's Token dimension (kept in the secret)
+    session_manager: bool = False
 
     @property
     def deployment_spec(self) -> DeploymentSpec:
@@ -79,6 +87,7 @@ def ensure_role(c: Clients, spec: EndpointHostSpec, report: Report, *, dry_run: 
     policy = iam.endpoint_role_policy(
         deployment=d, region=spec.region, account=spec.account,
         bucket=naming.bucket_name(spec.account, spec.region),
+        session_manager=spec.session_manager,
     )  # fmt: skip
     _put_role_policy(c, name, iam.ENDPOINT_POLICY, policy, report, dry_run=dry_run)
     arn = f"arn:aws:iam::{spec.account}:instance-profile{naming.IAM_PATH}{name}"
@@ -144,7 +153,7 @@ def launch_template_data(
 
 def ensure_group(
     c: Clients, spec: EndpointHostSpec, *, lt_name: str, subnets: list[str], report: Report,
-    dry_run: bool,
+    dry_run: bool, roll: bool = False,
 ) -> str:  # fmt: skip
     d, name = spec.deployment, naming.endpoint_group(spec.deployment)
     req = {
@@ -173,6 +182,7 @@ def ensure_group(
             ),
             codes={"ValidationError"}, attempts=10, delay_s=5,
         )  # fmt: skip
+        c.autoscaling.suspend_processes(AutoScalingGroupName=name, ScalingProcesses=["AZRebalance"])
         report.add("auto scaling group", name, "created", spec.instance_type)
         return name
     if not naming.is_owned(name, naming.tag_dict(groups[0].get("Tags", [])), d):
@@ -180,14 +190,32 @@ def ensure_group(
     outcome: Outcome = "exists"
     if not dry_run:
         c.autoscaling.update_auto_scaling_group(AutoScalingGroupName=name, DesiredCapacity=1, **req)
+        # A second host on the same endpoint id would fight the first: never two at once.
+        c.autoscaling.suspend_processes(AutoScalingGroupName=name, ScalingProcesses=["AZRebalance"])
     report.add("auto scaling group", name, outcome, spec.instance_type)
+    if roll:
+        # The host only reads its template, image and login at boot: replace it, terminating the
+        # old one first (two hosts can't share one endpoint id).
+        if not dry_run:
+            c.autoscaling.start_instance_refresh(
+                AutoScalingGroupName=name,
+                Strategy="Rolling",
+                Preferences={"MinHealthyPercentage": 0, "InstanceWarmup": 60},
+            )
+        report.add("instance refresh", name, "would-update" if dry_run else "updated",
+                   "replacing the host with the new configuration")  # fmt: skip
     return name
 
 
 def ensure_alarm(c: Clients, spec: EndpointHostSpec, report: Report, *, dry_run: bool) -> None:
     """Alarm when the endpoint is offline, or ``aegc evaluate`` stops reporting, for 15 minutes."""
+    from aegc import evaluator
+
     d, name = spec.deployment, naming.endpoint_alarm(spec.deployment)
     actions: list[str] = []
+    existing = _topic_arn(c, d)
+    if existing and not spec.alarm_email:
+        actions = [existing]  # a redeploy without --alarm-email keeps the alarm's email
     if spec.alarm_email:
         topic = naming.endpoint_topic(d)
         if dry_run:
@@ -209,33 +237,74 @@ def ensure_alarm(c: Clients, spec: EndpointHostSpec, report: Report, *, dry_run:
         AlarmName=name,
         AlarmDescription=f"aegc: deployment {d}'s cloud endpoint is offline (or aegc evaluate "
         "stopped reporting)",
-        Namespace="aegc", MetricName="EndpointOnline",
-        Dimensions=[{"Name": "Deployment", "Value": d}],
+        Namespace=iam.ENDPOINT_NAMESPACE, MetricName="EndpointOnline",
+        Dimensions=evaluator.liveness_dimensions(d, spec.metric_token),
         Statistic="Maximum", Period=300, EvaluationPeriods=3, DatapointsToAlarm=3,
         Threshold=1, ComparisonOperator="LessThanThreshold", TreatMissingData="breaching",
         AlarmActions=actions, OKActions=actions,
         Tags=naming.tag_list(naming.tags(d, "endpoint-alarm")),
     )  # fmt: skip
-    report.add("cloudwatch alarm", name, "updated", "offline for 15 min")
+    # A new host reports after ~5 minutes; seed one datapoint so a fresh alarm doesn't start in
+    # ALARM (missing data counts as breaching).
+    evaluator.put_liveness(c.cloudwatch, d, spec.metric_token, True)
+    report.add("cloudwatch alarm", name, "updated", "offline for 15 min (alerts in ~20-25 min)")
 
 
-def deploy(c: Clients, spec: EndpointHostSpec, *, dry_run: bool = False) -> Report:
+def _topics(c: Clients) -> list[str]:
+    if c.sns is None:
+        return []
+    out: list[str] = []
+    for page in c.sns.get_paginator("list_topics").paginate():
+        out += [str(t["TopicArn"]) for t in page.get("Topics", [])]
+    return out
+
+
+def _topic_arn(c: Clients, d: str) -> str:
+    for arn in _topics(c):
+        if arn.rsplit(":", 1)[-1] == naming.endpoint_topic(d):
+            return arn
+    return ""
+
+
+def deploy(
+    c: Clients, spec: EndpointHostSpec, *, dry_run: bool = False, roll: bool = False
+) -> Report:
+    """Create or update the host. ``roll``: the login changed, so replace the running host."""
+    from aegc import images
+    from aegc.infra.deployment import OfferingCache, offered_zones, subnet_zones
+
+    if not spec.metric_token:
+        raise ValueError("the endpoint host needs a metric token (secrets.metric_token or new)")
     report = Report()
     ds = spec.deployment_spec
     profile = ensure_role(c, spec, report, dry_run=dry_run)
     vpc, subnets = resolve_network(c.ec2, ds)
+    if not spec.subnet_ids:  # only zones that offer the host's instance type (#64)
+        cache = OfferingCache()
+        offered = offered_zones(c.ec2, (spec.instance_type,), cache)
+        if offered:
+            zones = subnet_zones(c.ec2, subnets, cache)
+            subnets = [s for s in subnets if zones.get(s, ("", ""))[0] in offered] or subnets
     sg = ensure_security_group(c, ds, vpc, report, dry_run=dry_run)
     ensure_log_group(c, ds, report, dry_run=dry_run)
+    if c.ecr is not None and not dry_run:  # keep the image past the repository's lifecycle
+        images.protect(c.ecr, "", spec.image, spec.deployment, report=report,
+                       repository=naming.endpoint_repository())  # fmt: skip
     data = launch_template_data(spec, ami=resolve_ami(c.ssm), sg=sg, profile_arn=profile)
+    before = len(report.actions)
     lt = ensure_launch_template(c, ds, None, data, report, dry_run=dry_run)
-    ensure_group(c, spec, lt_name=lt, subnets=subnets, report=report, dry_run=dry_run)
+    lt_changed = any(
+        a.resource == "launch template" and a.outcome == "updated" for a in report.actions[before:]
+    )
+    ensure_group(c, spec, lt_name=lt, subnets=subnets, report=report, dry_run=dry_run,
+                 roll=roll or lt_changed)  # fmt: skip
     ensure_alarm(c, spec, report, dry_run=dry_run)
     return report
 
 
 def undeploy(
     c: Clients, deployment: str, region: str, *, dry_run: bool = True, wait_s: float = 600,
-    poll_s: float = 5,
+    poll_s: float = 5, host: bool = True,
 ) -> Report:  # fmt: skip
     """Remove the endpoint host, its role, alarm and topic (the secret: :mod:`secrets`)."""
     from aegc.infra.deployment import _destroy_role, _wait_gone
@@ -244,9 +313,13 @@ def undeploy(
     d = deployment
     verb: Outcome = "would-delete" if dry_run else "deleted"
     group = naming.endpoint_group(d)
-    groups = c.autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[group])[
-        "AutoScalingGroups"
-    ]
+    groups = (
+        c.autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[group])[
+            "AutoScalingGroups"
+        ]
+        if host
+        else []  # destroy removes the group and template with the deployment's own
+    )
     if groups:
         if not naming.is_owned(group, naming.tag_dict(groups[0].get("Tags", [])), d):
             report.add("auto scaling group", group, "kept", "not tagged as aegc's")
@@ -258,9 +331,13 @@ def undeploy(
                 _wait_gone(c, group, wait_s=wait_s, poll_s=poll_s)
             report.add("auto scaling group", group, verb)
     try:
+        if not host:
+            raise _NoTemplates
         lts = c.ec2.describe_launch_templates(LaunchTemplateNames=[naming.endpoint_group(d)])[
             "LaunchTemplates"
         ]
+    except _NoTemplates:
+        lts = []
     except Exception as e:
         if not is_not_found(e):
             raise
@@ -277,14 +354,22 @@ def undeploy(
         if not dry_run:
             c.cloudwatch.delete_alarms(AlarmNames=[alarm])
         report.add("cloudwatch alarm", alarm, verb)
-    for t in c.sns.list_topics().get("Topics", []) if c.sns is not None else []:
-        arn = t["TopicArn"]
-        if arn.rsplit(":", 1)[-1] == naming.endpoint_topic(d):
-            tags = naming.tag_dict(c.sns.list_tags_for_resource(ResourceArn=arn).get("Tags"))
-            if naming.is_owned(naming.endpoint_topic(d), tags, d):
-                if not dry_run:
-                    c.sns.delete_topic(TopicArn=arn)
-                report.add("sns topic", naming.endpoint_topic(d), verb)
+    arn = _topic_arn(c, d)
+    if arn:
+        tags = naming.tag_dict(c.sns.list_tags_for_resource(ResourceArn=arn).get("Tags"))
+        if naming.is_owned(naming.endpoint_topic(d), tags, d):
+            if not dry_run:
+                c.sns.delete_topic(TopicArn=arn)
+            report.add("sns topic", naming.endpoint_topic(d), verb)
+    if c.ecr is not None:
+        from aegc import images
+
+        try:
+            images.release(c.ecr, "", d, repository=naming.endpoint_repository(), report=report,
+                           dry_run=dry_run)  # fmt: skip
+        except Exception as e:
+            if not is_not_found(e):
+                raise
     role = naming.endpoint_role(d, region)
     try:
         prof_tags = naming.tag_dict(

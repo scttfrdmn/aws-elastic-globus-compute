@@ -219,33 +219,68 @@ def _endpoint_cloud(args: argparse.Namespace, spec: Any) -> int:
             print("dry run; pass --yes to remove the cloud endpoint")
         return 0
     # deploy
+    import secrets as _secrets
+    from dataclasses import replace as _replace
+
+    from aegc import naming
+    from aegc.infra.deployment import read_manifest
+
     if not args.env:
         raise SystemExit("aegc: endpoint deploy needs --env (the default science environment)")
-    if ep.is_running(spec):
-        if not args.stop_local:
-            raise SystemExit(
-                f"aegc: the local endpoint {spec.name} is running ({spec.container}); one endpoint "
-                "id can run in one place. Stop it, or pass --stop-local"
-            )
+    try:
+        read_manifest(c.ssm, d)  # type: ignore[attr-defined]
+    except Exception as e:
+        if not awsutil.is_not_found(e):
+            raise
+        raise SystemExit(
+            f"aegc: no deployment {d!r} in {region}; `aegc deploy {d} ...` first"
+        ) from None
+    running = ep.is_running(spec)
+    if running and not args.stop_local:
+        raise SystemExit(
+            f"aegc: the local endpoint {spec.name} is running ({spec.container}); one endpoint "
+            "id can run in one place. Stop it, or pass --stop-local"
+        )
+    if running and not args.dry_run:
         ep.stop(spec)
     login = ep.export_login(spec)
-    image = args.image or ep.build_push(
-        Path(args.project_dir),
-        ecr=awsutil.client(sess, "ecr"),  # type: ignore[arg-type]
-        python=args.python,
-    )
+    # The cloud endpoint keeps the local endpoint's allowed functions (#57) unless told otherwise.
+    allowed = spec.allowed_functions
+    if allowed is None:
+        allowed = ep.local_allowed_functions(spec)
+    token = secrets.metric_token(c.secretsmanager, d) or _secrets.token_urlsafe(24)  # type: ignore[attr-defined]
+    login = _replace(login, metric_token=token)
+    if args.image:
+        image = args.image
+    elif args.dry_run:
+        image = f"<{naming.endpoint_repository()} image, built and pushed on deploy>@sha256:"
+    else:
+        image = ep.build_push(
+            Path(args.project_dir),
+            ecr=awsutil.client(sess, "ecr"),  # type: ignore[arg-type]
+            python=args.python,
+        )
     cloud = ep.EndpointSpec(
         name=spec.name, deployment=d, region=region, default_env=spec.default_env,
-        allowed_functions=spec.allowed_functions,
+        allowed_functions=allowed,
     )  # fmt: skip
     host = endpoint_host.EndpointHostSpec(
         deployment=d, account=account, region=region, name=spec.name,
         endpoint_id=login.endpoint_id, image=image, configure_script=ep.configure_script(cloud),
         instance_type=args.instance_type, alarm_email=args.alarm_email or "",
+        metric_token=token, session_manager=args.session_manager,
     )  # fmt: skip
     report = Report()
-    secrets.put_login(c.secretsmanager, d, login, report, dry_run=args.dry_run)  # type: ignore[attr-defined]
-    report.actions.extend(endpoint_host.deploy(c, host, dry_run=args.dry_run).actions)  # type: ignore[arg-type]
+    role_arn = f"arn:aws:iam::{account}:role{naming.IAM_PATH}{naming.endpoint_role(d, region)}"
+    before = len(report.actions)
+    secrets.put_login(
+        c.secretsmanager, d, login, report, dry_run=args.dry_run,  # type: ignore[attr-defined]
+        endpoint_role_arn=role_arn,
+    )  # fmt: skip
+    login_changed = report.actions[before].outcome in ("updated", "would-update")
+    report.actions.extend(
+        endpoint_host.deploy(c, host, dry_run=args.dry_run, roll=login_changed).actions  # type: ignore[arg-type]
+    )
     print(report)
     if not args.dry_run:
         print(
@@ -272,11 +307,8 @@ def _endpoint_status(c: Any, d: str, region: str) -> str:
         + (", ".join(f"{i['InstanceId']} {i.get('InstanceType', '')} {i['LifecycleState']}"
                      for i in inst) or "none yet")
     )  # fmt: skip
-    try:
-        login = secrets.get_login(c.secretsmanager, d)
-        lines.append(f"  endpoint: {login.name} ({login.endpoint_id})")
-    except Exception as e:
-        lines.append(f"  endpoint: login secret unreadable ({e})")
+    meta = secrets.metadata(c.secretsmanager, d)
+    lines.append(f"  endpoint: {meta['name'] or '?'} ({meta['endpoint_id'] or 'no secret'})")
     a = c.cloudwatch.describe_alarms(AlarmNames=[naming.endpoint_alarm(d)]).get("MetricAlarms", [])
     if a:
         lines.append(f"  alarm {a[0]['AlarmName']}: {a[0]['StateValue']}")
@@ -284,12 +316,14 @@ def _endpoint_status(c: Any, d: str, region: str) -> str:
 
 
 def _evaluate(args: argparse.Namespace) -> int:
+    import os
+
     from aegc import awsutil, evaluator
 
     sess, region, _ = _ctx(args)
     clients = {
         s: awsutil.client(sess, s)  # type: ignore[arg-type]
-        for s in ("ssm", "s3", "autoscaling", "scheduler", "sqs", "ec2")
+        for s in ("ssm", "s3", "autoscaling", "scheduler", "sqs", "ec2", "cloudwatch")
     }
     clients["pricing"] = awsutil.client(  # the Price List API is in us-east-1
         awsutil.session(args.profile, "us-east-1"), "pricing"
@@ -297,6 +331,7 @@ def _evaluate(args: argparse.Namespace) -> int:
     ev = evaluator.evaluate(
         deployment=args.deployment, region=region, clients=clients,
         endpoint_id=args.endpoint_id or "", dry_run=args.dry_run,
+        metric_token=os.environ.get("AEGC_METRIC_TOKEN", ""),
     )  # fmt: skip
     print(ev.render(), file=sys.stderr)  # stdout carries the EMF metric line
     return 1 if ev.errors else 0
@@ -1199,6 +1234,11 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--alarm-email", help="deploy: email when the cloud endpoint is offline")
     e.add_argument("--image", help="deploy: an endpoint image already in ECR (default: build one)")
     e.add_argument("--stop-local", action="store_true", help="deploy: stop the local endpoint")
+    e.add_argument(
+        "--session-manager", action="store_true",
+        help="deploy: allow Session Manager shells on the host (whoever may ssm:StartSession "
+        "there gets root, and with it your stored Globus login)",
+    )  # fmt: skip
     e.add_argument("--dry-run", action="store_true", help="deploy: show what would change")
     e.add_argument("--yes", action="store_true", help="undeploy: actually remove it")
     e.set_defaults(func=_endpoint)

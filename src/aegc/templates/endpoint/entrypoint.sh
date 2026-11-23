@@ -11,16 +11,19 @@ rm -f "$HOME/.globus_compute/$GC_ENDPOINT/daemon.pid"
 # which the host's awslogs driver ships to CloudWatch.
 if [ -n "${GC_ENDPOINT_UUID:-}" ]; then
     # User endpoint processes (where AWSEngine runs) log to files: copy them to the console too.
+    # Logs that already exist (from before a restart) follow from their end; new ones from the top.
     (
         seen=""
+        from="-n 0"
         while true; do
             for f in "$HOME"/.globus_compute/uep.*/endpoint.log; do
                 [ -f "$f" ] || continue
                 case " $seen " in
                     *" $f "*) ;;
-                    *) seen="$seen $f"; tail -n +1 -F "$f" 2>/dev/null | sed -u 's/^/[uep] /' & ;;
+                    *) seen="$seen $f"; tail $from -F "$f" 2>/dev/null | sed -u 's/^/[uep] /' & ;;
                 esac
             done
+            from="-n +1"
             sleep 5
         done
     ) &

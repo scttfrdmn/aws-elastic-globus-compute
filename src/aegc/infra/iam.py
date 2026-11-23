@@ -563,8 +563,25 @@ BOOTSTRAP_ONLY = {"Bucket", "Ecr", "EcrDeleteAegcRepos"}
 SHARED = {"IamUnderAegcPath", "PassAegcRoles", "Parameters", "Identity"}
 
 
+#: The endpoint host's liveness metric (PutMetricData; workers have no PutMetricData at all).
+ENDPOINT_NAMESPACE = "aegc/endpoint"
+
+#: Opt-in (``aegc endpoint deploy --session-manager``): anyone allowed ssm:StartSession on the
+#: host gets root there, and with it the stored Globus login.
+SESSION_MANAGER_STATEMENT: dict[str, Any] = {
+    "Sid": "SessionManager",
+    "Effect": "Allow",
+    "Action": [
+        "ssm:UpdateInstanceInformation", "ssmmessages:CreateControlChannel",
+        "ssmmessages:CreateDataChannel", "ssmmessages:OpenControlChannel",
+        "ssmmessages:OpenDataChannel",
+    ],
+    "Resource": "*",
+}  # fmt: skip
+
+
 def endpoint_role_policy(
-    *, deployment: str, region: str, account: str, bucket: str
+    *, deployment: str, region: str, account: str, bucket: str, session_manager: bool = False
 ) -> dict[str, Any]:
     """The cloud endpoint host's role (#22): the operator policy (what AWSEngine needs), plus
     reading its own Globus login, pulling the endpoint image, writing its log streams and
@@ -603,19 +620,26 @@ def endpoint_role_policy(
             "Resource": f"arn:aws:logs:{region}:{account}:log-group:{naming.log_group(d)}:*",
         },
         {
-            # Session Manager (no SSH, no inbound ports): an operator can open a shell on the
-            # host to debug it, if their own IAM allows ssm:StartSession.
-            "Sid": "SessionManager",
+            # A boot that fails marks the instance unhealthy, so the group replaces it.
+            "Sid": "ReplaceSelf",
             "Effect": "Allow",
-            "Action": [
-                "ssm:UpdateInstanceInformation",
-                "ssmmessages:CreateControlChannel",
-                "ssmmessages:CreateDataChannel",
-                "ssmmessages:OpenControlChannel",
-                "ssmmessages:OpenDataChannel",
-            ],
+            "Action": "autoscaling:SetInstanceHealth",
             "Resource": "*",
+            "Condition": {
+                "StringEquals": {
+                    f"autoscaling:ResourceTag/{naming.TAG_DEPLOYMENT}": d,
+                    f"autoscaling:ResourceTag/{naming.TAG_ROLE}": "endpoint-asg",
+                }
+            },
         },
+        {
+            "Sid": "LivenessMetric",
+            "Effect": "Allow",
+            "Action": "cloudwatch:PutMetricData",
+            "Resource": "*",
+            "Condition": {"StringEquals": {"cloudwatch:namespace": ENDPOINT_NAMESPACE}},
+        },
+        *([SESSION_MANAGER_STATEMENT] if session_manager else []),
         {
             "Sid": "ReapResultQueues",
             "Effect": "Allow",
@@ -640,12 +664,22 @@ def endpoint_deployer_policy(*, region: str, account: str) -> dict[str, Any]:
             {"Sid": "CreateLoginTagged", "Effect": "Allow",
              "Action": ["secretsmanager:CreateSecret", "secretsmanager:TagResource"],
              "Resource": secrets, "Condition": managed_req},
+            # Never GetSecretValue: only the endpoint host reads the login (and the secret's own
+            # policy denies everyone else).
             {"Sid": "ChangeOwnedLogin", "Effect": "Allow",
              "Action": ["secretsmanager:PutSecretValue", "secretsmanager:DeleteSecret",
-                        "secretsmanager:DescribeSecret", "secretsmanager:GetSecretValue"],
+                        "secretsmanager:PutResourcePolicy", "secretsmanager:UntagResource"],
              "Resource": secrets, "Condition": managed_res},
-            {"Sid": "ListLogins", "Effect": "Allow", "Action": "secretsmanager:ListSecrets",
-             "Resource": "*"},
+            {"Sid": "ListLogins", "Effect": "Allow",
+             "Action": ["secretsmanager:ListSecrets", "sns:ListTopics"], "Resource": "*"},
+            {"Sid": "LivenessSeed", "Effect": "Allow", "Action": "cloudwatch:PutMetricData",
+             "Resource": "*",
+             "Condition": {"StringEquals": {"cloudwatch:namespace": ENDPOINT_NAMESPACE}}},
+            {"Sid": "RollEndpointHost", "Effect": "Allow",
+             "Action": ["autoscaling:StartInstanceRefresh", "autoscaling:SuspendProcesses"],
+             "Resource": "*",
+             "Condition": {"StringEquals": {
+                 f"autoscaling:ResourceTag/{naming.TAG_ROLE}": "endpoint-asg"}}},
             {"Sid": "OfflineAlarm", "Effect": "Allow",
              "Action": ["cloudwatch:PutMetricAlarm", "cloudwatch:DeleteAlarms",
                         "cloudwatch:DescribeAlarms", "cloudwatch:TagResource",

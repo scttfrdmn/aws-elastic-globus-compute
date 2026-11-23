@@ -204,6 +204,20 @@ def is_running(spec: EndpointSpec, run: Runner = subprocess.run) -> bool:
     return out.returncode == 0 and out.stdout.strip() == "true"
 
 
+def local_allowed_functions(spec: EndpointSpec, run: Runner = subprocess.run) -> tuple[str, ...]:
+    """The local endpoint's ``allowed_functions`` (empty: any function)."""
+    code = (
+        "import sys, yaml; c = yaml.safe_load(open(sys.argv[1])) or {}; "
+        "print(' '.join(c.get('allowed_functions') or []))"
+    )
+    out = run(
+        ["docker", "run", "--rm", *_mounts(spec), IMAGE, "python", "-c", code,
+         f"{GC_DIR}/{spec.name}/config.yaml"],
+        check=False, text=True, capture_output=True,
+    )  # fmt: skip
+    return tuple(out.stdout.split()) if out.returncode == 0 else ()
+
+
 def export_login(spec: EndpointSpec, run: Runner = subprocess.run) -> Any:
     """This host's Globus login and the endpoint's id, for the cloud endpoint (#22)."""
     import base64

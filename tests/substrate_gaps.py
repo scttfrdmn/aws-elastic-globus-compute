@@ -84,3 +84,61 @@ def instance_type_offerings(ec2: Any, offered: dict[str, list[str]]) -> list[dic
 
     ec2.meta.events.register("before-call.ec2.DescribeInstanceTypeOfferings", answer)
     return calls
+
+
+def secrets_with_tags(sm: Any) -> Any:
+    """substrate#1622: ListSecrets omits Tags. Fills them in from DescribeSecret on this
+    client, so ownership checks see what AWS returns."""
+
+    def add_tags(parsed: Any, **_: Any) -> None:
+        for s in parsed.get("SecretList", []):
+            if "Tags" not in s:
+                s["Tags"] = sm.describe_secret(SecretId=s["ARN"]).get("Tags", [])
+
+    sm.meta.events.register("after-call.secrets-manager.ListSecrets", add_tags)
+    return sm
+
+
+def _stub(client: Any, service: str, op: str, respond: Any) -> None:
+    """Answer ``op`` on this client with ``respond(api_params)`` instead of calling substrate."""
+    last: dict[str, Any] = {}
+
+    def capture(params: dict[str, Any], **_: Any) -> None:
+        last.clear()
+        last.update(params)
+
+    def answer(**_: Any) -> tuple[Any, dict[str, Any]]:
+        return SimpleNamespace(status_code=200, headers={}), respond(dict(last))
+
+    client.meta.events.register(f"before-parameter-build.{service}.{op}", capture)
+    client.meta.events.register(f"before-call.{service}.{op}", answer)
+
+
+def secret_resource_policies(sm: Any) -> dict[str, str]:
+    """substrate#1623: no PutResourcePolicy/GetResourcePolicy. Records them on this client;
+    returns the policies by secret id."""
+    policies: dict[str, str] = {}
+
+    def put(p: dict[str, Any]) -> dict[str, Any]:
+        policies[p["SecretId"]] = p["ResourcePolicy"]
+        return {"Name": p["SecretId"]}
+
+    def get(p: dict[str, Any]) -> dict[str, Any]:
+        sid = p["SecretId"]
+        return {"Name": sid, **({"ResourcePolicy": policies[sid]} if sid in policies else {})}
+
+    _stub(sm, "secrets-manager", "PutResourcePolicy", put)
+    _stub(sm, "secrets-manager", "GetResourcePolicy", get)
+    return policies
+
+
+def instance_refreshes(autoscaling: Any) -> list[dict[str, Any]]:
+    """substrate#1624: no StartInstanceRefresh. Records the requests on this client."""
+    calls: list[dict[str, Any]] = []
+
+    def start(p: dict[str, Any]) -> dict[str, Any]:
+        calls.append(p)
+        return {"InstanceRefreshId": "r-1"}
+
+    _stub(autoscaling, "auto-scaling", "StartInstanceRefresh", start)
+    return calls

@@ -252,14 +252,15 @@ def _is_inuse_tag(tag: str, deployment: str) -> bool:
 
 
 def protect(
-    ecr: Any, env: str, digest_ref: str, deployment: str, *, report: Report | None = None
-) -> str:
+    ecr: Any, env: str, digest_ref: str, deployment: str, *, report: Report | None = None,
+    repository: str = "",
+) -> str:  # fmt: skip
     """Tag the pinned image ``inuse-<d>-<sha12>`` so the lifecycle never expires it. Returns it.
 
     ``put_image`` with the image's existing manifest adds a tag without pushing anything; immutable
     repositories allow new tags, just not moving existing ones. Re-applies the lifecycle first.
     """
-    name = naming.image_repository(env)
+    name = repository or naming.image_repository(env)
     repo_ref, _, digest = digest_ref.partition("@")
     if not repo_ref.endswith("/" + name):
         raise ValueError(f"image {digest_ref!r} isn't in aegc's repository {name}")
@@ -300,6 +301,7 @@ def release(
     deployment: str,
     keep: set[str] | frozenset[str] = frozenset(),
     *,
+    repository: str = "",
     report: Report | None = None,
     dry_run: bool = False,
 ) -> list[str]:
@@ -309,7 +311,7 @@ def release(
     that's an image's only one is kept, because deleting it would delete the image. Returns the
     tags removed (or that would be, on a dry run).
     """
-    name = naming.image_repository(env)
+    name = repository or naming.image_repository(env)
     try:
         _owned_repository(ecr, name)
         details = list(

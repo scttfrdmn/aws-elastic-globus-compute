@@ -2,9 +2,9 @@
 
 The cloud endpoint's host runs this every 5 minutes:
 
-1. **Liveness (#60).** Ask Globus whether the endpoint is online and emit an ``EndpointOnline``
-   EMF metric (namespace ``aegc``, dimension ``Deployment``) on stdout, which the host's awslogs
-   driver turns into a metric. An alarm fires when it's missing or 0.
+1. **Liveness (#60).** Ask Globus whether the endpoint is online and publish ``EndpointOnline``
+   (namespace ``aegc/endpoint``, dimensions ``Deployment`` and a secret ``Token``). An alarm
+   fires when it's missing or 0.
 2. **Caps (#51).** Check spend against the deployment's limits and trip it, as an engine would,
    even when no engine (user endpoint process) is running.
 3. **Lease.** Renew it, but only while the endpoint is online: the lease stays a dead-man switch
@@ -16,16 +16,15 @@ Nothing changes with ``dry_run``; the report says what would.
 
 from __future__ import annotations
 
-import json
 import logging
-import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, TextIO
+from typing import Any
 
 from aegc import caps, lease, ops
 from aegc.infra.deployment import read_manifest
+from aegc.infra.iam import ENDPOINT_NAMESPACE
 from aegc.pricing import Prices
 from aegc.spend import SpendGuard
 from aegc.state import Limits, read_state
@@ -62,25 +61,28 @@ class Evaluation:
         return "\n".join(lines)
 
 
-def emf_line(deployment: str, online: bool, *, now: float | None = None) -> str:
-    """An EMF document for ``EndpointOnline`` (1 or 0)."""
-    ts = int((time.time() if now is None else now) * 1000)
-    return json.dumps(
-        {
-            "_aws": {
-                "Timestamp": ts,
-                "CloudWatchMetrics": [
-                    {
-                        "Namespace": "aegc",
-                        "Dimensions": [["Deployment"]],
-                        "Metrics": [{"Name": "EndpointOnline", "Unit": "Count"}],
-                    }
-                ],
-            },
-            "Deployment": deployment,
-            "EndpointOnline": 1 if online else 0,
-        },
-        separators=(",", ":"),
+def liveness_dimensions(deployment: str, token: str) -> list[dict[str, str]]:
+    """``EndpointOnline``'s dimensions. The token is in the endpoint's secret only, so no one
+    else (task code printing EMF into worker logs, say) can publish the series the alarm watches."""
+    return [{"Name": "Deployment", "Value": deployment}, {"Name": "Token", "Value": token}]
+
+
+def put_liveness(
+    cloudwatch: Any, deployment: str, token: str, online: bool, *, now: float | None = None
+) -> None:
+    from datetime import UTC, datetime
+
+    cloudwatch.put_metric_data(
+        Namespace=ENDPOINT_NAMESPACE,
+        MetricData=[
+            {
+                "MetricName": "EndpointOnline",
+                "Dimensions": liveness_dimensions(deployment, token),
+                "Timestamp": datetime.fromtimestamp(time.time() if now is None else now, UTC),
+                "Value": 1.0 if online else 0.0,
+                "Unit": "Count",
+            }
+        ],
     )
 
 
@@ -98,9 +100,9 @@ def evaluate(
     region: str,
     clients: dict[str, Any],
     endpoint_id: str = "",
+    metric_token: str = "",
     online: Callable[[str], bool] = globus_status,
     dry_run: bool = False,
-    out: TextIO = sys.stdout,
     now: float | None = None,
 ) -> Evaluation:
     """One pass. ``clients`` needs ssm, s3, autoscaling, scheduler, sqs (ec2 and pricing are
@@ -113,8 +115,11 @@ def evaluate(
             ev.online = bool(online(endpoint_id))
         except Exception as e:
             ev.errors.append(f"endpoint status: {e}")
-        if ev.online is not None and not dry_run:
-            print(emf_line(deployment, ev.online, now=now), file=out, flush=True)
+        if ev.online is not None and not dry_run and metric_token and "cloudwatch" in clients:
+            try:
+                put_liveness(clients["cloudwatch"], deployment, metric_token, ev.online, now=now)
+            except Exception as e:
+                ev.errors.append(f"liveness metric: {e}")
 
     try:
         m = read_manifest(clients["ssm"], deployment)
@@ -156,7 +161,7 @@ def evaluate(
         try:
             expires = lease.expiry(clients["scheduler"], deployment)
             # Renew hourly (as engines do), not every pass.
-            if expires is None or expires - now < lease_s - lease.renew_interval(lease_s):
+            if expires is not None and expires - now < lease_s - lease.renew_interval(lease_s):
                 ev.lease_renewed = (
                     1
                     if dry_run

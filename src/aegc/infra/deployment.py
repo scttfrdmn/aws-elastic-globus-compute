@@ -202,6 +202,14 @@ class Clients:
     sns: Any = None
 
 
+ACCESS_DENIED = {
+    "AccessDenied",
+    "AccessDeniedException",
+    "AuthorizationError",
+    "UnauthorizedOperation",
+}
+
+
 def _retry(fn: Callable[[], Any], *, codes: set[str], attempts: int, delay_s: float) -> Any:
     for attempt in range(attempts):
         try:
@@ -1424,14 +1432,25 @@ def destroy(
         )  # fmt: skip
     _destroy_worker_role(c, d, region, report, dry_run=dry_run)
     _destroy_role(c, d, naming.task_role(d, region), report, dry_run=dry_run)
-    # The cloud endpoint (#22): its group and template went with the others above.
+    # The cloud endpoint (#22): its group and template went with the others above. Its alarm,
+    # topic and secret need the endpoint-deployer policy; a deployer without it still destroys
+    # everything else.
     from aegc.infra import endpoint_host, secrets
 
-    report.actions.extend(
-        endpoint_host.undeploy(c, d, region, dry_run=dry_run, wait_s=wait_s, poll_s=poll_s).actions
-    )
-    if c.secretsmanager is not None:
-        secrets.delete_login(c.secretsmanager, d, report, dry_run=dry_run)
+    try:
+        report.actions.extend(
+            endpoint_host.undeploy(
+                c, d, region, dry_run=dry_run, wait_s=wait_s, poll_s=poll_s, host=False
+            ).actions
+        )
+        if c.secretsmanager is not None:
+            secrets.delete_login(c.secretsmanager, d, report, dry_run=dry_run)
+    except Exception as e:
+        if error_code(e) not in ACCESS_DENIED:
+            raise
+        report.add("cloud endpoint", d, "kept",
+                   "not checked: needs the endpoint-deployer policy (aegc iam-policy "
+                   "endpoint-deployer)")  # fmt: skip
 
     log_name = naming.log_group(d)
     for g in list(
@@ -1597,11 +1616,23 @@ def verify_destroyed(
         except Exception as e:
             if not is_not_found(e):
                 raise
-    if c.secretsmanager is not None:
-        from aegc.infra import secrets
+    try:  # the cloud endpoint's secret, alarm and topic (endpoint-deployer policy)
+        if c.secretsmanager is not None:
+            from aegc.infra import secrets
 
-        if secrets.exists(c.secretsmanager, d):
-            report.add("secret", naming.endpoint_secret(d), "remaining")
+            if secrets.exists(c.secretsmanager, d):
+                report.add("secret", naming.endpoint_secret(d), "remaining")
+        if c.cloudwatch is not None and c.cloudwatch.describe_alarms(
+            AlarmNames=[naming.endpoint_alarm(d)]
+        ).get("MetricAlarms"):
+            report.add("cloudwatch alarm", naming.endpoint_alarm(d), "remaining")
+        from aegc.infra import endpoint_host
+
+        if endpoint_host._topic_arn(c, d):
+            report.add("sns topic", naming.endpoint_topic(d), "remaining")
+    except Exception as e:
+        if error_code(e) not in ACCESS_DENIED:
+            raise
     try:  # the task role (#32)
         if naming.is_owned(task, naming.tag_dict(c.iam.list_role_tags(RoleName=task)["Tags"]), d):
             report.add("iam role", task, "remaining")

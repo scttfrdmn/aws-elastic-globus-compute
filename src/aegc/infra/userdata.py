@@ -218,7 +218,6 @@ _ENDPOINT_TEMPLATE = Template(
 set -uo pipefail
 exec > >(tee -a /var/log/aegc-boot.log) 2>&1
 echo "aegc: endpoint boot start $$(date -Is)"
-fail() { echo "aegc: endpoint boot failed: $$*"; exit 1; }
 
 TOKEN=$$(curl -sfX PUT http://169.254.169.254/latest/api/token \
   -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
@@ -226,6 +225,14 @@ md() { curl -sf -H "X-aws-ec2-metadata-token: $$TOKEN" \
   "http://169.254.169.254/latest/meta-data/$$1"; }
 IID=$$(md instance-id)
 REGION=$$(md placement/region)
+# A failed boot marks the instance unhealthy, so the group replaces it (not a paid, dead host).
+fail() {
+  echo "aegc: endpoint boot failed: $$*"
+  aws autoscaling set-instance-health --region "$$REGION" --instance-id "$$IID" \
+    --health-status Unhealthy || true
+  exit 1
+}
+retry() { local n; for n in 1 2 3 4 5 6; do "$$@" && return 0; sleep $$((n * 10)); done; return 1; }
 
 systemctl disable --now ecs amazon-ecs-volume-plugin || true
 systemctl enable --now docker || fail "docker didn't start"
@@ -247,22 +254,32 @@ done
 # The Globus login (token storage) and the endpoint id, from Secrets Manager.
 GC=/var/lib/aegc-endpoint/gc
 install -d -m 700 -o 1000 -g 1000 "$$GC"
-SECRET=$$(aws secretsmanager get-secret-value --region "$$REGION" --secret-id ${secret} \
-  --query SecretString --output text) || fail "couldn't read the secret ${secret}"
+readsecret() {
+  SECRET=$$(aws secretsmanager get-secret-value --region "$$REGION" --secret-id ${secret} \
+    --query SecretString --output text)
+}
+retry readsecret || fail "couldn't read the secret ${secret}"
 SECRET="$$SECRET" python3 - "$$GC" <<'PY' || fail "couldn't restore the Globus login"
 import base64, json, os, sys
 d, s = sys.argv[1], json.loads(os.environ["SECRET"])
 with open(os.path.join(d, "storage.db"), "wb") as f:
     f.write(base64.b64decode(s["storage_db_b64"]))
 os.chmod(os.path.join(d, "storage.db"), 0o600)
+env = "/var/lib/aegc-endpoint/evaluate.env"
+with open(env, "w") as f:
+    f.write("AEGC_METRIC_TOKEN=" + s.get("metric_token", "") + "\n")
+os.chmod(env, 0o600)
 PY
 unset SECRET
 chown -R 1000:1000 "$$GC"
 
 echo ${configure_b64} | base64 -d > /var/lib/aegc-endpoint/configure.sh
-docker run --rm -v "$$GC":/home/gc/.globus_compute \
-  -v /var/lib/aegc-endpoint/configure.sh:/tmp/configure.sh:ro \
-  -e AWS_REGION="$$REGION" "$$IMAGE" sh /tmp/configure.sh || fail "couldn't configure the endpoint"
+configure() {
+  docker run --rm -v "$$GC":/home/gc/.globus_compute \
+    -v /var/lib/aegc-endpoint/configure.sh:/tmp/configure.sh:ro \
+    -e AWS_REGION="$$REGION" "$$IMAGE" sh /tmp/configure.sh
+}
+retry configure || fail "couldn't configure the endpoint"
 # After configure (which creates the endpoint directory): keep the registered endpoint id.
 printf '{"endpoint_id": "%s"}' ${endpoint_id} > "$$GC"/${name}/endpoint.json
 chown 1000:1000 "$$GC"/${name}/endpoint.json
@@ -277,7 +294,7 @@ Requires=docker.service
 Restart=always
 RestartSec=10
 ExecStartPre=-/usr/bin/docker rm -f aegc-endpoint
-ExecStart=/usr/bin/docker run --rm --name aegc-endpoint $$LOGS \
+ExecStart=/usr/bin/docker run --rm --init --name aegc-endpoint $$LOGS \
   --log-opt awslogs-stream=endpoint/$$IID -v $$GC:/home/gc/.globus_compute \
   -e GC_ENDPOINT=${name} -e GC_ENDPOINT_UUID=${endpoint_id} \
   -e AWS_REGION=$$REGION -e AWS_DEFAULT_REGION=$$REGION $$IMAGE
@@ -292,9 +309,11 @@ cat > /etc/systemd/system/aegc-evaluate.service <<UNIT
 Description=aegc evaluate ${deployment}
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/docker run --rm $$LOGS --log-opt awslogs-format=json/emf \
+TimeoutStartSec=240
+EnvironmentFile=/var/lib/aegc-endpoint/evaluate.env
+ExecStart=/usr/bin/docker run --rm --init $$LOGS \
   --log-opt awslogs-stream=endpoint/$$IID/evaluate -v $$GC:/home/gc/.globus_compute \
-  -e AWS_REGION=$$REGION -e AWS_DEFAULT_REGION=$$REGION $$IMAGE \
+  -e AWS_REGION=$$REGION -e AWS_DEFAULT_REGION=$$REGION -e AEGC_METRIC_TOKEN $$IMAGE \
   aegc --region $$REGION evaluate ${deployment} --endpoint-id ${endpoint_id}
 UNIT
 cat > /etc/systemd/system/aegc-evaluate.timer <<'UNIT'
@@ -303,6 +322,7 @@ Description=aegc evaluate timer
 [Timer]
 OnBootSec=3min
 OnUnitActiveSec=5min
+AccuracySec=1s
 [Install]
 WantedBy=timers.target
 UNIT
