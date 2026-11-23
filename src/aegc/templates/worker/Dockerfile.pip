@@ -6,6 +6,7 @@ ARG BASE
 FROM ${BASE}
 ARG GCE_VERSION
 ARG PYTHON=python3
+ARG AEGC_ALLOW_CHANGE=click
 ARG AEGC_UID=57439
 USER root
 COPY dist/ /opt/aegc/dist/
@@ -17,7 +18,8 @@ RUN set -e; \
     "$PY" -c 'import sys; assert sys.version_info >= (3, 11), "aegc workers need Python >= 3.11, not " + sys.version'; \
     "$PY" -m pip --version >/dev/null 2>&1 || "$PY" -m ensurepip --upgrade >/dev/null 2>&1 \
         || { echo "aegc: $PY has no pip and no ensurepip; add pip to the base (e.g. apt-get install python3-pip)" >&2; exit 1; }; \
-    "$PY" -m pip list --format=freeze > /opt/aegc/constraints.txt; \
+    "$PY" -m pip list --format=freeze \
+        | grep -viE "^($(echo "${AEGC_ALLOW_CHANGE}" | tr ',' '|'))==" > /opt/aegc/constraints.txt; \
     PIP_BREAK_SYSTEM_PACKAGES=1 PIP_ROOT_USER_ACTION=ignore "$PY" -m pip install --no-cache-dir -c /opt/aegc/constraints.txt \
         "globus-compute-endpoint==${GCE_VERSION}" /opt/aegc/dist/*.whl; \
     "$PY" -m pip check; \

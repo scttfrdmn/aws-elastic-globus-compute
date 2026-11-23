@@ -41,6 +41,11 @@ def _image_build(args: argparse.Namespace) -> int:
             gce_version=args.gce_version,
             base=args.base or "",
             python=args.python or "",
+            **(
+                {"allow_change": tuple(sorted({*images.DEFAULT_ALLOW_CHANGE, *args.allow_change}))}
+                if args.allow_change
+                else {}
+            ),
         )
     except ValueError as e:
         raise SystemExit(f"aegc: {e}") from None
@@ -1036,6 +1041,11 @@ def build_parser() -> argparse.ArgumentParser:
         "not latest or untagged. aegc builds from the image the tag points to now",
     )  # fmt: skip
     b.add_argument("--source", default="aarchsci", choices=["aarchsci", "aarchbio"])
+    b.add_argument(
+        "--allow-change", action="append", default=[], metavar="PACKAGE",
+        help="let installing aegc change this package of the base (repeatable), e.g. "
+        "python-dateutil when the base's is newer than botocore accepts; click always may",
+    )  # fmt: skip
     b.add_argument(
         "--python", metavar="PATH", help="with --base: the base's Python (default python3)"
     )

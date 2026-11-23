@@ -76,9 +76,14 @@ curl -s 'https://quay.io/api/v1/repository/aarchsci/earth-observation/tag/?onlyA
 At the time of writing that was `2026.11.21.153534`. Build from it:
 
 ```sh
-aegc image build --env earth-observation --base-tag 2026.11.21.153534
+aegc image build --env earth-observation --base-tag 2026.11.21.153534 \
+  --allow-change python-dateutil
 aegc image list --env earth-observation    # one line, for Python 3.14
 ```
+
+`--allow-change python-dateutil` lets the build downgrade one package of the base: this image
+ships python-dateutil 4.0, and botocore (which aegc needs) accepts only versions below 3. Every
+other package of the base stays exactly as it is.
 
 ### 2. Deploy a pool with a write grant
 

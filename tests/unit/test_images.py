@@ -514,3 +514,17 @@ def test_register_refuses_amd64(aws: Callable[[str], Any]) -> None:
             ecr=aws("ecr"), ssm=aws("ssm"), project_dir=Path("."),
             run=fake_docker("pip", "3.12", [], arch="amd64"), log=lambda _: None,
         )  # fmt: skip
+
+
+def test_allow_change_reaches_pip_too() -> None:
+    # Found in the NDVI tutorial: the earth-observation image's python-dateutil 4.0 is newer than
+    # every botocore accepts (<3); pinning all base packages made boto3 uninstallable.
+    for name in ("Dockerfile", "Dockerfile.pip"):
+        text = (resources.files("aegc") / "templates" / "worker" / name).read_text()
+        assert 'grep -viE "^($(echo "${AEGC_ALLOW_CHANGE}"' in text, name
+    from aegc import cli
+
+    p = cli.build_parser()
+    a = p.parse_args(["image", "build", "--env", "eo", "--base-tag", "2026.11.21.153534",
+                      "--allow-change", "python-dateutil"])  # fmt: skip
+    assert a.allow_change == ["python-dateutil"]

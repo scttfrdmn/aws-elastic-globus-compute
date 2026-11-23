@@ -16,7 +16,8 @@ RUN micromamba list -n base --json > /opt/aegc/base.json \
  && micromamba install -y -n base -c conda-forge "globus-compute-endpoint=${GCE_VERSION}" \
  && micromamba list -n base --json > /opt/aegc/worker.json \
  && /opt/conda/bin/python /opt/aegc/aegc_env_guard.py /opt/aegc/base.json /opt/aegc/worker.json "${AEGC_ALLOW_CHANGE}" \
- && /opt/conda/bin/python -m pip list --format=freeze > /opt/aegc/constraints.txt \
+ && /opt/conda/bin/python -m pip list --format=freeze \
+      | grep -viE "^($(echo "${AEGC_ALLOW_CHANGE}" | tr ',' '|'))==" > /opt/aegc/constraints.txt \
  && /opt/conda/bin/python -m pip install --no-cache-dir -c /opt/aegc/constraints.txt /opt/aegc/dist/*.whl \
  && /opt/conda/bin/python -m pip check \
  && micromamba clean --all --yes && rm -rf /opt/conda/pkgs /opt/aegc/dist
