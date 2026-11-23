@@ -543,6 +543,8 @@ def docker_build_args(
         "docker", "buildx", "build",
         "--platform", "linux/arm64",
         "--load",
+        # One image manifest, no attestation index: Lambda pools run the same digest (#21).
+        "--provenance=false", "--sbom=false",
         "--build-arg", f"BASE={base}",
         "--build-arg", f"GCE_VERSION={spec.gce_version}",
         "--build-arg", f"AEGC_ALLOW_CHANGE={','.join(spec.allow_change)}",

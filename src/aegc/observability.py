@@ -311,10 +311,16 @@ def render_provenance(task_uuid: str, deployment: str, records: list[dict[str, A
             )
             if v
         )
-        lines.append(
-            f"    {where} | pool {p.get('pool') or rec.get('pool', '?')}, "
-            f"{p.get('slots', '?')} slot(s), {p.get('vcpus', '?')} vCPUs"
-        )
+        if p.get("backend") == "lambda":
+            lines.append(
+                f"    Lambda {p.get('function') or '?'} ({p.get('memory_mib', '?')} MB), "
+                f"request {p.get('request_id') or '?'} | pool {p.get('pool') or '?'}"
+            )
+        else:
+            lines.append(
+                f"    {where} | pool {p.get('pool') or rec.get('pool', '?')}, "
+                f"{p.get('slots', '?')} slot(s), {p.get('vcpus', '?')} vCPUs"
+            )
         lines.append(f"    image {p.get('image') or '(unknown)'}")
         if cost is not None:
             lines.append(f"    estimated cost ${cost:.6f} ({p.get('est_cost_source') or 'static'})")

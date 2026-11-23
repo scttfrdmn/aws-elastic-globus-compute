@@ -46,6 +46,22 @@ STATIC_ON_DEMAND = {
 #: Per-vCPU fallback for types not in the table (about the most expensive general family).
 STATIC_PER_VCPU = 0.065
 
+#: Lambda on arm64, us-west-2, read 2026-11-23 (the first tier; us-east-1's is the same). Billed
+#: per millisecond of handler (and, for container images, init) time.
+LAMBDA_ARM_GB_S = 0.0000133334
+LAMBDA_REQUEST = 0.20 / 1_000_000
+
+
+def lambda_cost(billed_s: float, memory_mib: int, invocations: int = 0) -> float:
+    """Dollars for ``billed_s`` seconds at ``memory_mib`` plus ``invocations`` requests."""
+    return billed_s * memory_mib / 1024 * LAMBDA_ARM_GB_S + invocations * LAMBDA_REQUEST
+
+
+def lambda_hourly(memory_mib: int) -> float:
+    """One execution environment kept busy for an hour."""
+    return lambda_cost(3600, memory_mib)
+
+
 _SIZE = re.compile(r"^(?P<family>[a-z0-9-]+)\.(?P<size>[a-z0-9]+)$")
 _MULT = {"medium": 1, "large": 2, "xlarge": 4}
 
@@ -236,6 +252,16 @@ def accrue(records: Iterable[dict[str, Any]], start: float, end: float, prices: 
     by_type: dict[str, float] = {}
     sources: set[str] = set()
     for r in records:
+        if r.get("kind") == "lambda":
+            cost, h = _accrue_lambda(r, start, end)
+            if cost or h:
+                usd += cost
+                hours += h
+                sources.add("static")
+                pool, kind = str(r.get("pool", "")), f"lambda-{int(r.get('memory_mib', 0))}MB"
+                by_pool[pool] = by_pool.get(pool, 0.0) + cost
+                by_type[kind] = by_type.get(kind, 0.0) + cost
+            continue
         lo = max(start, float(r.get("launched_at", 0)))
         last = float(r.get("last_seen", lo))
         # Records are written every 5 min and read up to 5 min late: 20 min of slack.
@@ -260,3 +286,17 @@ def accrue(records: Iterable[dict[str, Any]], start: float, end: float, prices: 
             by_type.get(str(r.get("instance_type", "")), 0.0) + cost
         )
     return Accrued(usd, hours, by_pool, by_type, frozenset(sources))
+
+
+def _accrue_lambda(r: dict[str, Any], start: float, end: float) -> tuple[float, float]:
+    """A Lambda record's dollars and busy hours in ``[start, end)``: its billed time, spread
+    evenly over the span from its first invocation to its last."""
+    first = float(r.get("launched_at", 0))
+    last = float(r.get("last_seen", first))
+    if last <= first:
+        frac = 1.0 if start <= last < end else 0.0
+    else:
+        frac = max(0.0, min(end, last) - max(start, first)) / (last - first)
+    billed = float(r.get("billed_s", 0))
+    total = lambda_cost(billed, int(r.get("memory_mib", 0)), int(r.get("invocations", 0)))
+    return total * frac, billed / 3600 * frac

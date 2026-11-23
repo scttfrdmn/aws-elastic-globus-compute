@@ -79,6 +79,14 @@ def _run(_: argparse.Namespace) -> int:
     return 0
 
 
+def _lambda(_: argparse.Namespace) -> int:
+    """On Lambda (pools of kind ``lambda``): serve invocations through the Runtime API."""
+    from aegc.worker import lambda_handler, lambda_runtime
+
+    lambda_runtime.serve(lambda_handler.handler, init=lambda_handler.runtime)
+    return 0
+
+
 def _selftest(_: argparse.Namespace) -> int:
     """Run a real packed task through execute_task in this image's Python."""
     from globus_compute_common import messagepack
@@ -146,12 +154,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="aegc-worker")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("run", help="claim and run tasks until drained").set_defaults(func=_run)
+    sub.add_parser("lambda", help="serve Lambda invocations (Lambda pools)").set_defaults(
+        func=_lambda
+    )
     sub.add_parser("selftest", help="run a probe task through execute_task").set_defaults(
         func=_selftest
     )
     sub.add_parser("version", help="aegc, Python and uid, as JSON").set_defaults(func=_version)
     args = parser.parse_args(argv)
-    if args.command == "run":
+    if args.command == "lambda":
+        pass  # lambda_handler.runtime() sets up JSON logs
+    elif args.command == "run":
         # On instances: one JSON object per line, for CloudWatch Logs Insights (#39).
         from aegc.worker import jsonlog
 

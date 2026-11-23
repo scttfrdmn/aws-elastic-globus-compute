@@ -23,7 +23,7 @@ _STANDARD = frozenset(vars(logging.LogRecord("", 0, "", 0, "", None, None))) | {
     "taskName",
 }
 
-CONTEXT_FIELDS = ("deployment", "pool", "instance_id", "type", "az", "lifecycle")
+CONTEXT_FIELDS = ("deployment", "pool", "instance_id", "type", "az", "lifecycle", "function")
 
 _context: dict[str, Any] = {}
 
