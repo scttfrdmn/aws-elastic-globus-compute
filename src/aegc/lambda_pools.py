@@ -125,11 +125,6 @@ def per_task(entry: dict[str, Any]) -> tuple[float, float]:
     return round(min(MAX_VCPUS, mib / MIB_PER_VCPU), 2), mib / 1024
 
 
-def worst_case_usd_per_hour(entry: dict[str, Any]) -> float:
-    """Every execution environment the mapping allows, busy for an hour."""
-    return concurrency(entry) * pricing.lambda_hourly(memory_mib(entry))
-
-
 def describe(entry: dict[str, Any]) -> str:
     """``lambda 2048 MB x 10``."""
     return f"lambda {memory_mib(entry)} MB x {concurrency(entry)}"

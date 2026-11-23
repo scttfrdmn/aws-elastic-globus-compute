@@ -500,7 +500,30 @@ def test_destroy_survives_a_deployer_without_the_lambda_policy(
     r = deployment.destroy(c, deployment="dev", region=REGION, dry_run=False, wait_s=30,
                            poll_s=0.1)  # fmt: skip
     assert ("lambda pools", "dev", "kept") in {(a.resource, a.name, a.outcome) for a in r.actions}
-    assert deployment.verify_destroyed(c, deployment="dev", region=REGION, wait_s=0).actions == []
+    v = deployment.verify_destroyed(c, deployment="dev", region=REGION, wait_s=0)
+    assert deployment.remaining(v) == []  # unchecked is said, but isn't a failure...
+    assert [a.detail for a in v.actions] == [deployment.LAMBDA_DENIED]
+
+
+def test_destroy_without_lambda_deployer_fails_when_there_are_lambda_pools(
+    env: tuple[Clients, DeploymentSpec, dict[str, list[Any]]],
+) -> None:
+    # Docs review: it said "kept" and verification passed, with the functions still there.
+    from botocore.exceptions import ClientError
+
+    class Denied:
+        def __getattr__(self, name: str) -> Any:
+            def call(*a: Any, **kw: Any) -> Any:
+                raise ClientError({"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+                                  name)  # fmt: skip
+
+            return call
+
+    c, spec, _ = env
+    deployment.deploy(c, spec)  # with its Lambda pool
+    r = deployment.destroy(replace(c, lambda_=Denied()), deployment="dev", region=REGION,
+                           dry_run=False, wait_s=30, poll_s=0.1)  # fmt: skip
+    assert deployment.remaining(r) and "lambda-deployer" in deployment.remaining(r)[0]
 
 
 def test_footprint_lists_functions_and_mappings(

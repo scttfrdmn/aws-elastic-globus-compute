@@ -1008,7 +1008,9 @@ def _destroy(args: argparse.Namespace) -> int:
         print(f"aegc: {len(left)} resource(s) of {args.deployment} remain", file=sys.stderr)
         return 1
     if args.verify or (args.yes and not args.no_verify):
-        print(f"verified: nothing of {args.deployment} remains")
+        unchecked = any(a.detail == deployment.LAMBDA_DENIED for a in report.actions)
+        note = " (Lambda pools not checked: no lambda-deployer policy)" if unchecked else ""
+        print(f"verified: nothing of {args.deployment} remains{note}")
     return 0
 
 
@@ -1252,7 +1254,7 @@ def build_parser() -> argparse.ArgumentParser:
         "at most max_vcpus); disk: root gp3 GiB (30-16384, default 30); throughput: its MiB/s "
         "(125-1000, default 125); lifetime: 3600-259200 s (default 86400). A Lambda pool, "
         "<env>-py<NNN>-lambda: env:lambda[,memory=MiB,timeout=S,concurrency=N,tmp=MiB,"
-        "walltime=S,max_walltime=S,python=3.NN] (memory 128-10240, default 2048; timeout "
+        "walltime=S,max_walltime=S,python=3.NN] (memory 1024-10240, default 2048; timeout "
         "60-1800, default 900; concurrency 2-1000, default 10; tmp 512-10240). On a redeploy, "
         "options not given keep their last values.",
     )  # fmt: skip

@@ -73,20 +73,18 @@ curl -s 'https://quay.io/api/v1/repository/aarchsci/earth-observation/tag/?onlyA
   | python3 -c 'import json, re, sys; print(max(t["name"] for t in json.load(sys.stdin)["tags"] if re.fullmatch(r"\d{4}(\.\d\d){2}\.\d{6}", t["name"])))'
 ```
 
-At the time of writing that was `2026.11.21.153534`. Build from it:
+At the time of writing that was `2026.11.23.201317`. Build from it:
 
 ```sh
-aegc image build --env earth-observation --base-tag 2026.11.21.153534 \
-  --allow-change python-dateutil
+aegc image build --env earth-observation --base-tag 2026.11.23.201317
 aegc image list --env earth-observation    # one line, for Python 3.14
 ```
 
-`--allow-change python-dateutil` lets the build downgrade one package of the base: this image
-ships python-dateutil 4.0, and botocore (which aegc needs) accepts only versions below 3. Without
-it the build stops, because aegc never changes a base's packages unless told to. With it, that
-package is left out of the constraints the install runs under, so pip can pick a version botocore
-accepts. Every other package of the base stays exactly as it is, apart from `click`, which aegc
-always lets `globus-compute-endpoint` change. See
+The build adds globus-compute-endpoint and aegc without changing any package of the base (apart
+from `click`, which aegc always lets `globus-compute-endpoint` change). Tags before
+2026.11.23 shipped python-dateutil 4.0, which botocore refuses; building from one of those needs
+`--allow-change python-dateutil` (aarchsci fixed it in
+[aarchsci#48](https://github.com/playgroundlogic/aarchsci/issues/48)). See
 [`image build`](../reference/cli.md#aegc-image-build).
 
 ### 2. Deploy a pool with a write grant

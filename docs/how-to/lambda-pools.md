@@ -343,8 +343,8 @@ secrets there.
   [lambda-deployer](../reference/iam.md#lambda-deployer). `stop` still writes the state, so
   records that reach the function are refused, but the mapping keeps delivering until an
   engine or `aegc evaluate` disables it; `aegc status` shows the mapping as
-  `unknown (AccessDeniedException)`. `destroy` removes everything else and reports
-  `kept  lambda pools <d> (not checked: needs the lambda-deployer policy ...)`; run it again with
-  both policies.
+  `unknown (AccessDeniedException)`. `destroy` removes everything else, reports
+  `remaining  lambda pools <d> (not checked: needs the lambda-deployer policy ...)` and exits
+  with an error; run it again with both policies.
 - **A task ran twice.** Delivery is at least once, as on EC2; see
   [Delivery and idempotency](../concepts/delivery.md#lambda-pools).

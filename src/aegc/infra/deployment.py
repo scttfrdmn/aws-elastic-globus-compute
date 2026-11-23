@@ -2024,11 +2024,13 @@ def destroy(
     verb: Outcome = "would-delete" if dry_run else "deleted"
     prefix = f"{naming.PREFIX}-{d}-"
     try:
-        envs = sorted({str(p["env"]) for p in read_manifest(c.ssm, d).get("pools", {}).values()})
+        manifest_pools = dict(read_manifest(c.ssm, d).get("pools", {}))
     except Exception as e:
         if not is_not_found(e):
             raise
-        envs = []
+        manifest_pools = {}
+    envs = sorted({str(p["env"]) for p in manifest_pools.values()})
+    had_lambda = any(lambda_pools.is_lambda(p) for p in manifest_pools.values())
 
     # Queues first, to check for in-flight work before deleting anything.
     queues = [
@@ -2112,7 +2114,8 @@ def destroy(
         except Exception as e:
             if error_code(e) not in ACCESS_DENIED:
                 raise
-            report.add("lambda pools", d, "kept", LAMBDA_DENIED)
+            # With Lambda pools in the manifest, they're still there: say so (and fail).
+            report.add("lambda pools", d, "remaining" if had_lambda else "kept", LAMBDA_DENIED)
 
     for u in queues:
         if not dry_run:
@@ -2350,6 +2353,7 @@ def verify_destroyed(
         except Exception as e:
             if error_code(e) not in ACCESS_DENIED:
                 raise
+            report.add("lambda pools", d, "kept", LAMBDA_DENIED)  # shown, and named below
     if c.scheduler is not None:
         from aegc import lease
 

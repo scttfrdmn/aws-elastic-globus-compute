@@ -94,6 +94,12 @@ live; see the [performance page](docs/reference/performance.md#v07-live-run-2026
   #1622 and #1623 (#1522 is only partly fixed: instances have no primary network interface, so
   the destroy check's interface scan always comes back empty in tests).
 
+- The NDVI tutorial builds `earth-observation` 2026.11.23.201317, which needs no
+  `--allow-change python-dateutil` (aarchsci fixed the conflict with botocore, aarchsci#48).
+- `aegc destroy` without the lambda-deployer policy reports a deployment's Lambda pools as
+  `remaining` and fails, instead of `kept`; verification says when it couldn't check them.
+- Lambda pools' `InitSeconds` counts from the process's start, interpreter start-up included.
+
 ### Fixed
 - Found in review, before release: Lambda spend came from per-environment ledger records that the
   function role, and so task code, could write, and that an invocation timing out never wrote;

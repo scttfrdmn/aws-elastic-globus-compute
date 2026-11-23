@@ -268,14 +268,16 @@ remove them.
 
 **Without the lambda-deployer policy.** Lambda pools' mappings, functions and function roles need
 the [lambda-deployer](../reference/iam.md#lambda-deployer) policy. Without it, `destroy` removes
-everything else, the pools' queues included, and reports
+everything else, the pools' queues included. If the deployment has Lambda pools, it reports them
+as remaining and exits with an error:
 
 ```
-        kept  lambda pools               e2e (not checked: needs the lambda-deployer policy (aegc iam-policy lambda-deployer))
+   remaining  lambda pools               e2e (not checked: needs the lambda-deployer policy (aegc iam-policy lambda-deployer))
 ```
 
-Verification can't list them either, so it doesn't report them as `remaining`. Run
-`aegc destroy <d> --yes` again with both policies, and check with `aegc footprint <d>`.
+(Without Lambda pools the line says `kept`, and verification ends with `verified: nothing of e2e
+remains (Lambda pools not checked: no lambda-deployer policy)`.) Run `aegc destroy <d> --yes`
+again with both policies, and check with `aegc footprint <d>`.
 
 ## Find what exists
 

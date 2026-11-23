@@ -53,8 +53,22 @@ STATE_TTL_S = 60.0
 VISIBILITY_SLACK_S = 60
 SCRATCH = "/tmp/aegc"
 
+
+def _process_start() -> float:
+    """When this process started (Linux: /proc), so init includes the interpreter's start-up;
+    now, elsewhere."""
+    try:
+        with open("/proc/self/stat") as f:
+            ticks = int(f.read().rsplit(")", 1)[1].split()[19])  # field 22: starttime
+        with open("/proc/uptime") as f:
+            uptime = float(f.read().split()[0])
+        return time.time() - (uptime - ticks / os.sysconf("SC_CLK_TCK"))
+    except (OSError, ValueError, IndexError):
+        return time.time()
+
+
 #: When this execution environment's init began (container images are billed for init).
-_INIT_AT = time.time()
+_INIT_AT = _process_start()
 
 
 def environment_id(log_stream: str) -> str:

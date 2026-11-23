@@ -102,9 +102,11 @@ aegc image build --env earth-observation --base-tag 2026.11.21.153534 \
   --allow-change python-dateutil
 ```
 
-That one is real: aarchsci's `earth-observation` 2026.11.21.153534 ships python-dateutil 4.0, and
-botocore, which aegc needs, accepts only versions below 3. Every other package of the base still
-stays as it is, and `click` is always allowed to change. See the
+That one was real: aarchsci's `earth-observation` 2026.11.21.153534 ships python-dateutil 4.0,
+and botocore, which aegc needs, accepts only versions below 3. (aarchsci fixed it from
+2026.11.23.201317 on, [aarchsci#48](https://github.com/playgroundlogic/aarchsci/issues/48); newer
+tags need no flag.) Every other package of the base still stays as it is, and `click` is always
+allowed to change. See the
 [NDVI tutorial](../tutorials/sentinel2-ndvi.md#1-build-the-worker-image).
 
 The base needs a shell (`sh`): aegc runs one in it to see what kind it is, so distroless images
