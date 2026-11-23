@@ -93,6 +93,7 @@ class Env:
             "autoscaling": self.asg,
             "ec2": self.aws("ec2"),
             "pricing": self.aws("pricing"),
+            "lambda": self.aws("lambda"),
         }
         e.start(endpoint_id=EID, run_dir=str(self.tmp / "ep"))
         # Tests drive scale_once() with a fake clock; let the scaler's real-time first pass

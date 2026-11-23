@@ -6,7 +6,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from aegc import naming, quotas, sizes
+from aegc import lambda_pools, naming, quotas, sizes
 from aegc.awsutil import error_code, is_not_found, paginate
 from aegc.infra import Outcome, Report
 from aegc.infra.deployment import _owned_ec2_filters, read_manifest
@@ -36,9 +36,15 @@ class PoolStatus:
     size_class: str = ""  # aegc.sizes; empty: deployed without size= (one task per vCPU)
     task_vcpus: float = 0.0  # what one task is sure to get (aegc.sizes.per_task)
     task_memory_gib: float = 0.0
+    kind: str = "ec2"
+    #: Lambda pools: ``lambda 2048 MB x 10`` and the event source mapping's State.
+    lambda_text: str = ""
+    mapping: str = ""
 
     @property
     def size_text(self) -> str:
+        if self.kind == lambda_pools.KIND:
+            return f"{self.task_vcpus:g} vCPU(s), {self.task_memory_gib:g} GiB per task"
         name = self.size_class or "per-vCPU"
         if self.size_class == "whole":
             return (
@@ -102,10 +108,16 @@ class DeploymentStatus:
                 parts.append(f"TTL {_utc(self.ttl_expires)}")
             lines.append("  " + "; ".join(parts))
         for p in self.pools:
+            if p.kind == lambda_pools.KIND:
+                capacity = f"{p.lambda_text}, event source mapping {p.mapping or 'unknown'}"
+            else:
+                capacity = (
+                    f"workers {p.in_service} in service, {p.desired} {p.unit} desired, "
+                    f"max {p.max_capacity}"
+                )
             lines.append(
                 f"  pool {p.name}: env {p.env}, Python {p.python_minor} | tasks queued {p.queued}, "
-                f"running {p.running}, dead-lettered {p.dead_letters} | workers {p.in_service} "
-                f"in service, {p.desired} {p.unit} desired, max {p.max_capacity}"
+                f"running {p.running}, dead-lettered {p.dead_letters} | {capacity}"
             )
             extra = [p.size_text]
             if p.workers:
@@ -152,6 +164,7 @@ def status(
     prices: Any | None = None,
     scheduler: Any | None = None,
     now: float | None = None,
+    lam: Any | None = None,
 ) -> DeploymentStatus:
     from aegc import pricing, protocol
     from aegc.control import describe_limits
@@ -179,9 +192,16 @@ def status(
             unit="vCPUs" if pool.get("capacity_type") == "vcpu" else "workers",
             size_class=str(pool.get("size_class") or ""),
         )
-        ps.task_vcpus, ps.task_memory_gib = sizes.per_task(pool)
         ps.queued, ps.running = _counts(sqs, pool["task_queue_url"])
         ps.dead_letters, _ = _counts(sqs, pool["dlq_url"])
+        if cw is not None:
+            ps.oldest_task_s = _oldest_age(cw, pool["task_queue_url"].rsplit("/", 1)[-1], now)
+        if lambda_pools.is_lambda(pool):
+            _lambda_status(ps, pool, lam)
+            out.usd_per_hour += ps.usd_per_hour
+            out.pools.append(ps)
+            continue
+        ps.task_vcpus, ps.task_memory_gib = sizes.per_task(pool)
         groups = autoscaling.describe_auto_scaling_groups(
             AutoScalingGroupNames=[pool["auto_scaling_group"]]
         )["AutoScalingGroups"]
@@ -216,8 +236,6 @@ def status(
             if acts:
                 a = acts[0]
                 ps.last_activity = f"{a.get('StatusCode', '')}: {a.get('Description', '')}".strip()
-        if cw is not None:
-            ps.oldest_task_s = _oldest_age(cw, pool["task_queue_url"].rsplit("/", 1)[-1], now)
         out.usd_per_hour += ps.usd_per_hour
         out.pools.append(ps)
     if s3 is not None and prices is not None:
@@ -239,13 +257,41 @@ def status(
         ttl_at = float((m.get("lease") or {}).get("ttl_at") or 0)
         out.ttl_expires = ttl_at or None
     if sq is not None and cw is not None:
-        out.quotas = quotas.check(
-            [{"name": n, **p} for n, p in m.get("pools", {}).items()], sq=sq, cw=cw
-        )
+        ec2_pools = [
+            {"name": n, **p} for n, p in m.get("pools", {}).items() if not lambda_pools.is_lambda(p)
+        ]
+        out.quotas = quotas.check(ec2_pools, sq=sq, cw=cw) if ec2_pools else []
     for url in _result_queues(sqs, deployment):
         visible, inflight = _counts(sqs, url)
         out.result_queues[url.rsplit("/", 1)[-1]] = visible + inflight
     return out
+
+
+def _lambda_status(ps: PoolStatus, pool: dict[str, Any], lam: Any | None) -> None:
+    """A Lambda pool's capacity: its function's memory and concurrency, the mapping's state,
+    and about what it costs now (one busy environment per task running)."""
+    from aegc import pricing, protocol
+
+    ps.kind = lambda_pools.KIND
+    ps.lambda_text = lambda_pools.describe(pool)
+    ps.max_capacity = lambda_pools.concurrency(pool)
+    ps.unit = "concurrent invocations"
+    ps.task_vcpus, ps.task_memory_gib = lambda_pools.per_task(pool)
+    if lam is not None:
+        try:
+            ps.mapping = lambda_pools.mapping_state(lam, pool) or "unknown"
+        except Exception as e:
+            ps.mapping = f"unknown ({error_code(e) or e})"
+    hourly = pricing.lambda_hourly(lambda_pools.memory_mib(pool))
+    busy = min(ps.running, ps.max_capacity)
+    ps.in_service = busy
+    ps.usd_per_hour = busy * hourly
+    if busy:
+        walltime = min(
+            int(pool.get("walltime_s") or protocol.DEFAULT_WALLTIME_S),
+            lambda_pools.max_walltime_s(pool),
+        )
+        ps.exposure_usd = busy * walltime / 3600 * hourly
 
 
 def _utc(t: float) -> str:

@@ -349,7 +349,7 @@ def _evaluate(args: argparse.Namespace) -> int:
     sess, region, _ = _ctx(args)
     clients = {
         s: awsutil.client(sess, s)  # type: ignore[arg-type]
-        for s in ("ssm", "s3", "autoscaling", "scheduler", "sqs", "ec2", "cloudwatch")
+        for s in ("ssm", "s3", "autoscaling", "scheduler", "sqs", "ec2", "cloudwatch", "lambda")
     }
     clients["pricing"] = awsutil.client(  # the Price List API is in us-east-1
         awsutil.session(args.profile, "us-east-1"), "pricing"
@@ -756,6 +756,7 @@ def _stop(args: argparse.Namespace) -> int:
             autoscaling=awsutil.client(sess, "autoscaling"),  # type: ignore[arg-type]
             deployment=args.deployment,
             hard=args.hard,
+            lam=awsutil.client(sess, "lambda"),  # type: ignore[arg-type]
         )
     )
     return 0
@@ -771,6 +772,7 @@ def _resume(args: argparse.Namespace) -> int:
             autoscaling=awsutil.client(sess, "autoscaling"),  # type: ignore[arg-type]
             deployment=args.deployment,
             scheduler=awsutil.client(sess, "scheduler"),  # type: ignore[arg-type]
+            lam=awsutil.client(sess, "lambda"),  # type: ignore[arg-type]
         )
     )
     return 0
@@ -799,6 +801,7 @@ def _limits(args: argparse.Namespace) -> int:
             resume_now=args.resume,
             spend=spend if args.resume else None,
             scheduler=awsutil.client(sess, "scheduler"),  # type: ignore[arg-type]
+            lam=awsutil.client(sess, "lambda"),  # type: ignore[arg-type]
             max_usd_day=args.max_usd_day,
             max_usd_month=args.max_usd_month,
             max_instance_hours_day=args.max_instance_hours_day,
@@ -932,6 +935,7 @@ def _status(args: argparse.Namespace) -> int:
             pricing=awsutil.client(awsutil.session(args.profile, "us-east-1"), "pricing"),
         ),
         scheduler=awsutil.client(sess, "scheduler"),  # type: ignore[arg-type]
+        lam=awsutil.client(sess, "lambda"),  # type: ignore[arg-type]
     )
     if args.json:
         print(json.dumps(st.to_dict(), indent=2, sort_keys=True))

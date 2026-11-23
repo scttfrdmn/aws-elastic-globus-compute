@@ -13,6 +13,9 @@ Properties the interchange relies on:
   result that arrives for a task this process doesn't know is written to
   ``<run_dir>/unacked_results/<task_uuid>``, which the interchange republishes.
 - The scaler only scales out. Several processes may share a pool; workers scale in themselves.
+- Lambda pools (#21, :mod:`aegc.lambda_pools`) aren't scaled: Lambda scales them. Tasks go to one
+  only when they name it (``pool=``) or their env has no EC2 pool for their Python. The scaler
+  keeps each one's event source mapping enabled while the deployment runs, disabled otherwise.
 """
 
 from __future__ import annotations
@@ -33,7 +36,18 @@ from typing import Any
 from globus_compute_common.messagepack.message_types import EPStatusReport
 from globus_compute_endpoint.engines.base import GlobusComputeEngineBase
 
-from aegc import __version__, awsutil, caps, lease, naming, payloads, protocol, sizes
+from aegc import (
+    __version__,
+    awsutil,
+    caps,
+    lambda_pools,
+    lease,
+    naming,
+    payloads,
+    pricing,
+    protocol,
+    sizes,
+)
 from aegc.gcresult import failed_result
 from aegc.pricing import IPV4_HOUR, Prices, volume_hour
 from aegc.protocol import Call, ProtocolError, ResultMessage, TaskMessage
@@ -94,6 +108,8 @@ class _PoolMetrics:
     stalled: bool = False
     last_scaling_error: str = ""
     admitted: int | None = None  # capped by spend admission this pass (None: not limited)
+    kind: str = "ec2"
+    mapping: str = ""  # Lambda pools: the event source mapping's State
 
 
 @dataclass
@@ -195,7 +211,7 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         try:
             sess = awsutil.session(self.aws_profile, self.region)
             self.region = self.region or (sess.region_name or "")
-            for svc in ("sqs", "s3", "ssm", "autoscaling", "ec2", "scheduler"):
+            for svc in ("sqs", "s3", "ssm", "autoscaling", "ec2", "scheduler", "lambda"):
                 if svc not in self._clients:  # tests inject clients before start()
                     self._clients[svc] = awsutil.client(sess, svc)
             if "pricing" not in self._clients:  # the Price List API lives in us-east-1
@@ -252,18 +268,30 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
             with self._lock:
                 outstanding = len(self._inflight)
             pools = {
-                name: {
-                    "queue_visible": m.visible,
-                    "queue_inflight": m.inflight,
-                    "dlq": m.dlq,
-                    "asg_desired": m.desired,
-                    "asg_in_service": m.in_service,
-                    "min": m.min,
-                    "max": m.max,
-                    "slots": m.slots,
-                    "stalled": m.stalled,
-                    "last_scaling_error": m.last_scaling_error,
-                }
+                name: (
+                    {
+                        "kind": m.kind,
+                        "queue_visible": m.visible,
+                        "queue_inflight": m.inflight,
+                        "dlq": m.dlq,
+                        "max_concurrency": m.max,
+                        "mapping": m.mapping,
+                        "last_scaling_error": m.last_scaling_error,
+                    }
+                    if m.kind == lambda_pools.KIND
+                    else {
+                        "queue_visible": m.visible,
+                        "queue_inflight": m.inflight,
+                        "dlq": m.dlq,
+                        "asg_desired": m.desired,
+                        "asg_in_service": m.in_service,
+                        "min": m.min,
+                        "max": m.max,
+                        "slots": m.slots,
+                        "stalled": m.stalled,
+                        "last_scaling_error": m.last_scaling_error,
+                    }
+                )
                 for name, m in snap.pools.items()
             }
             state = {
@@ -431,13 +459,13 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
             name = str(spec["pool"])
             if name not in pools:
                 return None, 0, f"no pool {name!r} in deployment {self.deployment!r}"
-            walltime, problem = _walltime(spec, pools[name])
+            walltime, problem = _walltime(spec, pools[name], name)
             problem = problem or self._python_check(name, pools[name]) or _fit(spec, name, pools)
             return name, walltime, problem
         picked, problem = self._pick_pool(spec, pools)
         if picked is None:
             return None, 0, problem
-        walltime, problem = _walltime(spec, pools[picked])
+        walltime, problem = _walltime(spec, pools[picked], picked)
         return (None, 0, problem) if problem else (picked, walltime, "")
 
     def _pick_pool(
@@ -458,8 +486,10 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
                     f"no worker image for Python {self.python_minor} in env {env!r}; "
                     f"available: {', '.join(have)}. Submit from a matching Python version."
                 )
-            candidates = {n: candidates[n] for n in matching}
+            candidates = _prefer_ec2({n: candidates[n] for n in matching})
         else:
+            # Lambda pools only for an env without EC2 pools (any Python): see _prefer_ec2.
+            candidates = _prefer_ec2(candidates)
             minors = sorted(
                 {str(p.get("python_minor")) for p in candidates.values()},
                 key=lambda m: tuple(int(x) if x.isdigit() else 0 for x in m.split(".")),
@@ -700,6 +730,8 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         if self._manifest is None:
             return
         for name, pool in self._manifest.get("pools", {}).items():
+            if lambda_pools.is_lambda(pool):
+                continue  # the scaler enables its mapping (_reconcile_mappings)
             minimum = int(pool.get("min_vcpus" if _vcpu_mode(pool) else "min_workers", 0))
             if not minimum:
                 continue
@@ -837,7 +869,9 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         pools: dict[str, dict[str, Any]] = self._manifest.get("pools", {})
         groups: dict[str, dict[str, Any]] = {}
         for name, pool in pools.items():
-            if _vcpu_mode(pool):
+            if lambda_pools.is_lambda(pool):
+                m = _PoolMetrics(kind=lambda_pools.KIND, max=lambda_pools.concurrency(pool))
+            elif _vcpu_mode(pool):
                 m = _PoolMetrics(
                     min=int(pool.get("min_vcpus", 0)), max=int(pool.get("max_vcpus", 0))
                 )
@@ -855,6 +889,9 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
             )["Attributes"]
             m.visible = int(a.get("ApproximateNumberOfMessages", 0))
             m.inflight = int(a.get("ApproximateNumberOfMessagesNotVisible", 0))
+            if m.kind == lambda_pools.KIND:  # Lambda scales it: nothing to describe
+                snap.pools[name] = m
+                continue
             found = asg.describe_auto_scaling_groups(
                 AutoScalingGroupNames=[pool["auto_scaling_group"]]
             )["AutoScalingGroups"]
@@ -868,9 +905,14 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
                 )
             snap.pools[name] = m
 
+        self._reconcile_mappings(pools, snap, now)
         limits = Limits.from_dict(self._manifest.get("limits"))
         rate_now, instances_now = self._current_rate(pools, groups)
-        snap.usd_per_hour = rate_now
+        snap.usd_per_hour = rate_now + self._lambda_rate(pools, snap)
+        # Admission counts Lambda pools at their worst case: every environment busy.
+        worst_rate, worst_instances = _lambda_worst_case(pools)
+        rate_now += worst_rate
+        instances_now += worst_instances
         if limits.any and self._spend is not None and self._state.running:
             try:
                 snap.spend_today = round(self._spend.accrued("day", now).usd, 4)
@@ -886,6 +928,8 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
 
         for name, pool in pools.items():
             m = snap.pools[name]
+            if m.kind == lambda_pools.KIND:
+                continue
             demand = max(outstanding.get(name, 0), m.visible + m.inflight)
             target = min(max(_capacity_for(pool, demand), m.min), m.max)
             m.stalled = self._stalled(name, m, demand, now)
@@ -966,6 +1010,46 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
                 n += 1
         return rate, n
 
+    def _lambda_rate(self, pools: dict[str, dict[str, Any]], snap: _Snapshot) -> float:
+        """About what the Lambda pools cost now: one busy environment per message in flight."""
+        return sum(
+            min(snap.pools[n].inflight, lambda_pools.concurrency(p))
+            * pricing.lambda_hourly(lambda_pools.memory_mib(p))
+            for n, p in pools.items()
+            if lambda_pools.is_lambda(p) and n in snap.pools
+        )
+
+    def _reconcile_mappings(
+        self, pools: dict[str, dict[str, Any]], snap: _Snapshot, now: float
+    ) -> None:
+        """Lambda pools' mappings follow the state: enabled while running, else disabled (a cap
+        whose period ends reads as running with nobody to enable them)."""
+        lam = self._clients.get("lambda")
+        if lam is None or not lambda_pools.mappings(pools):
+            return
+
+        def still_running() -> bool:  # re-read: don't undo a stop that just happened
+            return self.refresh_state(now, force=True).running
+
+        try:
+            states, changes = lambda_pools.reconcile(
+                lam, pools, self._state.running, confirm=still_running
+            )
+        except Exception as e:
+            snap.last_aws_error = f"Lambda mappings: {e}"
+            log.warning("couldn't check the Lambda pools' mappings: %s", e)
+            return
+        for name, state in states.items():
+            if name in snap.pools:
+                snap.pools[name].mapping = state
+        for name, change in changes.items():
+            if change in ("enabled", "disabled"):
+                log.info("pool %s: %s its event source mapping", name, change)
+            else:
+                if name in snap.pools:
+                    snap.pools[name].last_scaling_error = change
+                log.warning("pool %s: couldn't update its event source mapping: %s", name, change)
+
     def _unit_cost(self, pool: dict[str, Any]) -> float:
         """$/h of one more worker, erring high: the priciest allowed family at the pool's
         smallest size, plus volume and IPv4."""
@@ -1030,6 +1114,8 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
                 for name, g in groups.items()
             },
             by="engine",
+            lam=self._clients.get("lambda"),
+            mappings=lambda_pools.mappings(pools),
         )
         if error is not None:  # still stop this process's spending
             self._local_cap = st
@@ -1105,19 +1191,51 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         return False
 
 
-def _walltime(spec: dict[str, Any], pool: dict[str, Any]) -> tuple[int, str]:
-    """(walltime_s, problem): the request's, else the pool's default; within the pool's max."""
-    default = int(pool.get("walltime_s") or protocol.DEFAULT_WALLTIME_S)
+def _walltime(spec: dict[str, Any], pool: dict[str, Any], name: str = "") -> tuple[int, str]:
+    """(walltime_s, problem): the request's, else the pool's default; within the pool's max
+    (for a Lambda pool, also within its function's timeout)."""
     ceiling = min(
         int(pool.get("max_walltime_s") or protocol.MAX_WALLTIME_S), protocol.MAX_WALLTIME_S
     )
+    if lambda_pools.is_lambda(pool):
+        ceiling = min(ceiling, lambda_pools.max_walltime_s(pool))
+    default = int(pool.get("walltime_s") or protocol.DEFAULT_WALLTIME_S)
     try:
         walltime = int(spec.get("walltime_s", min(default, ceiling)))
     except (TypeError, ValueError):
         return 0, "walltime_s must be an integer number of seconds"
+    if lambda_pools.is_lambda(pool) and walltime > ceiling >= 1:
+        timeout = int(pool.get("timeout_s") or lambda_pools.DEFAULT_TIMEOUT_S)
+        return 0, (
+            f"walltime_s {walltime} is more than Lambda pool {name!r} allows: its function "
+            f"{pool.get('function_name') or '?'} times out after {timeout} s, so a task gets at "
+            f"most {ceiling} s ({lambda_pools.MARGIN_S} s are kept for posting the result). Ask "
+            "for less, or use an EC2 pool for longer tasks."
+        )
     if not 1 <= walltime <= ceiling:
         return 0, f"walltime_s must be between 1 and {ceiling}"
     return walltime, ""
+
+
+def _prefer_ec2(pools: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """The EC2 pools, if there are any: tasks go to a Lambda pool only by name, or when only
+    Lambda pools serve their env (and Python)."""
+    return {n: p for n, p in pools.items() if not lambda_pools.is_lambda(p)} or pools
+
+
+def _lambda_worst_case(pools: dict[str, dict[str, Any]]) -> tuple[float, float]:
+    """($/h, busy environments) of every Lambda pool at its maximum concurrency."""
+    lam = [p for p in pools.values() if lambda_pools.is_lambda(p)]
+    return (
+        sum(lambda_pools.worst_case_usd_per_hour(p) for p in lam),
+        float(sum(lambda_pools.concurrency(p) for p in lam)),
+    )
+
+
+def _per_task(pool: dict[str, Any]) -> tuple[float, float]:
+    if lambda_pools.is_lambda(pool):
+        return lambda_pools.per_task(pool)
+    return sizes.per_task(pool)
 
 
 def _families(pool: dict[str, Any]) -> list[str]:
@@ -1165,9 +1283,10 @@ def _pick_size(
 
     def have() -> str:
         return ", ".join(
-            f"{n} ({cls(p)}: {c:g} vCPU, {m:g} GiB per task)"
+            f"{n} ({lambda_pools.describe(p) if lambda_pools.is_lambda(p) else cls(p)}: "
+            f"{c:g} vCPU, {m:g} GiB per task)"
             for n, p in sorted(pools.items())
-            for c, m in [sizes.per_task(p)]
+            for c, m in [_per_task(p)]
         )
 
     if "size" in spec:
@@ -1181,9 +1300,16 @@ def _pick_size(
     mem = float(spec.get("memory_gib", 0))
     # Cheapest first: the vCPUs a task holds, then a sized pool over a whole one, then memory.
     fits = [
-        (_capacity_for({**p, "slots": "auto", "capacity_type": "vcpu"}, 1), cls(p) == "whole", m, n)
+        (
+            math.ceil(c)
+            if lambda_pools.is_lambda(p)
+            else _capacity_for({**p, "slots": "auto", "capacity_type": "vcpu"}, 1),
+            cls(p) == "whole",
+            m,
+            n,
+        )
         for n, p in pools.items()
-        for c, m in [sizes.per_task(p)]
+        for c, m in [_per_task(p)]
         if c >= cpus and m >= mem
     ]
     if not fits:
@@ -1197,7 +1323,7 @@ def _pick_size(
 def _fit(spec: dict[str, Any], name: str, pools: dict[str, dict[str, Any]]) -> str:
     """A problem if the request's ``cpus``/``memory_gib`` don't fit pool ``name``'s tasks."""
     cpus, mem = float(spec.get("cpus", 0)), float(spec.get("memory_gib", 0))
-    c, m = sizes.per_task(pools[name])
+    c, m = _per_task(pools[name])
     if cpus > c or mem > m:
         return (
             f"pool {name!r} gives a task {c:g} vCPUs and {m:g} GiB, less than the "

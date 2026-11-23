@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from aegc import ledger, pricing
+from aegc import lambda_pools, ledger, pricing
 from aegc.infra.deployment import manifest_generation, read_manifest, update_manifest
 from aegc.state import Limits, State, period_start, read_state, write_state
 
@@ -30,6 +30,29 @@ def _min_of(pool: dict[str, Any]) -> tuple[int, str]:
     return int(pool.get("min_workers", 0)), "workers"
 
 
+def _set_mappings(
+    report: ControlReport, lam: Any, pools: dict[str, dict[str, Any]], enabled: bool
+) -> None:
+    """Enable or disable the Lambda pools' event source mappings, reporting each."""
+    maps = lambda_pools.mappings(pools)
+    if not maps:
+        return
+    verb = "enabled" if enabled else "disabled"
+    if lam is None:
+        for name in maps:
+            report.add(f"  pool {name}: event source mapping NOT {verb} (no Lambda client)")
+        return
+    errors = lambda_pools.set_all(lam, maps, enabled)
+    for name in maps:
+        if name in errors:
+            report.add(
+                f"  pool {name}: couldn't {verb[:-1]} the event source mapping: {errors[name]}"
+            )
+        else:
+            what = lambda_pools.describe(pools[name])
+            report.add(f"  pool {name} ({what}): event source mapping {verb}")
+
+
 def stop(
     *,
     ssm: Any,
@@ -38,12 +61,15 @@ def stop(
     hard: bool = False,
     grace_s: float = HARD_STOP_GRACE_S,
     sleep: Any = time.sleep,
+    lam: Any = None,
 ) -> ControlReport:
-    """Stop spending: state ``stopped``; every group's minimum to 0 so workers can leave.
+    """Stop spending: state ``stopped``; every group's minimum to 0 so workers can leave; every
+    Lambda pool's event source mapping disabled.
 
     Workers see the state within a minute, fail anything still queued with AEGC_STOPPED, finish
     their tasks (or, with ``hard``, fail them now), then leave their groups. With ``hard``, any
-    instance still in a group after ``grace_s`` is terminated.
+    instance still in a group after ``grace_s`` is terminated. Lambda invocations already running
+    finish; records delivered after the state changed are refused with a final result.
     """
     report = ControlReport()
     m = read_manifest(ssm, deployment)
@@ -56,11 +82,18 @@ def stop(
     )
     write_state(ssm, deployment, st)
     report.add(f"deployment {deployment}: state stopped{' (hard)' if hard else ''}")
-    groups = {n: p["auto_scaling_group"] for n, p in m.get("pools", {}).items()}
+    pools = m.get("pools", {})
+    _set_mappings(report, lam, pools, False)
+    groups = {n: p["auto_scaling_group"] for n, p in pools.items() if not lambda_pools.is_lambda(p)}
     for name, group in sorted(groups.items()):
         autoscaling.update_auto_scaling_group(AutoScalingGroupName=group, MinSize=0)
         report.add(f"  pool {name}: minimum 0; workers drain within about a minute")
-    if hard:
+    if hard and lambda_pools.mappings(pools):
+        report.add(
+            "  Lambda pools: invocations already running finish (Lambda can't stop them early); "
+            "records not yet started are refused with AEGC_STOPPED"
+        )
+    if hard and groups:
         sleep(grace_s)
         for name, group in sorted(groups.items()):
             # Desired 0 first: then terminating needs no decrement (which a vCPU-weighted group
@@ -85,21 +118,31 @@ def stop(
 
 
 def resume(
-    *, ssm: Any, autoscaling: Any, deployment: str, scheduler: Any | None = None
+    *,
+    ssm: Any,
+    autoscaling: Any,
+    deployment: str,
+    scheduler: Any | None = None,
+    lam: Any = None,
 ) -> ControlReport:
-    """Back to running: clear the state, restore each group's minimum from the manifest, and
-    (given a scheduler client) push the lease forward."""
+    """Back to running: clear the state, restore each group's minimum from the manifest, enable
+    the Lambda pools' event source mappings, and (given a scheduler client) push the lease
+    forward."""
     report = ControlReport()
     m = read_manifest(ssm, deployment)
     before = read_state(ssm, deployment)
     write_state(ssm, deployment, State(reason="aegc resume", since=time.time(), by="aegc resume"))
     report.add(f"deployment {deployment}: {before.mode} -> running")
-    for name, pool in sorted(m.get("pools", {}).items()):
+    pools = m.get("pools", {})
+    for name, pool in sorted(pools.items()):
+        if lambda_pools.is_lambda(pool):
+            continue
         minimum, unit = _min_of(pool)
         autoscaling.update_auto_scaling_group(
             AutoScalingGroupName=pool["auto_scaling_group"], MinSize=minimum
         )
         report.add(f"  pool {name}: minimum {minimum} {unit}")
+    _set_mappings(report, lam, pools, True)
     lease_s = int((m.get("lease") or {}).get("lease_s") or 0)
     if scheduler is not None and lease_s:
         from aegc import lease
@@ -117,6 +160,7 @@ def set_limits(
     resume_now: bool = False,
     spend: Any | None = None,
     scheduler: Any | None = None,
+    lam: Any = None,
     **changes: Any,
 ) -> ControlReport:
     """Change a deployment's spend limits (``"none"`` removes one). Running engines pick the
@@ -138,8 +182,9 @@ def set_limits(
                     f"still over a limit ({trip.reason}); raise it (e.g. --max-usd-day) to resume"
                 )
             report.lines += resume(
-                ssm=ssm, autoscaling=autoscaling, deployment=deployment, scheduler=scheduler
-            ).lines
+                ssm=ssm, autoscaling=autoscaling, deployment=deployment, scheduler=scheduler,
+                lam=lam,
+            ).lines  # fmt: skip
         else:
             report.add(f"  state is {st.mode}; nothing to resume")
     return report
@@ -182,7 +227,8 @@ class CostReport:
             lines.append(f"  {key or '?'}: ${usd:.4f}")
         lines.append(
             "  estimate from the cost ledger: instance time x Spot or on-demand price, plus root "
-            "volume and IPv4; SQS, S3, ECR, logs and data transfer aren't included"
+            "volume and IPv4; Lambda pools (lambda-<memory>MB): billed time x memory, plus "
+            "requests; SQS, S3, ECR, logs and data transfer aren't included"
         )
         if self.actual:
             lines.append(self.actual)

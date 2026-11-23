@@ -6,6 +6,7 @@ import logging
 import time
 from typing import Any
 
+from aegc import lambda_pools
 from aegc.spend import Trip
 from aegc.state import Limits, State, write_state
 
@@ -22,11 +23,14 @@ def trip(
     groups: dict[str, int],
     by: str,
     now: float | None = None,
+    lam: Any = None,
+    mappings: dict[str, str] | None = None,
 ) -> tuple[State, Exception | None]:
-    """Set the deployment ``capped`` and drop group minimums to 0.
+    """Set the deployment ``capped``, drop group minimums to 0 and disable Lambda pools.
 
-    ``groups`` maps Auto Scaling group names to their current MinSize. Returns the state and the
-    error from writing it, if that failed (the caller still stops its own spending).
+    ``groups`` maps Auto Scaling group names to their current MinSize, ``mappings`` Lambda pools
+    to their event source mapping UUIDs (:func:`aegc.lambda_pools.mappings`). Returns the state
+    and the error from writing it, if that failed (the caller still stops its own spending).
     """
     st = State(
         mode="capped",
@@ -50,4 +54,10 @@ def trip(
                 autoscaling.update_auto_scaling_group(AutoScalingGroupName=asg, MinSize=0)
             except Exception as e:
                 log.warning("%s: couldn't lower the minimum: %s", asg, e)
+    if mappings:
+        if lam is None:
+            log.error("no Lambda client: Lambda pools %s stay enabled", sorted(mappings))
+        else:
+            for pool, err in lambda_pools.set_all(lam, mappings, False).items():
+                log.warning("pool %s: couldn't disable its event source mapping: %s", pool, err)
     return st, error
