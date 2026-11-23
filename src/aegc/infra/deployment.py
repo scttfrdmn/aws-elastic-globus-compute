@@ -8,12 +8,16 @@ via ``resolve:ssm:``, IMDSv2 with hop limit 2, gp3 root), and a Spot Auto Scalin
 attribute-based Graviton selection, protected from scale-in and with AZRebalance suspended, in the
 subnets whose zones offer the pool's instance types. Workers scale the group in themselves.
 
+Lambda pool (kind ``lambda``, :mod:`aegc.lambda_pools`): the task queues, a function role, a
+function running the pool's image, and an event source mapping from the task queue.
+
 Every create carries the ownership tags; ``destroy`` deletes only what carries them (see
 :func:`aegc.naming.is_owned`) and is a dry run unless asked otherwise.
 """
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import time
@@ -22,7 +26,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any
 
-from aegc import __version__, images, naming, protocol, sizes
+from aegc import __version__, images, lambda_pools, naming, protocol, sizes
 from aegc.awsutil import error_code, is_not_found, paginate
 from aegc.infra import Outcome, OwnershipError, Report, iam, userdata
 
@@ -38,6 +42,16 @@ ROOT_GIB_RANGE = (30, 16384)
 THROUGHPUT_RANGE = (125, 1000)
 BASE_IOPS = 3000
 GROUP_METRICS_NOTE = "1-minute group metrics"
+KINDS = ("ec2", lambda_pools.KIND)
+#: PoolSpec fields only EC2 pools use; Lambda pools keep their defaults.
+EC2_ONLY = (
+    "min_vcpus", "max_vcpus", "vcpu_min", "vcpu_max", "memory_mib_min", "spot", "slots",
+    "allowed_instance_types", "root_volume_gib", "idle_timeout_s", "throughput_mibps",
+    "max_lifetime_s", "size_class", "task_cpus", "task_memory_gib", "memory_gib_per_vcpu_min",
+)  # fmt: skip
+#: PoolSpec fields only Lambda pools use; EC2 pools keep them 0.
+LAMBDA_ONLY = ("memory_mib", "timeout_s", "max_concurrency", "ephemeral_mib")
+LAMBDA_VISIBILITY_MARGIN_S = 60
 
 
 @dataclass(frozen=True)
@@ -85,6 +99,14 @@ class PoolSpec:
 
     def __post_init__(self) -> None:
         naming.validate_name("pool", self.name)
+        if self.kind not in KINDS:
+            raise ValueError(f"pool kind must be one of {', '.join(KINDS)}, not {self.kind!r}")
+        if self.is_lambda:
+            self._check_lambda()
+            return
+        for f in LAMBDA_ONLY:
+            if getattr(self, f):
+                raise ValueError(f"{f} applies to Lambda pools only (kind=lambda)")
         if self.size_class:
             sizes.get(self.size_class)  # a known class
             if self.slots != "auto":
@@ -130,6 +152,54 @@ class PoolSpec:
         if not lo <= self.throughput_mibps <= hi:
             raise ValueError(f"gp3 throughput (throughput=) must be {lo}-{hi} MiB/s")
 
+    def _check_lambda(self) -> None:
+        """Lambda's limits; fills in the defaults (0) so the manifest records what's deployed."""
+        defaults = {f.name: f.default for f in fields(self)}
+        for f in EC2_ONLY:
+            if getattr(self, f) != defaults[f]:
+                raise ValueError(f"{f} applies to EC2 pools only, not to Lambda pools")
+        if self.isolate_tasks:
+            # Lambda gives the process the role's credentials in environment variables, with no
+            # uid to drop to: task code always runs with the function role (and its grants).
+            raise ValueError(
+                "Lambda pools can't isolate tasks: task code runs with the function role's "
+                "credentials (the pool's queue, payloads and grants)"
+            )
+
+        def put(key: str, value: Any) -> None:
+            object.__setattr__(self, key, value)  # frozen
+
+        put("memory_mib", self.memory_mib or lambda_pools.DEFAULT_MEMORY_MIB)
+        put("timeout_s", self.timeout_s or lambda_pools.DEFAULT_TIMEOUT_S)
+        put("max_concurrency", self.max_concurrency or lambda_pools.DEFAULT_CONCURRENCY)
+        lo, hi = lambda_pools.MEMORY_MIB_RANGE
+        if not lo <= self.memory_mib <= hi:
+            raise ValueError(f"Lambda memory (memory=) must be {lo}-{hi} MiB")
+        if not 60 <= self.timeout_s <= lambda_pools.MAX_TIMEOUT_S:
+            raise ValueError(f"Lambda timeout (timeout=) must be 60-{lambda_pools.MAX_TIMEOUT_S} s")
+        lo, hi = lambda_pools.CONCURRENCY_RANGE
+        if not lo <= self.max_concurrency <= hi:
+            raise ValueError(f"Lambda concurrency (concurrency=) must be {lo}-{hi}")
+        lo, hi = lambda_pools.EPHEMERAL_MIB_RANGE
+        if self.ephemeral_mib and not lo <= self.ephemeral_mib <= hi:
+            raise ValueError(f"Lambda /tmp (tmp=) must be {lo}-{hi} MiB")
+        # Each invocation keeps MARGIN_S for posting the result.
+        ceiling = self.timeout_s - lambda_pools.MARGIN_S
+        if self.walltime_s < 0 or self.max_walltime_s < 0:
+            raise ValueError("walltime_s and max_walltime_s must be >= 0")
+        if self.max_walltime_s > ceiling:
+            raise ValueError(
+                f"max_walltime={self.max_walltime_s} doesn't fit timeout={self.timeout_s} (at "
+                f"most {ceiling} s: {lambda_pools.MARGIN_S} s are kept for posting the result)"
+            )
+        put("max_walltime_s", self.max_walltime_s or ceiling)
+        put("walltime_s", self.walltime_s or min(protocol.DEFAULT_WALLTIME_S, self.max_walltime_s))
+        if self.walltime_s > self.max_walltime_s:
+            raise ValueError(
+                f"walltime={self.walltime_s} exceeds max_walltime_s={self.max_walltime_s} "
+                f"(timeout={self.timeout_s} less {lambda_pools.MARGIN_S} s)"
+            )
+
     @classmethod
     def from_manifest(cls, name: str, entry: dict[str, Any]) -> PoolSpec:
         """The PoolSpec a manifest pool entry was deployed from (for redeploy merges)."""
@@ -169,6 +239,20 @@ class DeploymentSpec:
             )
         )
         object.__setattr__(self, "grants", grants)
+        for p in self.pools:
+            if p.is_lambda:  # Lambda allows 64-character function names, IAM 64 for roles
+                for what, name in (
+                    ("function", lambda_pools.function_name(self.deployment, p.name)),
+                    (
+                        "function role",
+                        lambda_pools.function_role(self.deployment, p.name, self.region),
+                    ),
+                ):
+                    if len(name) > 64:
+                        raise ValueError(
+                            f"Lambda pool {p.name}: its {what} name {name} is longer than 64 "
+                            "characters; use a shorter deployment or env name"
+                        )
         self.grants_policy()  # too many grants fail here, before anything changes
 
     def worker_policy(self) -> dict[str, Any]:
@@ -179,18 +263,28 @@ class DeploymentSpec:
     def task_policy(self) -> dict[str, Any]:
         return iam.task_policy(deployment=self.deployment, region=self.region, account=self.account)
 
+    def function_policy(self, pool: PoolSpec) -> dict[str, Any]:
+        return iam.function_policy(
+            deployment=self.deployment, pool=pool.name, env=pool.env, region=self.region,
+            account=self.account, bucket=self.bucket,
+        )  # fmt: skip
+
     @property
     def unisolated_pools(self) -> tuple[str, ...]:
-        """Pools whose tasks still run with the worker role (images older than aegc 0.4)."""
-        return tuple(p.name for p in self.pools if not p.isolate_tasks)
+        """EC2 pools whose tasks still run with the worker role (images older than aegc 0.4).
+        Lambda pools' tasks run with their own function role, which holds the grants."""
+        return tuple(p.name for p in self.pools if not p.isolate_tasks and not p.is_lambda)
 
     def grants_policy(self) -> dict[str, Any] | None:
-        """The ``aegc-grants`` document, or None without grants. It goes on the task role, and
-        on the worker role too while any pool isn't isolated; it must fit next to either."""
+        """The ``aegc-grants`` document, or None without grants. It goes on the task role, on
+        the worker role too while any EC2 pool isn't isolated, and on each Lambda pool's
+        function role; it must fit next to any of them."""
         if not self.grants:
             return None
         room = iam.INLINE_POLICY_LIMIT - max(
-            iam.policy_size(self.worker_policy()), iam.policy_size(self.task_policy())
+            iam.policy_size(self.worker_policy()),
+            iam.policy_size(self.task_policy()),
+            *(iam.policy_size(self.function_policy(p)) for p in self.pools if p.is_lambda),
         )
         return iam.grants_policy(
             self.grants, deployment=self.deployment, budget=room, account=self.account
@@ -670,6 +764,14 @@ def ensure_queue(
     return str(url)
 
 
+def task_visibility_s(pool: PoolSpec) -> int:
+    """The task queue's visibility timeout. An SQS event source mapping needs it to be at least
+    the function's timeout; the margin covers the mapping's own handling."""
+    if pool.is_lambda:
+        return max(TASK_VISIBILITY_S, pool.timeout_s + LAMBDA_VISIBILITY_MARGIN_S)
+    return TASK_VISIBILITY_S
+
+
 def ensure_pool_queues(
     c: Clients, spec: DeploymentSpec, pool: PoolSpec, report: Report, *, dry_run: bool
 ) -> tuple[str, str]:
@@ -701,7 +803,7 @@ def ensure_pool_queues(
         naming.tags(d, "task-queue", pool=pool.name, extra=spec.extra_tags),
         {
             **base,
-            "VisibilityTimeout": str(TASK_VISIBILITY_S),
+            "VisibilityTimeout": str(task_visibility_s(pool)),
             "ReceiveMessageWaitTimeSeconds": "20",
             "RedrivePolicy": json.dumps(
                 {"deadLetterTargetArn": dlq_arn, "maxReceiveCount": str(MAX_RECEIVE_COUNT)}
@@ -723,7 +825,7 @@ def worker_config(spec: DeploymentSpec, pool: PoolSpec, task_queue_url: str) -> 
         "bucket": spec.bucket,
         "slots": pool.slots,
         "idle_timeout_s": pool.idle_timeout_s,
-        "visibility_s": TASK_VISIBILITY_S,
+        "visibility_s": task_visibility_s(pool),
         "max_deliveries": 4,
         "aegc_version": __version__,
         "state_parameter": naming.state_parameter(spec.deployment),
@@ -1023,6 +1125,547 @@ def enable_group_metrics(c: Clients, name: str, report: Report) -> bool:
     return True
 
 
+# --- Lambda pools (#21) ------------------------------------------------------------------------
+
+#: The function's command. The image's entrypoint stays: conda images' ``_entrypoint.sh``
+#: activates the environment, and pip images have ``ENTRYPOINT []``.
+LAMBDA_COMMAND = ("aegc-worker", "lambda")
+#: Lambda allows 4 KB of environment variables per function, names and values together.
+LAMBDA_ENV_LIMIT = 4096
+LAMBDA_DEFAULT_TMP_MIB = 512
+#: How long deploy waits for a function to settle: Lambda optimizes the image after each change.
+FUNCTION_WAIT_S = 900.0
+FUNCTION_POLL_S = 5.0
+#: A new role takes seconds before Lambda can assume it (and before its policy applies).
+ROLE_RETRIES = 10
+ROLE_RETRY_S = 3.0
+#: Mapping states that mean it's on its way to delivering (or already is).
+_MAPPING_ON = {"Enabled", "Enabling", "Creating", "Updating"}
+
+
+def function_role_arn(spec: DeploymentSpec, pool: PoolSpec) -> str:
+    name = lambda_pools.function_role(spec.deployment, pool.name, spec.region)
+    return f"arn:aws:iam::{spec.account}:role{naming.IAM_PATH}{name}"
+
+
+def function_arn(spec: DeploymentSpec, pool: PoolSpec) -> str:
+    name = lambda_pools.function_name(spec.deployment, pool.name)
+    return f"arn:aws:lambda:{spec.region}:{spec.account}:function:{name}"
+
+
+def task_queue_arn(spec: DeploymentSpec, pool: PoolSpec) -> str:
+    name = naming.task_queue(spec.deployment, pool.name)
+    return f"arn:aws:sqs:{spec.region}:{spec.account}:{name}"
+
+
+def function_environment(
+    spec: DeploymentSpec, pool: PoolSpec, task_queue_url: str
+) -> dict[str, str]:
+    """``AEGC_WORKER_CONFIG_B64`` (the worker config, as user data passes it) and ``AEGC_IMAGE``."""
+    cfg = json.dumps(
+        worker_config(spec, pool, task_queue_url), sort_keys=True, separators=(",", ":")
+    )
+    env = {
+        "AEGC_WORKER_CONFIG_B64": base64.b64encode(cfg.encode()).decode(),
+        "AEGC_IMAGE": pool.image,
+    }
+    if (size := sum(len(k) + len(v) for k, v in env.items())) > LAMBDA_ENV_LIMIT:
+        raise ValueError(
+            f"Lambda pool {pool.name}: its worker config needs {size} bytes of environment "
+            f"variables, and Lambda allows {LAMBDA_ENV_LIMIT}; use fewer grants "
+            f"({len(spec.grants)} now)"
+        )
+    return env
+
+
+def function_config(
+    spec: DeploymentSpec, pool: PoolSpec, *, role_arn: str, task_queue_url: str
+) -> dict[str, Any]:
+    """The function's settings: the UpdateFunctionConfiguration request (CreateFunction's too)."""
+    return {
+        "Role": role_arn,
+        "Description": f"aegc Lambda pool {pool.name} of deployment {spec.deployment}",
+        "MemorySize": pool.memory_mib,
+        "Timeout": pool.timeout_s,
+        "EphemeralStorage": {"Size": pool.ephemeral_mib or LAMBDA_DEFAULT_TMP_MIB},
+        "ImageConfig": {"Command": list(LAMBDA_COMMAND)},
+        "Environment": {"Variables": function_environment(spec, pool, task_queue_url)},
+        "LoggingConfig": {"LogFormat": "Text", "LogGroup": naming.log_group(spec.deployment)},
+    }
+
+
+def _config_changes(current: dict[str, Any], want: dict[str, Any]) -> list[str]:
+    """The settings in ``want`` that GetFunction's ``Configuration`` differs on."""
+    logging_ = current.get("LoggingConfig") or {}
+    got = {
+        "Role": current.get("Role"),
+        "Description": current.get("Description", ""),
+        "MemorySize": current.get("MemorySize"),
+        "Timeout": current.get("Timeout"),
+        "EphemeralStorage": current.get("EphemeralStorage"),
+        "ImageConfig": (current.get("ImageConfigResponse") or {}).get("ImageConfig"),
+        "Environment": {"Variables": (current.get("Environment") or {}).get("Variables", {})},
+        "LoggingConfig": {k: logging_.get(k) for k in ("LogFormat", "LogGroup")},
+    }
+    return [k for k in want if got.get(k) != want[k]]
+
+
+def check_lambda_pools(c: Clients, spec: DeploymentSpec) -> None:
+    """What would stop a Lambda pool's deploy halfway: raises before anything changes."""
+    lam = [p for p in spec.pools if p.is_lambda]
+    if lam and c.lambda_ is None:
+        raise ValueError(f"pool(s) {', '.join(p.name for p in lam)} need a Lambda client")
+    for p in lam:
+        url = f"https://sqs.{spec.region}.amazonaws.com/{spec.account}/"
+        function_environment(spec, p, url + naming.task_queue(spec.deployment, p.name))
+        if c.ecr is None:
+            continue
+        # ECR reports the compressed size; Lambda's limit is uncompressed, which only pulling
+        # the layers would tell. An image over the limit compressed is certainly too large; one
+        # under it may still fail CreateFunction or UpdateFunctionCode, which say so.
+        size = images.image_size(c.ecr, p.image)
+        if size is not None and size > lambda_pools.MAX_IMAGE_BYTES:
+            raise ValueError(
+                f"Lambda pool {p.name}: image {p.image} is {size / 2**30:.1f} GiB compressed; "
+                f"Lambda allows {lambda_pools.MAX_IMAGE_BYTES / 2**30:.0f} GiB uncompressed. "
+                "Use an EC2 pool for this env"
+            )
+
+
+def _retry_new_role(fn: Callable[[], Any]) -> Any:
+    """``fn``, retried while Lambda can't use a role created moments ago yet."""
+    for attempt in range(ROLE_RETRIES):
+        try:
+            return fn()
+        except Exception as e:
+            if (
+                error_code(e) != "InvalidParameterValueException"
+                or "role" not in str(e).lower()
+                or attempt == ROLE_RETRIES - 1
+            ):
+                raise
+            time.sleep(ROLE_RETRY_S)
+    return None
+
+
+def _wait_function(lam: Any, name: str) -> dict[str, Any]:
+    """Wait until the function isn't Pending or mid-update (bounded); its configuration."""
+    deadline = time.monotonic() + FUNCTION_WAIT_S
+    while True:
+        cfg = dict(lam.get_function(FunctionName=name)["Configuration"])
+        state = cfg.get("State", "Active")
+        update = cfg.get("LastUpdateStatus", "Successful")
+        if state == "Failed" or update == "Failed":
+            why = cfg.get("StateReason") or cfg.get("LastUpdateStatusReason") or "no reason given"
+            raise RuntimeError(f"Lambda function {name} failed: {why}")
+        if state != "Pending" and update != "InProgress":
+            return cfg
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"Lambda function {name} still {state}/{update} after "
+                               f"{FUNCTION_WAIT_S:.0f} s")  # fmt: skip
+        time.sleep(FUNCTION_POLL_S)
+
+
+def ensure_function_role(
+    c: Clients, spec: DeploymentSpec, pool: PoolSpec, report: Report, *, dry_run: bool
+) -> str:
+    """The pool's function role (path /aegc/, trusted by Lambda), with its own policy and the
+    deployment's grants. Returns its ARN."""
+    d = spec.deployment
+    name = lambda_pools.function_role(d, pool.name, spec.region)
+    try:
+        found = naming.tag_dict(c.iam.list_role_tags(RoleName=name)["Tags"])
+        if not naming.is_owned(name, found, d):
+            raise OwnershipError(f"IAM role {name} exists but isn't tagged as {d}'s")
+        outcome: Outcome = "exists"
+    except Exception as e:
+        if isinstance(e, OwnershipError) or not is_not_found(e):
+            raise
+        outcome = "would-create" if dry_run else "created"
+        if not dry_run:
+            c.iam.create_role(
+                Path=naming.IAM_PATH,
+                RoleName=name,
+                AssumeRolePolicyDocument=json.dumps(iam.lambda_trust_policy()),
+                Description=f"aegc Lambda pool {pool.name} of deployment {d}",
+                Tags=naming.tag_list(
+                    naming.tags(d, "function-role", pool=pool.name, extra=spec.extra_tags)
+                ),
+            )
+    report.add("iam role", name, outcome)
+    _put_role_policy(
+        c, name, iam.FUNCTION_POLICY, spec.function_policy(pool), report, dry_run=dry_run,
+        label=f"{iam.FUNCTION_POLICY} ({pool.name})",
+    )  # fmt: skip
+    _set_grants(
+        c, name, spec.grants_policy(), len(spec.grants), report,
+        role_kind=f"{pool.name} function", dry_run=dry_run,
+    )  # fmt: skip
+    return function_role_arn(spec, pool)
+
+
+def _function(lam: Any, name: str) -> dict[str, Any] | None:
+    try:
+        return dict(lam.get_function(FunctionName=name))
+    except Exception as e:
+        if is_not_found(e):
+            return None
+        raise
+
+
+def ensure_function(
+    c: Clients,
+    spec: DeploymentSpec,
+    pool: PoolSpec,
+    *,
+    role_arn: str,
+    task_queue_url: str,
+    report: Report,
+    dry_run: bool,
+) -> str:
+    """The pool's function: created, or updated in place (never replaced). Returns its ARN."""
+    d, lam = spec.deployment, c.lambda_
+    name = lambda_pools.function_name(d, pool.name)
+    want = function_config(spec, pool, role_arn=role_arn, task_queue_url=task_queue_url)
+    got = _function(lam, name)
+    if got is None:
+        if dry_run:
+            report.add("lambda function", name, "would-create")
+            return function_arn(spec, pool)
+        made = _retry_new_role(
+            lambda: lam.create_function(
+                FunctionName=name,
+                PackageType="Image",
+                Code={"ImageUri": pool.image},
+                Architectures=["arm64"],
+                Publish=False,
+                Tags=naming.tags(d, "function", pool=pool.name, extra=spec.extra_tags),
+                **want,
+            )
+        )
+        _wait_function(lam, name)
+        report.add("lambda function", name, "created")
+        return str(made["FunctionArn"])
+    cfg = dict(got["Configuration"])
+    arn = str(cfg["FunctionArn"])
+    if not naming.is_owned(name, naming.tag_dict(lam.list_tags(Resource=arn).get("Tags")), d):
+        raise OwnershipError(f"Lambda function {name} exists but isn't tagged as {d}'s")
+    new_image = (got.get("Code") or {}).get("ImageUri") != pool.image
+    new_arch = cfg.get("Architectures", ["arm64"]) != ["arm64"]
+    changes = (["image"] if new_image or new_arch else []) + _config_changes(cfg, want)
+    if not changes:
+        report.add("lambda function", name, "exists")
+        return arn
+    detail = ", ".join(changes)
+    if dry_run:
+        report.add("lambda function", name, "would-update", detail)
+        return arn
+    _wait_function(lam, name)
+    if new_image or new_arch:
+        lam.update_function_code(FunctionName=name, ImageUri=pool.image, Architectures=["arm64"])
+        _wait_function(lam, name)
+    if changes != ["image"]:
+        _retry_new_role(lambda: lam.update_function_configuration(FunctionName=name, **want))
+        _wait_function(lam, name)
+    report.add("lambda function", name, "updated", detail)
+    return arn
+
+
+def _mapping_arn(m: dict[str, Any], function_arn_: str) -> str:
+    """substrate#1659: no EventSourceMappingArn; it's built from the function's region and
+    account, as AWS forms it."""
+    if m.get("EventSourceMappingArn"):
+        return str(m["EventSourceMappingArn"])
+    region, account = function_arn_.split(":")[3:5]
+    return f"arn:aws:lambda:{region}:{account}:event-source-mapping:{m['UUID']}"
+
+
+def _mapping_owned(lam: Any, m: dict[str, Any], d: str) -> bool:
+    """aegc's mapping for ``d``: its function has aegc's name, and it carries the tags."""
+    fn_arn = str(m.get("FunctionArn", ""))
+    function = fn_arn.rsplit(":", 1)[-1]
+    try:
+        tags = naming.tag_dict(lam.list_tags(Resource=_mapping_arn(m, fn_arn)).get("Tags"))
+    except Exception as e:
+        if is_not_found(e):
+            return False
+        raise
+    return naming.is_owned(function, tags, d)
+
+
+def ensure_mapping(
+    c: Clients,
+    spec: DeploymentSpec,
+    pool: PoolSpec,
+    *,
+    report: Report,
+    dry_run: bool,
+    halted: bool,
+) -> str:
+    """The event source mapping from the pool's task queue to its function. Returns its UUID.
+
+    A halted deployment (stopped, capped or expired) gets it disabled; resume enables it. A
+    redeploy never enables it: a running deployment's disabled mapping is reported, as kept.
+    """
+    d, lam = spec.deployment, c.lambda_
+    name = lambda_pools.function_name(d, pool.name)
+    queue = task_queue_arn(spec, pool)
+    try:
+        found = list(
+            paginate(lam, "list_event_source_mappings", "EventSourceMappings",
+                     EventSourceArn=queue, FunctionName=name)
+        )  # fmt: skip
+    except Exception as e:
+        if not is_not_found(e):  # the function doesn't exist yet (a dry run)
+            raise
+        found = []
+    found = [m for m in found if m.get("State") != "Deleting"]
+    want = {
+        "BatchSize": 1,
+        "FunctionResponseTypes": ["ReportBatchItemFailures"],
+        "ScalingConfig": {"MaximumConcurrency": pool.max_concurrency},
+    }
+    label = f"{name} <- {naming.task_queue(d, pool.name)}"
+    if not found:
+        if dry_run:
+            report.add("lambda event source mapping", label, "would-create")
+            return ""
+        m = _retry_new_role(
+            lambda: lam.create_event_source_mapping(
+                EventSourceArn=queue,
+                FunctionName=name,
+                Enabled=not halted,
+                Tags=naming.tags(d, "mapping", pool=pool.name, extra=spec.extra_tags),
+                **want,
+            )
+        )
+        report.add("lambda event source mapping", label, "created", "disabled" if halted else "")
+        return str(m["UUID"])
+    for m in found:
+        if not _mapping_owned(lam, m, d):
+            raise OwnershipError(
+                f"event source mapping {m['UUID']} ({label}) exists but isn't tagged as {d}'s"
+            )
+    m = found[0]
+    uuid = str(m["UUID"])
+    got = {
+        "BatchSize": m.get("BatchSize"),
+        "FunctionResponseTypes": m.get("FunctionResponseTypes", []),
+        "ScalingConfig": {
+            "MaximumConcurrency": (m.get("ScalingConfig") or {}).get("MaximumConcurrency")
+        },
+    }
+    on = m.get("State") in _MAPPING_ON
+    changes = [k for k in want if got[k] != want[k]]
+    if halted and on:
+        changes.append("disable")
+    if not changes:
+        if on or halted:
+            report.add("lambda event source mapping", label, "exists", uuid)
+        else:
+            report.add("lambda event source mapping", label, "kept",
+                       f"{uuid} is disabled; `aegc resume` enables it")  # fmt: skip
+        return uuid
+    detail = ", ".join(changes)
+    if dry_run:
+        report.add("lambda event source mapping", label, "would-update", detail)
+        return uuid
+    _retry(
+        lambda: lam.update_event_source_mapping(
+            UUID=uuid, **want, **({"Enabled": False} if halted else {})
+        ),
+        codes={"ResourceInUseException"}, attempts=10, delay_s=3,
+    )  # fmt: skip
+    report.add("lambda event source mapping", label, "updated", detail)
+    return uuid
+
+
+def ensure_lambda_pool(
+    c: Clients,
+    spec: DeploymentSpec,
+    pool: PoolSpec,
+    *,
+    task_queue_url: str,
+    report: Report,
+    dry_run: bool,
+    halted: bool,
+) -> dict[str, str]:
+    """A Lambda pool's function role, function and mapping: its manifest entry's resources."""
+    if c.ecr is not None:
+        images.allow_lambda_pulls(
+            c.ecr, pool.env, region=spec.region, account=spec.account, report=report,
+            dry_run=dry_run,
+        )  # fmt: skip
+    role_arn = ensure_function_role(c, spec, pool, report, dry_run=dry_run)
+    fn_arn = ensure_function(
+        c, spec, pool, role_arn=role_arn, task_queue_url=task_queue_url, report=report,
+        dry_run=dry_run,
+    )  # fmt: skip
+    uuid = ensure_mapping(c, spec, pool, report=report, dry_run=dry_run, halted=halted)
+    return {
+        "function_name": lambda_pools.function_name(spec.deployment, pool.name),
+        "function_arn": fn_arn,
+        "event_source_mapping": uuid,
+        "function_role_arn": role_arn,
+    }
+
+
+def _owned_functions(lam: Any, d: str) -> list[dict[str, Any]]:
+    """The deployment's functions: aegc's name prefix and its tags."""
+    prefix = f"{naming.PREFIX}-{d}-"
+    out = []
+    for f in paginate(lam, "list_functions", "Functions"):
+        name = str(f["FunctionName"])
+        if not name.startswith(prefix):
+            continue
+        try:
+            tags = naming.tag_dict(lam.list_tags(Resource=f["FunctionArn"]).get("Tags"))
+        except Exception as e:
+            if is_not_found(e):
+                continue
+            raise
+        if naming.is_owned(name, tags, d):
+            out.append(dict(f))
+    return out
+
+
+def _owned_mappings(lam: Any, d: str) -> list[dict[str, Any]]:
+    """The deployment's event source mappings (also those whose function is already gone)."""
+    prefix = f"{naming.PREFIX}-{d}-"
+    return [
+        dict(m)
+        for m in paginate(lam, "list_event_source_mappings", "EventSourceMappings")
+        if str(m.get("FunctionArn", "")).rsplit(":", 1)[-1].startswith(prefix)
+        and m.get("State") != "Deleting"  # DeleteEventSourceMapping completes asynchronously
+        and _mapping_owned(lam, m, d)
+    ]
+
+
+def _function_roles(c: Clients, d: str, region: str) -> list[str]:
+    """Function roles of ``d`` (tagged ``aegc:role=function-role``), found under /aegc/."""
+    out = []
+    for r in paginate(c.iam, "list_roles", "Roles", PathPrefix=naming.IAM_PATH):
+        name = str(r["RoleName"])
+        if not (name.startswith(f"{naming.PREFIX}-{d}-") and name.endswith(f"-{region}")):
+            continue
+        try:
+            tags = naming.tag_dict(c.iam.list_role_tags(RoleName=name)["Tags"])
+        except Exception as e:
+            if is_not_found(e):
+                continue
+            raise
+        if naming.is_owned(name, tags, d) and tags.get(naming.TAG_ROLE) == "function-role":
+            out.append(name)
+    return out
+
+
+def _delete_mapping(lam: Any, m: dict[str, Any], report: Report, *, dry_run: bool) -> None:
+    label = f"{m['UUID']} ({str(m.get('FunctionArn', '')).rsplit(':', 1)[-1]})"
+    if not dry_run:
+        try:
+            _retry(
+                lambda: lam.delete_event_source_mapping(UUID=m["UUID"]),
+                codes={"ResourceInUseException"}, attempts=10, delay_s=3,
+            )  # fmt: skip
+        except Exception as e:
+            if not is_not_found(e):
+                raise
+    report.add("lambda event source mapping", label, "would-delete" if dry_run else "deleted")
+
+
+def _delete_function(lam: Any, name: str, report: Report, *, dry_run: bool) -> None:
+    if not dry_run:
+        try:
+            lam.delete_function(FunctionName=name)
+        except Exception as e:
+            if not is_not_found(e):
+                raise
+    report.add("lambda function", name, "would-delete" if dry_run else "deleted")
+
+
+def destroy_lambda(c: Clients, d: str, region: str, report: Report, *, dry_run: bool) -> None:
+    """The deployment's mappings, functions and function roles, each ownership-checked."""
+    lam = c.lambda_
+    functions = _owned_functions(lam, d)
+    roles = {str(f.get("Role", "")).rsplit("/", 1)[-1] for f in functions} - {""}
+    try:
+        roles |= set(_function_roles(c, d, region))
+    except Exception as e:
+        if error_code(e) not in ACCESS_DENIED:
+            raise
+    for m in _owned_mappings(lam, d):
+        _delete_mapping(lam, m, report, dry_run=dry_run)
+    for f in functions:
+        _delete_function(lam, str(f["FunctionName"]), report, dry_run=dry_run)
+    for role in sorted(roles):
+        _destroy_role(c, d, role, report, dry_run=dry_run)
+
+
+def _prune_lambda(
+    c: Clients, d: str, entry: dict[str, Any], report: Report, *, dry_run: bool
+) -> None:
+    lam = c.lambda_
+    name = str(entry.get("function_name", ""))
+    uuid = str(entry.get("event_source_mapping", ""))
+    if uuid:
+        try:
+            m = dict(lam.get_event_source_mapping(UUID=uuid))
+        except Exception as e:
+            if not is_not_found(e):
+                raise
+            m = {}
+        if m and m.get("State") != "Deleting":
+            if _mapping_owned(lam, m, d):
+                _delete_mapping(lam, m, report, dry_run=dry_run)
+            else:
+                report.add("lambda event source mapping", uuid, "kept", "not tagged as aegc's")
+    if name and (got := _function(lam, name)) is not None:
+        arn = got["Configuration"]["FunctionArn"]
+        if naming.is_owned(name, naming.tag_dict(lam.list_tags(Resource=arn).get("Tags")), d):
+            _delete_function(lam, name, report, dry_run=dry_run)
+        else:
+            report.add("lambda function", name, "kept", "not tagged as aegc's")
+    role = str(entry.get("function_role_arn", "")).rsplit("/", 1)[-1]
+    if role:
+        _destroy_role(c, d, role, report, dry_run=dry_run)
+
+
+def lambda_leftovers(c: Clients, d: str, region: str) -> list[tuple[str, str]]:
+    """``(kind, name)`` of the deployment's mappings, functions and function roles still there."""
+    lam = c.lambda_
+    left = [("lambda event source mapping", str(m["UUID"])) for m in _owned_mappings(lam, d)]
+    left += [("lambda function", str(f["FunctionName"])) for f in _owned_functions(lam, d)]
+    left += [("iam role", r) for r in _function_roles(c, d, region)]
+    return left
+
+
+def lambda_footprint(lam: Any, fp: Any, d: str) -> None:
+    """Add the deployment's functions and mappings to an :class:`aegc.ops.Footprint`, with
+    look-alikes (aegc's names without its tags). The tagging API finds mappings by id only, so
+    their ownership is decided here (name of the function and the mapping's tags)."""
+    prefix = f"{naming.PREFIX}-{d}-"
+    for f in paginate(lam, "list_functions", "Functions"):
+        name = str(f["FunctionName"])
+        if not name.startswith(prefix):
+            continue
+        try:
+            tags = naming.tag_dict(lam.list_tags(Resource=f["FunctionArn"]).get("Tags"))
+        except Exception as e:
+            if is_not_found(e):
+                continue
+            raise
+        fp.add("lambda function", name, name, owned=naming.is_owned(name, tags, d),
+               found_by="name")  # fmt: skip
+    for m in paginate(lam, "list_event_source_mappings", "EventSourceMappings"):
+        function = str(m.get("FunctionArn", "")).rsplit(":", 1)[-1]
+        if not function.startswith(prefix) or m.get("State") == "Deleting":
+            continue
+        uuid, owned = str(m["UUID"]), _mapping_owned(lam, m, d)
+        kind = "lambda event-source-mapping"  # as aegc.ops names tagging-API mapping ARNs
+        fp.add(kind, uuid, uuid, owned=owned, found_by="name", detail=function)
+        fp.items[(kind, uuid)].owned = owned  # the name scan decides, not the uuid
+
+
 # --- manifest ----------------------------------------------------------------------------------
 
 
@@ -1140,7 +1783,8 @@ def prune_pool(
     wait_s: float = 600,
     poll_s: float = 10,
 ) -> None:
-    """Remove a pool a redeploy no longer lists: its group, launch template and queues.
+    """Remove a pool a redeploy no longer lists: its group and launch template (a Lambda pool:
+    its mapping, function and function role) and its queues.
 
     Refuses while its task queue has queued or running tasks, unless ``force``.
     """
@@ -1148,6 +1792,10 @@ def prune_pool(
     verb: Outcome = "would-delete" if dry_run else "deleted"
     if not force and (n := pool_tasks(c, entry)):
         raise RuntimeError(f"pool {name} has {n} queued or running task(s); use --force")
+    if lambda_pools.is_lambda(entry):
+        if c.lambda_ is None:
+            raise ValueError(f"pool {name} is a Lambda pool: pruning it needs a Lambda client")
+        _prune_lambda(c, d, entry, report, dry_run=dry_run)
     group = str(entry.get("auto_scaling_group", ""))
     found = (
         c.autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[group])[
@@ -1204,8 +1852,9 @@ def deploy(c: Clients, spec: DeploymentSpec, *, dry_run: bool = False) -> Report
             "ssm parameter",
             naming.state_parameter(spec.deployment),
             "kept",
-            "not running: group minimums stay 0 until `aegc resume`",
+            "not running: group minimums stay 0 and Lambda mappings disabled until `aegc resume`",
         )
+    check_lambda_pools(c, spec)
     inuse = _protect_images(c, spec, report, dry_run=dry_run)
     profile_arn = ensure_worker_role(c, spec, report, dry_run=dry_run)
     ensure_task_role(c, spec, report, dry_run=dry_run)
@@ -1219,6 +1868,16 @@ def deploy(c: Clients, spec: DeploymentSpec, *, dry_run: bool = False) -> Report
     pools: dict[str, dict[str, str]] = {}
     for pool in spec.pools:
         task_url, dlq_url = ensure_pool_queues(c, spec, pool, report, dry_run=dry_run)
+        if pool.is_lambda:
+            pools[pool.name] = {
+                "task_queue_url": task_url,
+                "dlq_url": dlq_url,
+                **ensure_lambda_pool(
+                    c, spec, pool, task_queue_url=task_url, report=report, dry_run=dry_run,
+                    halted=halted,
+                ),
+            }  # fmt: skip
+            continue
         data = launch_template_data(
             spec, pool, ami=ami, sg=sg, profile_arn=profile_arn, task_queue_url=task_url
         )
@@ -1263,7 +1922,16 @@ def deploy(c: Clients, spec: DeploymentSpec, *, dry_run: bool = False) -> Report
                 deployment=spec.deployment,
                 region=spec.region,
                 account=spec.account,
-                groups={n: str(p["auto_scaling_group"]) for n, p in pools.items()},
+                groups={
+                    n: str(p["auto_scaling_group"])
+                    for n, p in pools.items()
+                    if "auto_scaling_group" in p
+                },
+                mappings={
+                    n: str(p["event_source_mapping"])
+                    for n, p in pools.items()
+                    if "event_source_mapping" in p
+                },
                 lease_s=spec.lease_s,
                 ttl_at=spec.ttl_at,
             ),
@@ -1339,7 +2007,8 @@ def destroy(
     """Delete everything aegc created for ``deployment``. Dry run unless ``dry_run=False``.
 
     Refuses while tasks are queued or in flight unless ``force``. Order: Auto Scaling groups
-    (forced, and waited for), launch templates, security group, queues, instance profile and role,
+    (forced, and waited for), launch templates, security group, Lambda pools' mappings,
+    functions and function roles, queues, instance profile and role,
     log group, the deployment's ECR in-use tags, and its parameters (``/aegc/<d>/...``). Payload
     objects expire through the bucket's lifecycle rule.
 
@@ -1431,6 +2100,16 @@ def destroy(
             )
         report.add("security group", sg_name, verb, g["GroupId"])
 
+    # Lambda pools (#21): mappings before their queues. They need the lambda-deployer policy;
+    # a deployer without it still destroys everything else.
+    if c.lambda_ is not None:
+        try:
+            destroy_lambda(c, d, region, report, dry_run=dry_run)
+        except Exception as e:
+            if error_code(e) not in ACCESS_DENIED:
+                raise
+            report.add("lambda pools", d, "kept", LAMBDA_DENIED)
+
     for u in queues:
         if not dry_run:
             c.sqs.delete_queue(QueueUrl=u)
@@ -1498,6 +2177,9 @@ def destroy(
     return report
 
 
+LAMBDA_DENIED = "not checked: needs the lambda-deployer policy (aegc iam-policy lambda-deployer)"
+
+
 def _owned_parameters(c: Clients, d: str) -> list[tuple[str, dict[str, str]]]:
     """Every parameter under ``/aegc/<d>/`` with its tags (ownership is the caller's check)."""
     out = []
@@ -1562,8 +2244,9 @@ def verify_destroyed(
     while to go after their group is deleted, so this waits up to ``wait_s`` while any of them is
     still terminating, detaching or deleting. Then it
     checks the Auto Scaling groups, launch templates, security group, queues, log group,
-    ``/aegc/<d>/...`` parameters, worker role and instance profile, and (given an ECR client) the
-    deployment's in-use image tags. An empty report means the deployment is gone.
+    ``/aegc/<d>/...`` parameters, worker role and instance profile, (given an ECR client) the
+    deployment's in-use image tags, and (given a Lambda client) its Lambda pools' mappings,
+    functions and function roles. An empty report means the deployment is gone.
     """
     d = naming.validate_name("deployment", deployment)
     prefix = f"{naming.PREFIX}-{d}-"
@@ -1656,6 +2339,13 @@ def verify_destroyed(
         for repo, tags in images.inuse_tags(c.ecr, d).items():
             for t in tags:
                 report.add("ecr image tag", f"{repo}:{t}", "remaining")
+    if c.lambda_ is not None:  # Lambda pools (#21; lambda-deployer policy)
+        try:
+            for kind, name in lambda_leftovers(c, d, region):
+                report.add(kind, name, "remaining")
+        except Exception as e:
+            if error_code(e) not in ACCESS_DENIED:
+                raise
     if c.scheduler is not None:
         from aegc import lease
 
