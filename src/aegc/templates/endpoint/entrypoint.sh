@@ -10,6 +10,20 @@ rm -f "$HOME/.globus_compute/$GC_ENDPOINT/daemon.pid"
 # The cloud endpoint (#22) keeps its id across instance replacements and logs to the console,
 # which the host's awslogs driver ships to CloudWatch.
 if [ -n "${GC_ENDPOINT_UUID:-}" ]; then
+    # User endpoint processes (where AWSEngine runs) log to files: copy them to the console too.
+    (
+        seen=""
+        while true; do
+            for f in "$HOME"/.globus_compute/uep.*/endpoint.log; do
+                [ -f "$f" ] || continue
+                case " $seen " in
+                    *" $f "*) ;;
+                    *) seen="$seen $f"; tail -n +1 -F "$f" 2>/dev/null | sed -u 's/^/[uep] /' & ;;
+                esac
+            done
+            sleep 5
+        done
+    ) &
     exec globus-compute-endpoint start "$GC_ENDPOINT" --endpoint-uuid "$GC_ENDPOINT_UUID" \
         --log-to-console
 fi

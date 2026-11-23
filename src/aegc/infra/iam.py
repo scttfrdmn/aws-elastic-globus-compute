@@ -603,6 +603,20 @@ def endpoint_role_policy(
             "Resource": f"arn:aws:logs:{region}:{account}:log-group:{naming.log_group(d)}:*",
         },
         {
+            # Session Manager (no SSH, no inbound ports): an operator can open a shell on the
+            # host to debug it, if their own IAM allows ssm:StartSession.
+            "Sid": "SessionManager",
+            "Effect": "Allow",
+            "Action": [
+                "ssm:UpdateInstanceInformation",
+                "ssmmessages:CreateControlChannel",
+                "ssmmessages:CreateDataChannel",
+                "ssmmessages:OpenControlChannel",
+                "ssmmessages:OpenDataChannel",
+            ],
+            "Resource": "*",
+        },
+        {
             "Sid": "ReapResultQueues",
             "Effect": "Allow",
             "Action": "sqs:DeleteQueue",

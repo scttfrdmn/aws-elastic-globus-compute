@@ -255,9 +255,6 @@ d, s = sys.argv[1], json.loads(os.environ["SECRET"])
 with open(os.path.join(d, "storage.db"), "wb") as f:
     f.write(base64.b64decode(s["storage_db_b64"]))
 os.chmod(os.path.join(d, "storage.db"), 0o600)
-os.makedirs(os.path.join(d, s["name"]), exist_ok=True)
-with open(os.path.join(d, s["name"], "endpoint.json"), "w") as f:
-    json.dump({"endpoint_id": s["endpoint_id"]}, f)
 PY
 unset SECRET
 chown -R 1000:1000 "$$GC"
@@ -266,6 +263,9 @@ echo ${configure_b64} | base64 -d > /var/lib/aegc-endpoint/configure.sh
 docker run --rm -v "$$GC":/home/gc/.globus_compute \
   -v /var/lib/aegc-endpoint/configure.sh:/tmp/configure.sh:ro \
   -e AWS_REGION="$$REGION" "$$IMAGE" sh /tmp/configure.sh || fail "couldn't configure the endpoint"
+# After configure (which creates the endpoint directory): keep the registered endpoint id.
+printf '{"endpoint_id": "%s"}' ${endpoint_id} > "$$GC"/${name}/endpoint.json
+chown 1000:1000 "$$GC"/${name}/endpoint.json
 
 LOGS="--log-driver awslogs --log-opt awslogs-region=$$REGION --log-opt awslogs-group=${log_group}"
 cat > /etc/systemd/system/aegc-endpoint.service <<UNIT
