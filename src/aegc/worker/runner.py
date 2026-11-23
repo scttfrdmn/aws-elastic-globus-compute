@@ -55,6 +55,18 @@ def context() -> BaseContext:
         return mp.get_context("spawn")
 
 
+def _set_dumpable() -> None:
+    """After setuid from root, Linux makes the process non-dumpable, so its own /proc/self files
+    (io, status, ...) belong to root and the task can't read them. Restore it: only processes of
+    the same uid (other tasks, which already share it) gain anything."""
+    try:
+        import ctypes
+
+        ctypes.CDLL(None, use_errno=True).prctl(4, 1, 0, 0, 0)  # PR_SET_DUMPABLE
+    except Exception:  # pragma: no cover - not Linux
+        pass
+
+
 def drop_privileges(uid: int, run_dir: str) -> None:
     """Become ``uid`` for good (and its primary group), with a HOME it can write."""
     import pwd
@@ -67,6 +79,7 @@ def drop_privileges(uid: int, run_dir: str) -> None:
     os.setgroups([])
     os.setgid(gid)
     os.setuid(uid)
+    _set_dumpable()
     home = entry.pw_dir if entry else ""
     os.environ["HOME"] = home if home and os.access(home, os.W_OK) else run_dir
     os.environ["USER"] = entry.pw_name if entry else str(uid)
