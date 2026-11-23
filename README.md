@@ -51,11 +51,9 @@ flowchart LR
 
 ## Status
 
-Early release (0.x): v0.4.0 adds task isolation from the worker role, JSON logs, CloudWatch
-metrics, provenance, and support for Globus Flows and Timers to v0.3.0's bring-your-own images,
-grants, outputs and size classes. The main branch adds a cloud-hosted endpoint with an offline
-alarm and cloud-side spend checks, other regions such as us-east-1, and measured tutorials, not yet
-released. Work is tracked in this repo's issues, milestones and project board.
+Early release (0.x): v0.6.0 adds a cloud-hosted endpoint with an offline alarm and cloud-side
+spend checks, other regions such as us-east-1, and measured tutorials to v0.4.0's task isolation,
+JSON logs, CloudWatch metrics, provenance and Globus Flows and Timers. Work is tracked in this repo's issues, milestones and project board.
 
 Sister projects:
 - [aws-elastic-gcs](https://github.com/scttfrdmn/aws-elastic-gcs): elastic Globus Connect Server.

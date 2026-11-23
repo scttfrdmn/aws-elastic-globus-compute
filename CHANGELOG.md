@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-23
+
+A cloud-hosted endpoint, and tutorials that show what aegc is for: the endpoint runs on a small
+Graviton instance as your own Globus login, so Flows and Timers work with your laptop off; a
+cloud-side evaluator keeps spend caps and the lease working with no engine running, and an alarm
+says when the endpoint is offline. Four benefit-driven tutorials were run live, with measured
+results. (0.5, the Lambda backend, is still to come.)
+
 ### Added
 - **Cloud-hosted endpoint** (#22): `aegc endpoint deploy` runs a local endpoint on an on-demand
   Graviton instance (`--instance-type`, default `t4g.micro`) in an Auto Scaling group of one, with
@@ -532,7 +540,8 @@ Bugs found and fixed during validation:
 - the operator and deployer policies missed actions their commands use;
 - env names over 14 characters couldn't be deployed.
 
-[Unreleased]: https://github.com/scttfrdmn/aws-elastic-globus-compute/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/aws-elastic-globus-compute/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/scttfrdmn/aws-elastic-globus-compute/compare/v0.4.0...v0.6.0
 [0.4.0]: https://github.com/scttfrdmn/aws-elastic-globus-compute/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/scttfrdmn/aws-elastic-globus-compute/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/scttfrdmn/aws-elastic-globus-compute/compare/v0.1.0...v0.2.0
