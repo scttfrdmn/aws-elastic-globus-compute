@@ -14,12 +14,14 @@ SQS = f"arn:aws:sqs:{REGION}:{ACCOUNT}"
 BUCKET = naming.bucket_name(ACCOUNT, REGION)
 
 
-def principal(aws: Callable[[str], Any], doc: dict[str, Any]) -> tuple[Any, str]:
+def principal(
+    aws: Callable[[str], Any], doc: dict[str, Any], name: str = "aegc-test"
+) -> tuple[Any, str]:
     c = aws("iam")
-    arn = c.create_role(
-        RoleName="aegc-test", AssumeRolePolicyDocument=json.dumps(iam.ec2_trust_policy())
-    )["Role"]["Arn"]
-    c.put_role_policy(RoleName="aegc-test", PolicyName="p", PolicyDocument=json.dumps(doc))
+    arn = c.create_role(RoleName=name, AssumeRolePolicyDocument=json.dumps(iam.ec2_trust_policy()))[
+        "Role"
+    ]["Arn"]
+    c.put_role_policy(RoleName=name, PolicyName="p", PolicyDocument=json.dumps(doc))
     return c, arn
 
 
@@ -35,8 +37,8 @@ def decide(c: Any, arn: str, action: str, resource: str, **ctx: str) -> str:
     return str(r["EvalDecision"])
 
 
-def tag(v: str) -> dict[str, str]:
-    return {"autoscaling:ResourceTag/aegc:deployment": v}
+def tag(v: str, role: str = "asg") -> dict[str, str]:
+    return {"autoscaling:ResourceTag/aegc:deployment": v, "autoscaling:ResourceTag/aegc:role": role}
 
 
 def test_worker_policy(aws: Callable[[str], Any]) -> None:
@@ -244,3 +246,34 @@ def test_bootstrap_and_deployer_split(aws: Callable[[str], Any]) -> None:
         decide(c, boot, "scheduler:CreateScheduleGroup", group.replace("aegc-dev", "x"))
         != "allowed"
     )
+
+
+def test_workers_and_operators_cant_touch_the_endpoint_group(aws: Callable[[str], Any]) -> None:
+    # #22: the cloud endpoint's group carries the deployment tag too; only worker groups
+    # (aegc:role=asg) may be scaled, drained or capped from these roles.
+    for i, policy in enumerate((
+        iam.worker_policy(deployment="dev", region=REGION, account=ACCOUNT, bucket=BUCKET),
+        iam.operator_policy(deployment="dev", region=REGION, account=ACCOUNT, bucket=BUCKET),
+    )):  # fmt: skip
+        c, arn = principal(aws, policy, f"aegc-test-{i}")
+        group = f"arn:aws:autoscaling:{REGION}:{ACCOUNT}:autoScalingGroup:x:autoScalingGroupName/g"
+        for action in ("autoscaling:SetDesiredCapacity",
+                       "autoscaling:TerminateInstanceInAutoScalingGroup",
+                       "autoscaling:UpdateAutoScalingGroup"):  # fmt: skip
+            assert decide(c, arn, action, group, **tag("dev", "endpoint-asg")) != "allowed"
+
+
+def test_endpoint_role_reads_only_its_own_login(aws: Callable[[str], Any]) -> None:
+    c, arn = principal(
+        aws, iam.endpoint_role_policy(deployment="dev", region=REGION, account=ACCOUNT,
+                                      bucket=BUCKET),
+    )  # fmt: skip
+    sm = f"arn:aws:secretsmanager:{REGION}:{ACCOUNT}:secret"
+    assert decide(c, arn, "secretsmanager:GetSecretValue", f"{sm}:aegc-dev-endpoint-AbCdEf") == (
+        "allowed"
+    )
+    for other in ("aegc-prod-endpoint-AbCdEf", "aegc-dev-endpoint-x-AbCdEf", "db-password-AbCdEf"):
+        assert decide(c, arn, "secretsmanager:GetSecretValue", f"{sm}:{other}") != "allowed"
+    ecr = f"arn:aws:ecr:{REGION}:{ACCOUNT}:repository"
+    assert decide(c, arn, "ecr:BatchGetImage", f"{ecr}/aegc/endpoint") == "allowed"
+    assert decide(c, arn, "ecr:BatchGetImage", f"{ecr}/aegc/geospatial") != "allowed"

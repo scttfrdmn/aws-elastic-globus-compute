@@ -33,12 +33,12 @@ from typing import Any
 from globus_compute_common.messagepack.message_types import EPStatusReport
 from globus_compute_endpoint.engines.base import GlobusComputeEngineBase
 
-from aegc import __version__, awsutil, lease, naming, payloads, protocol, sizes
+from aegc import __version__, awsutil, caps, lease, naming, payloads, protocol, sizes
 from aegc.gcresult import failed_result
 from aegc.pricing import IPV4_HOUR, Prices, volume_hour
 from aegc.protocol import Call, ProtocolError, ResultMessage, TaskMessage
 from aegc.spend import SpendGuard, Trip
-from aegc.state import Limits, State, read_state, write_state
+from aegc.state import Limits, State, read_state
 
 log = logging.getLogger("aegc.engine")
 
@@ -1019,33 +1019,20 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         groups: dict[str, dict[str, Any]],
         limits: Limits,
     ) -> None:
-        st = State(
-            mode="capped",
-            reason=trip.reason,
-            since=time.time(),
-            until=trip.until,
+        st, error = caps.trip(
+            ssm=self._clients["ssm"],
+            autoscaling=self._clients["autoscaling"],
+            deployment=self.deployment,
+            cap=trip,
+            limits=limits,
+            groups={
+                pools[name]["auto_scaling_group"]: int(g.get("MinSize", 0))
+                for name, g in groups.items()
+            },
             by="engine",
-            kill=limits.on_cap == "kill",
         )
-        try:
-            write_state(self._clients["ssm"], self.deployment, st)
-        except Exception as e:  # still stop this process's spending
-            log.error(
-                "couldn't write the capped state (workers won't see it; check the operator "
-                "policy): %s",
-                e,
-            )
+        if error is not None:  # still stop this process's spending
             self._local_cap = st
-        log.error("deployment %s capped: %s", self.deployment, trip.reason)
-        # Workers at the group's minimum can't leave it: drop the minimum to 0 too.
-        for name, g in groups.items():
-            if int(g.get("MinSize", 0)) > 0:
-                try:
-                    self._clients["autoscaling"].update_auto_scaling_group(
-                        AutoScalingGroupName=pools[name]["auto_scaling_group"], MinSize=0
-                    )
-                except Exception as e:
-                    log.warning("pool %s: couldn't lower the minimum: %s", name, e)
         self._state_read = time.time()
         self._set_state(st)
 

@@ -208,3 +208,132 @@ def encode(script: str) -> str:
     if len(data) > 16 * 1024:
         raise ValueError(f"user data is {len(data)} bytes; EC2 allows 16 KiB")
     return base64.b64encode(data).decode()
+
+
+# --- the cloud endpoint host (#22) -------------------------------------------------------------
+
+_ENDPOINT_TEMPLATE = Template(
+    r"""#!/bin/bash
+# aegc cloud endpoint: deployment ${deployment}, endpoint ${name}
+set -uo pipefail
+exec > >(tee -a /var/log/aegc-boot.log) 2>&1
+echo "aegc: endpoint boot start $$(date -Is)"
+fail() { echo "aegc: endpoint boot failed: $$*"; exit 1; }
+
+TOKEN=$$(curl -sfX PUT http://169.254.169.254/latest/api/token \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+md() { curl -sf -H "X-aws-ec2-metadata-token: $$TOKEN" \
+  "http://169.254.169.254/latest/meta-data/$$1"; }
+IID=$$(md instance-id)
+REGION=$$(md placement/region)
+
+systemctl disable --now ecs amazon-ecs-volume-plugin || true
+systemctl enable --now docker || fail "docker didn't start"
+for i in $$(seq 1 60); do docker info >/dev/null 2>&1 && break; sleep 1; done
+
+IMAGE=${image}
+REGISTRY=$${IMAGE%%/*}
+pulled=""
+for i in 1 2 3 4 5; do
+  if aws ecr get-login-password --region "$$REGION" \
+       | docker login --username AWS --password-stdin "$$REGISTRY" \
+     && docker pull "$$IMAGE"; then
+    pulled=1; break
+  fi
+  sleep $$((i * 10))
+done
+[ -n "$$pulled" ] || fail "couldn't pull $$IMAGE"
+
+# The Globus login (token storage) and the endpoint id, from Secrets Manager.
+GC=/var/lib/aegc-endpoint/gc
+install -d -m 700 -o 1000 -g 1000 "$$GC"
+SECRET=$$(aws secretsmanager get-secret-value --region "$$REGION" --secret-id ${secret} \
+  --query SecretString --output text) || fail "couldn't read the secret ${secret}"
+SECRET="$$SECRET" python3 - "$$GC" <<'PY' || fail "couldn't restore the Globus login"
+import base64, json, os, sys
+d, s = sys.argv[1], json.loads(os.environ["SECRET"])
+with open(os.path.join(d, "storage.db"), "wb") as f:
+    f.write(base64.b64decode(s["storage_db_b64"]))
+os.chmod(os.path.join(d, "storage.db"), 0o600)
+os.makedirs(os.path.join(d, s["name"]), exist_ok=True)
+with open(os.path.join(d, s["name"], "endpoint.json"), "w") as f:
+    json.dump({"endpoint_id": s["endpoint_id"]}, f)
+PY
+unset SECRET
+chown -R 1000:1000 "$$GC"
+
+echo ${configure_b64} | base64 -d > /var/lib/aegc-endpoint/configure.sh
+docker run --rm -v "$$GC":/home/gc/.globus_compute \
+  -v /var/lib/aegc-endpoint/configure.sh:/tmp/configure.sh:ro \
+  -e AWS_REGION="$$REGION" "$$IMAGE" sh /tmp/configure.sh || fail "couldn't configure the endpoint"
+
+LOGS="--log-driver awslogs --log-opt awslogs-region=$$REGION --log-opt awslogs-group=${log_group}"
+cat > /etc/systemd/system/aegc-endpoint.service <<UNIT
+[Unit]
+Description=aegc cloud endpoint ${name} (${deployment})
+After=docker.service
+Requires=docker.service
+[Service]
+Restart=always
+RestartSec=10
+ExecStartPre=-/usr/bin/docker rm -f aegc-endpoint
+ExecStart=/usr/bin/docker run --rm --name aegc-endpoint $$LOGS \
+  --log-opt awslogs-stream=endpoint/$$IID -v $$GC:/home/gc/.globus_compute \
+  -e GC_ENDPOINT=${name} -e GC_ENDPOINT_UUID=${endpoint_id} \
+  -e AWS_REGION=$$REGION -e AWS_DEFAULT_REGION=$$REGION $$IMAGE
+ExecStop=/usr/bin/docker exec aegc-endpoint globus-compute-endpoint stop ${name}
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+# Every 5 minutes: liveness metric, spend caps, lease, idle result queues (aegc evaluate).
+cat > /etc/systemd/system/aegc-evaluate.service <<UNIT
+[Unit]
+Description=aegc evaluate ${deployment}
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/docker run --rm $$LOGS --log-opt awslogs-format=json/emf \
+  --log-opt awslogs-stream=endpoint/$$IID/evaluate -v $$GC:/home/gc/.globus_compute \
+  -e AWS_REGION=$$REGION -e AWS_DEFAULT_REGION=$$REGION $$IMAGE \
+  aegc --region $$REGION evaluate ${deployment} --endpoint-id ${endpoint_id}
+UNIT
+cat > /etc/systemd/system/aegc-evaluate.timer <<'UNIT'
+[Unit]
+Description=aegc evaluate timer
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+[Install]
+WantedBy=timers.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now aegc-endpoint.service aegc-evaluate.timer || fail "couldn't start"
+echo "aegc: endpoint boot done $$(date -Is)"
+"""
+)
+
+
+@dataclass(frozen=True)
+class EndpointBoot:
+    deployment: str
+    name: str  # the Globus Compute endpoint name
+    endpoint_id: str
+    image: str  # <registry>/aegc/endpoint@sha256:<digest>
+    secret: str  # the Secrets Manager secret name
+    log_group: str
+    configure_script: str  # aegc.endpoint.configure_script(...), run in the image at boot
+
+
+def render_endpoint(boot: EndpointBoot) -> str:
+    if "@sha256:" not in boot.image:
+        raise ValueError(f"endpoint image must be pinned by digest, got {boot.image!r}")
+    return _ENDPOINT_TEMPLATE.substitute(
+        deployment=boot.deployment,
+        name=shlex.quote(boot.name),
+        endpoint_id=shlex.quote(boot.endpoint_id),
+        image=shlex.quote(boot.image),
+        secret=shlex.quote(boot.secret),
+        log_group=boot.log_group,
+        configure_b64=base64.b64encode(boot.configure_script.encode()).decode(),
+    )

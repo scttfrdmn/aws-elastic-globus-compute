@@ -170,9 +170,9 @@ def wheel_hash(wheel_dir: Path) -> str:
     return h.hexdigest()[:8]
 
 
-def existing_image(ecr: Any, env: str, tag: str) -> str | None:
+def existing_image(ecr: Any, env: str, tag: str, *, name: str = "") -> str | None:
     """``<repo>@sha256:<digest>`` if the repository already has ``tag`` (tags are immutable)."""
-    name = naming.image_repository(env)
+    name = name or naming.image_repository(env)
     try:
         d = ecr.describe_images(repositoryName=name, imageIds=[{"imageTag": tag}])["imageDetails"]
     except Exception as e:
@@ -203,8 +203,11 @@ def apply_lifecycle(ecr: Any, name: str) -> None:
     ecr.put_lifecycle_policy(repositoryName=name, lifecyclePolicyText=json.dumps(LIFECYCLE))
 
 
-def ensure_repository(ecr: Any, env: str, report: Report, *, dry_run: bool = False) -> str:
-    name = naming.image_repository(env)
+def ensure_repository(
+    ecr: Any, env: str, report: Report, *, dry_run: bool = False, name: str = ""
+) -> str:
+    """The worker image repository ``aegc/<env>`` (or ``name``), created if it's missing."""
+    name = name or naming.image_repository(env)
     tags = naming.tag_list(naming.tags(naming.BOOTSTRAP, "image-repo"))
     try:
         repo = _owned_repository(ecr, name)

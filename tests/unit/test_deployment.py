@@ -121,7 +121,10 @@ def test_deploy_creates_everything(env: tuple[Clients, DeploymentSpec]) -> None:
     by_sid = {s["Sid"]: s for s in doc["Statement"]}
     assert by_sid["ConsumeTasks"]["Resource"].endswith(":aegc-dev-*-tasks")
     assert by_sid["SelfDrain"]["Condition"] == {
-        "StringEquals": {"autoscaling:ResourceTag/aegc:deployment": "dev"}
+        "StringEquals": {
+            "autoscaling:ResourceTag/aegc:deployment": "dev",
+            "autoscaling:ResourceTag/aegc:role": "asg",  # never the cloud endpoint (#22)
+        }
     }
 
     # Security group: no ingress.

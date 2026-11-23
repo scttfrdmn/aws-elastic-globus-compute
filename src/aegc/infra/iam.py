@@ -219,6 +219,8 @@ def ec2_trust_policy() -> dict[str, Any]:
     }
 
 
+#: The cloud endpoint host role's inline policy (#22).
+ENDPOINT_POLICY = "aegc-endpoint"
 #: The task role's own inline policy (grants go in aegc-grants next to it).
 TASK_POLICY = "aegc-task"
 
@@ -303,8 +305,12 @@ def worker_policy(*, deployment: str, region: str, account: str, bucket: str) ->
                 "Effect": "Allow",
                 "Action": "autoscaling:SetDesiredCapacity",
                 "Resource": "*",
+                # Worker groups only: never the cloud endpoint's group (#22).
                 "Condition": {
-                    "StringEquals": {f"autoscaling:ResourceTag/{naming.TAG_DEPLOYMENT}": d}
+                    "StringEquals": {
+                        f"autoscaling:ResourceTag/{naming.TAG_DEPLOYMENT}": d,
+                        f"autoscaling:ResourceTag/{naming.TAG_ROLE}": "asg",
+                    }
                 },
             },
             {
@@ -318,8 +324,12 @@ def worker_policy(*, deployment: str, region: str, account: str, bucket: str) ->
                 "Effect": "Allow",
                 "Action": "autoscaling:TerminateInstanceInAutoScalingGroup",
                 "Resource": "*",
+                # Worker groups only: never the cloud endpoint's group (#22).
                 "Condition": {
-                    "StringEquals": {f"autoscaling:ResourceTag/{naming.TAG_DEPLOYMENT}": d}
+                    "StringEquals": {
+                        f"autoscaling:ResourceTag/{naming.TAG_DEPLOYMENT}": d,
+                        f"autoscaling:ResourceTag/{naming.TAG_ROLE}": "asg",
+                    }
                 },
             },
             {
@@ -428,8 +438,12 @@ def operator_policy(*, deployment: str, region: str, account: str, bucket: str) 
                 "Effect": "Allow",
                 "Action": "autoscaling:SetDesiredCapacity",
                 "Resource": "*",
+                # Worker groups only: never the cloud endpoint's group (#22).
                 "Condition": {
-                    "StringEquals": {f"autoscaling:ResourceTag/{naming.TAG_DEPLOYMENT}": d}
+                    "StringEquals": {
+                        f"autoscaling:ResourceTag/{naming.TAG_DEPLOYMENT}": d,
+                        f"autoscaling:ResourceTag/{naming.TAG_ROLE}": "asg",
+                    }
                 },
             },
             {
@@ -490,8 +504,12 @@ def operator_policy(*, deployment: str, region: str, account: str, bucket: str) 
                 "Effect": "Allow",
                 "Action": "autoscaling:UpdateAutoScalingGroup",
                 "Resource": "*",
+                # Worker groups only: never the cloud endpoint's group (#22).
                 "Condition": {
-                    "StringEquals": {f"autoscaling:ResourceTag/{naming.TAG_DEPLOYMENT}": d}
+                    "StringEquals": {
+                        f"autoscaling:ResourceTag/{naming.TAG_DEPLOYMENT}": d,
+                        f"autoscaling:ResourceTag/{naming.TAG_ROLE}": "asg",
+                    }
                 },
             },
             {
@@ -543,6 +561,89 @@ def operator_policy(*, deployment: str, region: str, account: str, bucket: str) 
 BOOTSTRAP_ONLY = {"Bucket", "Ecr", "EcrDeleteAegcRepos"}
 #: Statements both policies need.
 SHARED = {"IamUnderAegcPath", "PassAegcRoles", "Parameters", "Identity"}
+
+
+def endpoint_role_policy(
+    *, deployment: str, region: str, account: str, bucket: str
+) -> dict[str, Any]:
+    """The cloud endpoint host's role (#22): the operator policy (what AWSEngine needs), plus
+    reading its own Globus login, pulling the endpoint image, writing its log streams and
+    deleting idle result queues (``aegc evaluate``)."""
+    d = deployment
+    doc = operator_policy(deployment=d, region=region, account=account, bucket=bucket)
+    doc["Statement"] = [
+        *doc["Statement"],
+        {
+            "Sid": "ReadOwnLogin",
+            "Effect": "Allow",
+            "Action": "secretsmanager:GetSecretValue",
+            "Resource": f"arn:aws:secretsmanager:{region}:{account}:secret:"
+            f"{naming.endpoint_secret(d)}-??????",
+        },
+        {
+            "Sid": "PullEndpointImage",
+            "Effect": "Allow",
+            "Action": [
+                "ecr:BatchGetImage",
+                "ecr:GetDownloadUrlForLayer",
+                "ecr:BatchCheckLayerAvailability",
+            ],
+            "Resource": f"arn:aws:ecr:{region}:{account}:repository/{naming.endpoint_repository()}",
+        },
+        {
+            "Sid": "EcrAuth",
+            "Effect": "Allow",
+            "Action": "ecr:GetAuthorizationToken",
+            "Resource": "*",
+        },
+        {
+            "Sid": "EndpointLogs",
+            "Effect": "Allow",
+            "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+            "Resource": f"arn:aws:logs:{region}:{account}:log-group:{naming.log_group(d)}:*",
+        },
+        {
+            "Sid": "ReapResultQueues",
+            "Effect": "Allow",
+            "Action": "sqs:DeleteQueue",
+            "Resource": f"arn:aws:sqs:{region}:{account}:{naming.PREFIX}-{d}-res-*",
+        },
+    ]
+    return doc
+
+
+def endpoint_deployer_policy(*, region: str, account: str) -> dict[str, Any]:
+    """What ``aegc endpoint deploy / undeploy`` need besides the deployer policy (which already
+    covers the endpoint's role, launch template and Auto Scaling group): its Globus login in
+    Secrets Manager, the offline alarm and its SNS topic."""
+    r, a, p = region, account, naming.PREFIX
+    managed_req = {"StringEquals": {f"aws:RequestTag/{naming.TAG_MANAGED}": "true"}}
+    managed_res = {"StringEquals": {f"aws:ResourceTag/{naming.TAG_MANAGED}": "true"}}
+    secrets = f"arn:aws:secretsmanager:{r}:{a}:secret:{p}-*"
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {"Sid": "CreateLoginTagged", "Effect": "Allow",
+             "Action": ["secretsmanager:CreateSecret", "secretsmanager:TagResource"],
+             "Resource": secrets, "Condition": managed_req},
+            {"Sid": "ChangeOwnedLogin", "Effect": "Allow",
+             "Action": ["secretsmanager:PutSecretValue", "secretsmanager:DeleteSecret",
+                        "secretsmanager:DescribeSecret", "secretsmanager:GetSecretValue"],
+             "Resource": secrets, "Condition": managed_res},
+            {"Sid": "ListLogins", "Effect": "Allow", "Action": "secretsmanager:ListSecrets",
+             "Resource": "*"},
+            {"Sid": "OfflineAlarm", "Effect": "Allow",
+             "Action": ["cloudwatch:PutMetricAlarm", "cloudwatch:DeleteAlarms",
+                        "cloudwatch:DescribeAlarms", "cloudwatch:TagResource",
+                        "cloudwatch:ListTagsForResource"],
+             "Resource": f"arn:aws:cloudwatch:{r}:{a}:alarm:{p}-*"},
+            {"Sid": "AlarmTopic", "Effect": "Allow",
+             "Action": ["sns:CreateTopic", "sns:DeleteTopic", "sns:Subscribe",
+                        "sns:GetTopicAttributes", "sns:ListTagsForResource", "sns:TagResource",
+                        "sns:ListSubscriptionsByTopic"],
+             "Resource": f"arn:aws:sns:{r}:{a}:{p}-*"},
+        ],
+    }  # fmt: skip
 
 
 def deployer_policy(*, region: str, account: str) -> dict[str, Any]:
@@ -981,7 +1082,10 @@ def builder_policy(*, region: str, account: str) -> dict[str, Any]:
     }  # fmt: skip
 
 
-POLICIES = {"worker", "operator", "deployer", "bootstrap", "builder", "task"}
+POLICIES = {
+    "worker", "operator", "deployer", "bootstrap", "builder", "task", "endpoint",
+    "endpoint-deployer",
+}  # fmt: skip
 
 
 def policy(kind: str, *, deployment: str, region: str, account: str) -> dict[str, Any]:
@@ -998,4 +1102,10 @@ def policy(kind: str, *, deployment: str, region: str, account: str) -> dict[str
         return bootstrap_policy(region=region, account=account)
     if kind == "task":
         return task_policy(deployment=deployment, region=region, account=account)
+    if kind == "endpoint":
+        return endpoint_role_policy(
+            deployment=deployment, region=region, account=account, bucket=bucket
+        )
+    if kind == "endpoint-deployer":
+        return endpoint_deployer_policy(region=region, account=account)
     raise ValueError(f"unknown policy {kind!r}; choose from {sorted(POLICIES)}")

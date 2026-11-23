@@ -180,4 +180,38 @@ def auto_scaling_group(deployment: str, pool: str) -> str:
 
 
 def image_repository(env: str) -> str:
+    if env == ENDPOINT:
+        raise NameError_(f"env name {ENDPOINT!r} is reserved for the endpoint image")
     return f"{PREFIX}/{env}"
+
+
+# --- the cloud-hosted endpoint (#22): one per deployment ---------------------------------------
+
+#: Reserved: the endpoint's image repository (aegc/endpoint) and its resources' names.
+ENDPOINT = "endpoint"
+
+
+def endpoint_role(deployment: str, region: str) -> str:
+    return f"{PREFIX}-{deployment}-endpoint-{region}"
+
+
+def endpoint_group(deployment: str) -> str:
+    """The endpoint host's launch template and Auto Scaling group."""
+    return f"{PREFIX}-{deployment}-{ENDPOINT}"
+
+
+def endpoint_secret(deployment: str) -> str:
+    """The Secrets Manager secret with the endpoint's Globus login."""
+    return f"{PREFIX}-{deployment}-{ENDPOINT}"
+
+
+def endpoint_alarm(deployment: str) -> str:
+    return f"{PREFIX}-{deployment}-endpoint-offline"
+
+
+def endpoint_topic(deployment: str) -> str:
+    return f"{PREFIX}-{deployment}-endpoint-alarm"
+
+
+def endpoint_repository() -> str:
+    return f"{PREFIX}/{ENDPOINT}"

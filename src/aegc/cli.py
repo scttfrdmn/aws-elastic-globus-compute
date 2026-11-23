@@ -162,6 +162,8 @@ def _endpoint(args: argparse.Namespace) -> int:
         allowed_functions=allowed,
     )
     cmd = args.endpoint_command
+    if cmd in ("deploy", "undeploy", "status"):
+        return _endpoint_cloud(args, spec)
     if cmd == "build":
         ep.build(Path(args.project_dir), python=args.python)
     elif cmd == "login":
@@ -193,6 +195,113 @@ def _endpoint(args: argparse.Namespace) -> int:
     return 0
 
 
+def _endpoint_cloud(args: argparse.Namespace, spec: Any) -> int:
+    """``aegc endpoint deploy / undeploy / status``: the cloud-hosted endpoint (#22)."""
+    from pathlib import Path
+
+    from aegc import awsutil
+    from aegc import endpoint as ep
+    from aegc.infra import Report, endpoint_host, secrets
+
+    sess, region, account = _ctx(args)
+    c = _clients(sess)
+    d = args.deployment
+    cmd = args.endpoint_command
+    if cmd == "status":
+        print(_endpoint_status(c, d, region))
+        return 0
+    if cmd == "undeploy":
+        dry = not args.yes
+        r = endpoint_host.undeploy(c, d, region, dry_run=dry)  # type: ignore[arg-type]
+        secrets.delete_login(c.secretsmanager, d, r, dry_run=dry)  # type: ignore[attr-defined]
+        print(r)
+        if dry:
+            print("dry run; pass --yes to remove the cloud endpoint")
+        return 0
+    # deploy
+    if not args.env:
+        raise SystemExit("aegc: endpoint deploy needs --env (the default science environment)")
+    if ep.is_running(spec):
+        if not args.stop_local:
+            raise SystemExit(
+                f"aegc: the local endpoint {spec.name} is running ({spec.container}); one endpoint "
+                "id can run in one place. Stop it, or pass --stop-local"
+            )
+        ep.stop(spec)
+    login = ep.export_login(spec)
+    image = args.image or ep.build_push(
+        Path(args.project_dir),
+        ecr=awsutil.client(sess, "ecr"),  # type: ignore[arg-type]
+        python=args.python,
+    )
+    cloud = ep.EndpointSpec(
+        name=spec.name, deployment=d, region=region, default_env=spec.default_env,
+        allowed_functions=spec.allowed_functions,
+    )  # fmt: skip
+    host = endpoint_host.EndpointHostSpec(
+        deployment=d, account=account, region=region, name=spec.name,
+        endpoint_id=login.endpoint_id, image=image, configure_script=ep.configure_script(cloud),
+        instance_type=args.instance_type, alarm_email=args.alarm_email or "",
+    )  # fmt: skip
+    report = Report()
+    secrets.put_login(c.secretsmanager, d, login, report, dry_run=args.dry_run)  # type: ignore[attr-defined]
+    report.actions.extend(endpoint_host.deploy(c, host, dry_run=args.dry_run).actions)  # type: ignore[arg-type]
+    print(report)
+    if not args.dry_run:
+        print(
+            f"cloud endpoint {spec.name} ({login.endpoint_id}) is starting on "
+            f"{args.instance_type}; `aegc endpoint status --deployment {d}` shows when it's "
+            "online (about 3 minutes)"
+        )
+    return 0
+
+
+def _endpoint_status(c: Any, d: str, region: str) -> str:
+    from aegc import naming
+    from aegc.infra import secrets
+
+    lines = [f"cloud endpoint of {d} ({region}):"]
+    g = c.autoscaling.describe_auto_scaling_groups(
+        AutoScalingGroupNames=[naming.endpoint_group(d)]
+    )["AutoScalingGroups"]
+    if not g:
+        return lines[0] + " none (aegc endpoint deploy creates one)"
+    inst = g[0].get("Instances", [])
+    lines.append(
+        "  instance: "
+        + (", ".join(f"{i['InstanceId']} {i.get('InstanceType', '')} {i['LifecycleState']}"
+                     for i in inst) or "none yet")
+    )  # fmt: skip
+    try:
+        login = secrets.get_login(c.secretsmanager, d)
+        lines.append(f"  endpoint: {login.name} ({login.endpoint_id})")
+    except Exception as e:
+        lines.append(f"  endpoint: login secret unreadable ({e})")
+    a = c.cloudwatch.describe_alarms(AlarmNames=[naming.endpoint_alarm(d)]).get("MetricAlarms", [])
+    if a:
+        lines.append(f"  alarm {a[0]['AlarmName']}: {a[0]['StateValue']}")
+    return "\n".join(lines)
+
+
+def _evaluate(args: argparse.Namespace) -> int:
+    from aegc import awsutil, evaluator
+
+    sess, region, _ = _ctx(args)
+    clients = {
+        s: awsutil.client(sess, s)  # type: ignore[arg-type]
+        for s in ("ssm", "s3", "autoscaling", "scheduler", "sqs", "ec2")
+    }
+    clients["pricing"] = awsutil.client(  # the Price List API is in us-east-1
+        awsutil.session(args.profile, "us-east-1"), "pricing"
+    )
+    ev = evaluator.evaluate(
+        deployment=args.deployment, region=region, clients=clients,
+        endpoint_id=args.endpoint_id or "", dry_run=args.dry_run,
+    )  # fmt: skip
+    print(ev.render(), file=sys.stderr)  # stdout carries the EMF metric line
+    return 1 if ev.errors else 0
+
+
 def _ctx(args: argparse.Namespace) -> tuple[object, str, str]:
     from aegc import awsutil
 
@@ -220,7 +329,10 @@ def _clients(sess: object) -> object:
     from aegc import awsutil
     from aegc.infra.deployment import Clients
 
-    services = ("iam", "ec2", "autoscaling", "sqs", "logs", "ssm", "ecr", "scheduler")
+    services = (
+        "iam", "ec2", "autoscaling", "sqs", "logs", "ssm", "ecr", "scheduler", "secretsmanager",
+        "cloudwatch", "sns",
+    )  # fmt: skip
     return Clients(**{s: awsutil.client(sess, s) for s in services})  # type: ignore[arg-type]
 
 
@@ -852,10 +964,21 @@ def build_parser() -> argparse.ArgumentParser:
         description="worker: on worker instances. operator: the endpoint's credentials. "
         "deployer: aegc deploy/destroy/stop/resume/reap/footprint. "
         "bootstrap: aegc bootstrap/unbootstrap. builder: aegc image build. task: task code on "
-        "isolated pools, besides the grants (aegc-task on the task role).",
+        "isolated pools, besides the grants (aegc-task on the task role). endpoint: the cloud "
+        "endpoint host. endpoint-deployer: aegc endpoint deploy/undeploy, with deployer.",
     )
     p.add_argument(
-        "kind", choices=["worker", "operator", "deployer", "bootstrap", "builder", "task"]
+        "kind",
+        choices=[
+            "worker",
+            "operator",
+            "deployer",
+            "bootstrap",
+            "builder",
+            "task",
+            "endpoint",
+            "endpoint-deployer",
+        ],
     )
     p.add_argument("--deployment", default="default", help="deployment name (worker, operator)")
     p.add_argument("--account", help="AWS account id (default: the caller's)")
@@ -1053,8 +1176,10 @@ def build_parser() -> argparse.ArgumentParser:
     e = sub.add_parser("endpoint", help="run a Globus Compute endpoint with AWSEngine in Docker")
     e.add_argument(
         "endpoint_command",
-        choices=["build", "login", "configure", "start", "stop", "logs", "test", "id"],
-    )
+        choices=["build", "login", "configure", "start", "stop", "logs", "test", "id", "deploy",
+                 "undeploy", "status"],
+        help="deploy/undeploy/status: the cloud-hosted endpoint (EC2), running as your login",
+    )  # fmt: skip
     e.add_argument("--name", default="aegc", help="Globus Compute endpoint name")
     e.add_argument("--deployment", default="default", help="aegc deployment the engine uses")
     e.add_argument("--env", help="default science environment (configure); env to test (test)")
@@ -1070,7 +1195,23 @@ def build_parser() -> argparse.ArgumentParser:
         default="3.14",
         help="Python in the endpoint image; `test` submits with it (build)",
     )
+    e.add_argument("--instance-type", default="t4g.micro", help="deploy: the host (Graviton)")
+    e.add_argument("--alarm-email", help="deploy: email when the cloud endpoint is offline")
+    e.add_argument("--image", help="deploy: an endpoint image already in ECR (default: build one)")
+    e.add_argument("--stop-local", action="store_true", help="deploy: stop the local endpoint")
+    e.add_argument("--dry-run", action="store_true", help="deploy: show what would change")
+    e.add_argument("--yes", action="store_true", help="undeploy: actually remove it")
     e.set_defaults(func=_endpoint)
+
+    ev = sub.add_parser(
+        "evaluate",
+        help="spend caps, lease, liveness and idle result queues, without an engine (the cloud "
+        "endpoint runs this every 5 minutes)",
+    )
+    ev.add_argument("deployment")
+    ev.add_argument("--endpoint-id", help="the endpoint to check with Globus (liveness metric)")
+    ev.add_argument("--dry-run", action="store_true", help="change nothing; say what would")
+    ev.set_defaults(func=_evaluate)
     return parser
 
 

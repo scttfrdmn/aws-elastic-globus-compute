@@ -196,6 +196,10 @@ class Clients:
     ssm: Any
     ecr: Any = None  # optional: without it, deploy and destroy leave ECR in-use tags alone
     scheduler: Any = None  # optional: without it, deploy and destroy leave the lease alone
+    # The cloud endpoint (#22); optional: without them, destroy leaves its secret and alarm.
+    secretsmanager: Any = None
+    cloudwatch: Any = None
+    sns: Any = None
 
 
 def _retry(fn: Callable[[], Any], *, codes: set[str], attempts: int, delay_s: float) -> Any:
@@ -731,13 +735,15 @@ def _lt_description(digest: str) -> str:
 def ensure_launch_template(
     c: Clients,
     spec: DeploymentSpec,
-    pool: PoolSpec,
+    pool: PoolSpec | None,
     data: dict[str, Any],
     report: Report,
     *,
     dry_run: bool,
 ) -> str:
-    d, name = spec.deployment, naming.launch_template(spec.deployment, pool.name)
+    """A pool's launch template (or, with ``pool=None``, the cloud endpoint host's)."""
+    pool_name = pool.name if pool is not None else naming.ENDPOINT
+    d, name = spec.deployment, naming.launch_template(spec.deployment, pool_name)
     digest = template_digest(data)
     try:
         found = c.ec2.describe_launch_templates(LaunchTemplateNames=[name])["LaunchTemplates"]
@@ -757,7 +763,7 @@ def ensure_launch_template(
                 {
                     "ResourceType": "launch-template",
                     "Tags": naming.tag_list(
-                        naming.tags(d, "lt", pool=pool.name, extra=spec.extra_tags)
+                        naming.tags(d, "lt", pool=pool_name, extra=spec.extra_tags)
                     ),
                 }
             ],
@@ -1335,6 +1341,14 @@ def destroy(
         )  # fmt: skip
     _destroy_worker_role(c, d, region, report, dry_run=dry_run)
     _destroy_role(c, d, naming.task_role(d, region), report, dry_run=dry_run)
+    # The cloud endpoint (#22): its group and template went with the others above.
+    from aegc.infra import endpoint_host, secrets
+
+    report.actions.extend(
+        endpoint_host.undeploy(c, d, region, dry_run=dry_run, wait_s=wait_s, poll_s=poll_s).actions
+    )
+    if c.secretsmanager is not None:
+        secrets.delete_login(c.secretsmanager, d, report, dry_run=dry_run)
 
     log_name = naming.log_group(d)
     for g in list(
@@ -1491,6 +1505,20 @@ def verify_destroyed(
         except Exception as e:
             if not is_not_found(e):
                 raise
+    for extra in (naming.endpoint_role(d, region),):  # the cloud endpoint's role (#22)
+        try:
+            if naming.is_owned(
+                extra, naming.tag_dict(c.iam.list_role_tags(RoleName=extra)["Tags"]), d
+            ):
+                report.add("iam role", extra, "remaining")
+        except Exception as e:
+            if not is_not_found(e):
+                raise
+    if c.secretsmanager is not None:
+        from aegc.infra import secrets
+
+        if secrets.exists(c.secretsmanager, d):
+            report.add("secret", naming.endpoint_secret(d), "remaining")
     try:  # the task role (#32)
         if naming.is_owned(task, naming.tag_dict(c.iam.list_role_tags(RoleName=task)["Tags"]), d):
             report.add("iam role", task, "remaining")

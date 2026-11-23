@@ -17,6 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
+from typing import Any
 
 from aegc import images
 
@@ -111,6 +112,13 @@ def login(spec: EndpointSpec, run: Runner = subprocess.run) -> None:
 
 def configure(spec: EndpointSpec, run: Runner = subprocess.run) -> None:
     """Create (if needed) and configure the endpoint inside the volume."""
+    script = configure_script(spec)
+    run(["docker", "run", "--rm", *_mounts(spec), IMAGE, "sh", "-c", script], check=True, text=True)
+
+
+def configure_script(spec: EndpointSpec) -> str:
+    """The shell script, run in the endpoint image, that creates and configures the endpoint
+    (on this host, or on the cloud endpoint host at boot)."""
     ep = f"{GC_DIR}/{spec.name}"
     files = {
         "user_config_template.yaml.j2": render_template(spec),
@@ -128,7 +136,7 @@ def configure(spec: EndpointSpec, run: Runner = subprocess.run) -> None:
               if spec.allowed_functions is not None else []),
         ]
     )  # fmt: skip
-    run(["docker", "run", "--rm", *_mounts(spec), IMAGE, "sh", "-c", script], check=True, text=True)
+    return script
 
 
 def _allowed_functions_edit(path: str, functions: tuple[str, ...]) -> str:
@@ -186,6 +194,73 @@ def wait_for_id(spec: EndpointSpec, timeout_s: float = 90, run: Runner = subproc
             if time.monotonic() > deadline:
                 raise
             time.sleep(3)
+
+
+def is_running(spec: EndpointSpec, run: Runner = subprocess.run) -> bool:
+    out = run(
+        ["docker", "inspect", "-f", "{{.State.Running}}", spec.container],
+        check=False, text=True, capture_output=True,
+    )  # fmt: skip
+    return out.returncode == 0 and out.stdout.strip() == "true"
+
+
+def export_login(spec: EndpointSpec, run: Runner = subprocess.run) -> Any:
+    """This host's Globus login and the endpoint's id, for the cloud endpoint (#22)."""
+    import base64
+
+    from aegc.infra.secrets import EndpointLogin
+
+    code = (
+        "import base64, json, sys; d = sys.argv[1]; "
+        "print(json.dumps({'db': base64.b64encode(open(d + '/storage.db', 'rb').read()).decode(),"
+        " 'id': json.load(open(d + '/' + sys.argv[2] + '/endpoint.json'))['endpoint_id']}))"
+    )
+    out = run(
+        ["docker", "run", "--rm", *_mounts(spec), IMAGE, "python", "-c", code, GC_DIR, spec.name],
+        check=True, text=True, capture_output=True,
+    )  # fmt: skip
+    d = json.loads(out.stdout.strip().splitlines()[-1])
+    return EndpointLogin(
+        name=spec.name, endpoint_id=str(d["id"]), storage_db=base64.b64decode(d["db"])
+    )
+
+
+def build_push(
+    project_dir: Path,
+    *,
+    ecr: Any,
+    gce_version: str = images.DEFAULT_GCE_VERSION,
+    python: str = DEFAULT_PYTHON,
+    run: Runner = subprocess.run,
+    log: Callable[[str], None] = print,
+) -> str:
+    """Build the endpoint image for linux/arm64 and push it to ECR ``aegc/endpoint``; returns
+    ``<repo>@sha256:<digest>`` (the cloud endpoint runs on Graviton)."""
+    from aegc import __version__, naming
+    from aegc.infra import Report
+
+    repo = naming.endpoint_repository()
+    local = "aegc-endpoint:arm64"
+    with tempfile.TemporaryDirectory(prefix="aegc-endpoint-") as tmp:
+        ctx = Path(tmp)
+        wheels = images.build_wheel(project_dir, ctx / "dist", run=run)
+        whash = images.wheel_hash(wheels)
+        for name in ("Dockerfile", "entrypoint.sh"):
+            (ctx / name).write_text(_template(name))
+        run(
+            ["docker", "buildx", "build", "--platform", "linux/arm64", "--load",
+             "--build-arg", f"GCE_VERSION={gce_version}", "--build-arg", f"PYTHON={python}",
+             "-t", local, str(ctx)],
+            check=True, text=True,
+        )  # fmt: skip
+    uri = images.ensure_repository(ecr, "", Report(), name=repo)
+    tag = f"py{python}-gce{gce_version}-aegc{__version__}-w{whash}"
+    pinned = images.existing_image(ecr, "", tag, name=repo)
+    if pinned:
+        log(f"{uri}:{tag} already exists; reusing it")
+        return pinned
+    images.docker_login(ecr, run=run)
+    return images.push(local, f"{uri}:{tag}", run=run)
 
 
 def logs(spec: EndpointSpec, run: Runner = subprocess.run) -> None:
