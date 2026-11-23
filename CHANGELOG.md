@@ -16,6 +16,11 @@ All notable changes to this project are documented here. The format follows
   without it, deploy keeps every subnet and says so.
 - [Other regions](docs/how-to/operations.md#other-regions): bootstrap, images, deployments and
   endpoints per region, for example us-east-1 next to RODA datasets.
+- [Tutorials](docs/tutorials/index.md) with runnable code in `examples/` (#65): Sentinel-2 NDVI
+  from a notebook to a nightly flow on the cloud endpoint (#71), slicing 1000 Genomes in
+  us-east-1 with a bring-your-own bcftools image (#72), a Spot sweep under FIS interruptions
+  (#73), and one flow across a laptop endpoint and aegc (#74). Each has a Results box for its
+  measured numbers, to be filled in from live runs.
 
 ### Changed
 - `aegc bootstrap` in us-east-1 creates the payload bucket without a `CreateBucketConfiguration`

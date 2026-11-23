@@ -57,13 +57,16 @@ submit host, which needs tunnels or exposed ports.
 
 - **[Quickstart](quickstart.md):** bootstrap a region, build one worker image, deploy a pool, and run
   tasks through a laptop endpoint, then tear it down.
+- **[Tutorials](tutorials/index.md):** real workloads, each with what it measured.
 - **[When to use aegc](concepts/when-to-use.md):** what it's good at, and its limits.
 - **[Architecture](concepts/architecture.md):** how a task travels from the SDK to a worker and back.
 
-The site is organised into concepts (how it works and why), how-to guides (tasks you'll do), and
-reference (exact commands, keys, limits, policies and resources).
+The site is organised into tutorials (worked examples), concepts (how it works and why), how-to
+guides (tasks you'll do), and reference (exact commands, keys, limits, policies and resources).
 
-!!! info "Tutorials (coming)"
-    Worked, measured tutorials (Sentinel-2 composites, CMIP6 ensembles, Spot sweeps and others) are
-    proposed in [#16](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/16) and will be
-    added later.
+!!! info "Tutorials"
+    [Worked, measured tutorials](tutorials/index.md): Sentinel-2 NDVI from a notebook to a
+    nightly flow, slicing 1000 Genomes in us-east-1, a Spot sweep under FIS interruptions, and one
+    flow across a laptop endpoint and aegc. More are proposed in
+    [#16](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/16) and
+    [#65](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/65).
