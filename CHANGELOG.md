@@ -90,8 +90,9 @@ live; see the [performance page](docs/reference/performance.md#v07-live-run-2026
   concurrency isn't checked.
 - The EC2 worker agent uses the shared message path (`aegc.worker.process`); its behaviour is
   unchanged.
-- Tests run against substrate v0.131.0, which drops the shims for substrate #1522, #1594, #1620,
-  #1622 and #1623.
+- Tests run against substrate v0.131.0, without the shims for substrate #1522, #1594, #1620,
+  #1622 and #1623 (#1522 is only partly fixed: instances have no primary network interface, so
+  the destroy check's interface scan always comes back empty in tests).
 
 ### Fixed
 - Found in review, before release: Lambda spend came from per-environment ledger records that the
