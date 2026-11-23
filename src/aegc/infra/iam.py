@@ -658,7 +658,8 @@ def operator_policy(*, deployment: str, region: str, account: str, bucket: str) 
                     "ArnLike": {
                         "lambda:FunctionArn": f"arn:aws:lambda:{region}:{account}:function:"
                         f"{naming.PREFIX}-{d}-*"
-                    }
+                    },
+                    "StringEquals": {f"aws:ResourceTag/{naming.TAG_DEPLOYMENT}": d},
                 },
             },
             {

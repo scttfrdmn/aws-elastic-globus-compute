@@ -648,12 +648,19 @@ def test_operator_can_freeze_only_its_own_lambda_pools(aws: Callable[[str], Any]
     c, arn = principal(
         aws, iam.operator_policy(deployment="dev", region=REGION, account=ACCOUNT, bucket=BUCKET)
     )
+    ours = {"lambda:FunctionArn": f"{FN}:{FUNCTION}", "aws:ResourceTag/aegc:deployment": "dev"}
     for action in ("lambda:UpdateEventSourceMapping", "lambda:GetEventSourceMapping"):
-        assert decide(c, arn, action, ESM, **{"lambda:FunctionArn": f"{FN}:{FUNCTION}"}) == (
-            "allowed"
-        )
-        assert decide(c, arn, action, ESM,
-                      **{"lambda:FunctionArn": f"{FN}:aegc-prod-x"}) != "allowed"  # fmt: skip
+        assert decide(c, arn, action, ESM, **ours) == "allowed"
+        for other in ({"lambda:FunctionArn": f"{FN}:aegc-prod-x"},
+                      {"aws:ResourceTag/aegc:deployment": "prod"}):  # fmt: skip
+            assert decide(c, arn, action, ESM, **{**ours, **other}) != "allowed", other
+        assert decide(
+            c, arn, action, ESM, **{"lambda:FunctionArn": ours["lambda:FunctionArn"]}
+        ) != ("allowed")  # untagged
+    # The cloud endpoint host (the evaluator) has the operator policy's statements.
+    host = iam.endpoint_role_policy(deployment="dev", region=REGION, account=ACCOUNT, bucket=BUCKET)
+    c2, arn2 = principal(aws, host, "aegc-ep")
+    assert decide(c2, arn2, "lambda:UpdateEventSourceMapping", ESM, **ours) == "allowed"
     assert decide(c, arn, "lambda:ListEventSourceMappings", "*") == "allowed"
     assert decide(c, arn, "lambda:GetFunctionConfiguration", f"{FN}:{FUNCTION}") == "allowed"
     assert decide(c, arn, "lambda:GetFunctionConfiguration", f"{FN}:aegc-prod-x") != "allowed"
