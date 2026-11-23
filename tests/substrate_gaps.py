@@ -55,7 +55,7 @@ def metrics_collection(autoscaling: Any) -> list[dict[str, Any]]:
 
 
 def instance_type_offerings(ec2: Any, offered: dict[str, list[str]]) -> list[dict[str, Any]]:
-    """substrate gap (not yet filed): DescribeInstanceTypeOfferings offers every type in every
+    """substrate#1621: DescribeInstanceTypeOfferings offers every type in every
     zone, so a zone without Graviton (us-east-1's use1-az3) can't be modelled. Subnets also lack
     AvailabilityZoneId.
 
