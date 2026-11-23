@@ -40,9 +40,9 @@ def renew_interval(lease_s: int) -> float:
 
 SSM_TARGET = "arn:aws:scheduler:::aws-sdk:ssm:putParameter"
 ASG_TARGET = "arn:aws:scheduler:::aws-sdk:autoscaling:updateAutoScalingGroup"
-#: Universal targets take a REST API's URI parameters and body fields together, named as in the
-#: API reference: ``{"UUID": ..., "Enabled": false}`` (Scheduler user guide, "Using universal
-#: targets").
+#: Universal targets take a REST API's URI parameters and body fields together, but named as the
+#: SDKs' members are serialized: ``{"Uuid": ..., "Enabled": false}`` (found live: "UUID" is
+#: refused with "Request payload is missing the following field(s): Uuid").
 LAMBDA_TARGET = "arn:aws:scheduler:::aws-sdk:lambda:updateEventSourceMapping"
 POLICY = "aegc-lease"
 
@@ -145,7 +145,7 @@ def schedules(spec: LeaseSpec, role_arn: str, *, now: float) -> dict[str, dict[s
             add(
                 f"{prefix}-{pool}",
                 when,
-                {"Arn": LAMBDA_TARGET, "Input": json.dumps({"UUID": uuid, "Enabled": False})},
+                {"Arn": LAMBDA_TARGET, "Input": json.dumps({"Uuid": uuid, "Enabled": False})},
             )
 
     if spec.lease_s:

@@ -77,7 +77,11 @@ class SpendGuard:
             return pricing.Accrued(0.0, 0.0, {}, {}, frozenset())
         hit = self._lambda.get(kind)
         if hit is None or hit[0] != start or now - hit[1] >= self.ledger_ttl_s:
-            hit = (start, now, lambda_pools.accrue_metrics(self.cloudwatch, pools, start, now))
+            hit = (
+                start,
+                now,
+                lambda_pools.accrue_metrics(self.cloudwatch, pools, start, now, self.deployment),
+            )
             self._lambda[kind] = hit
         return hit[2]
 

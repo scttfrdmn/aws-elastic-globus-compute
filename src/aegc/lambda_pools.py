@@ -190,15 +190,21 @@ METRIC_PERIOD_S = 3600
 
 
 def accrue_metrics(
-    cloudwatch: Any, pools: dict[str, dict[str, Any]], start: float, end: float
+    cloudwatch: Any,
+    pools: dict[str, dict[str, Any]],
+    start: float,
+    end: float,
+    deployment: str = "",
 ) -> pricing.Accrued:
     """Lambda pools' spend in ``[start, end)`` from Lambda's own metrics (``AWS/Lambda``
     ``Duration`` and ``Invocations`` by function), priced at each pool's memory.
 
     Not from the cost ledger: tasks run with the function role, so anything that role could write
-    a task could rewrite, and an invocation that times out never gets to write. Init time isn't
-    in ``Duration`` (images are billed for it), so this runs a little low; hours are rounded out
-    to whole hours, so a window that doesn't start on the hour runs a little high. Lambda time
+    a task could rewrite, and an invocation that times out never gets to write. Init isn't in
+    ``Duration`` but images are billed for it (about 5 s per execution environment, found live):
+    with ``deployment``, it comes from the handler's ``aegc`` ``InitSeconds`` metric, written
+    before any task runs in that environment (a task could only add to it). Hours are rounded
+    out to whole hours, so a window that doesn't start on the hour runs a little high. Lambda time
     isn't instance-hours.
     """
     from datetime import UTC, datetime
@@ -225,6 +231,26 @@ def accrue_metrics(
                     "ReturnData": True,
                 }
             )
+        if deployment:
+            pool = list(lam)[i]
+            queries.append(
+                {
+                    "Id": f"n{i}",
+                    "MetricStat": {
+                        "Metric": {
+                            "Namespace": "aegc",
+                            "MetricName": "InitSeconds",
+                            "Dimensions": [
+                                {"Name": "Deployment", "Value": deployment},
+                                {"Name": "Pool", "Value": pool},
+                            ],
+                        },
+                        "Period": METRIC_PERIOD_S,
+                        "Stat": "Sum",
+                    },
+                    "ReturnData": True,
+                }
+            )
     lo = start - start % METRIC_PERIOD_S
     totals: dict[str, float] = {}
     for i in range(0, len(queries), 500):
@@ -244,7 +270,7 @@ def accrue_metrics(
     by_pool: dict[str, float] = {}
     by_type: dict[str, float] = {}
     for i, (pool, entry) in enumerate(lam.items()):
-        billed_s = totals.get(f"d{i}", 0.0) / 1000
+        billed_s = totals.get(f"d{i}", 0.0) / 1000 + totals.get(f"n{i}", 0.0)
         cost = pricing.lambda_cost(billed_s, memory_mib(entry), int(totals.get(f"i{i}", 0)))
         if not cost:
             continue

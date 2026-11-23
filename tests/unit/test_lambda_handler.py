@@ -72,6 +72,7 @@ def test_runs_a_task_with_lambda_provenance(rig: Rig) -> None:
     assert rig.task_queue_empty()  # deleted, not left for the mapping
     assert not _ledger(rig)  # Lambda spend comes from Lambda's metrics, not the function role
     assert rig.metric_values("TasksCompleted", "ok") == [1.0]
+    assert len(rig.metric_values("InitSeconds")) == 1  # once per environment, before any task
 
 
 def _ledger(rig: Rig) -> list[dict[str, Any]]:

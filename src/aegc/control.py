@@ -262,7 +262,9 @@ def cost(
     recs = list(ledger.read(s3, bucket, deployment, start, now))
     a = pricing.accrue(recs, start, now, prices)
     if cloudwatch is not None and pools:
-        a = pricing.combine(a, lambda_pools.accrue_metrics(cloudwatch, pools, start, now))
+        a = pricing.combine(
+            a, lambda_pools.accrue_metrics(cloudwatch, pools, start, now, deployment)
+        )
     return CostReport(deployment, start, now, a, by)
 
 

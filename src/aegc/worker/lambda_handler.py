@@ -83,6 +83,7 @@ class Runtime:
     emitter: emf.Emitter | None = None
     init_at: float = _INIT_AT
     _halt: State | None = field(default=None, init=False)
+    _invoked: bool = field(default=False, init=False)
     _state_at: float = field(default=-1e18, init=False)
     _request_id: str = field(default="", init=False)
 
@@ -112,6 +113,9 @@ class Runtime:
     # --- one invocation -----------------------------------------------------------------------
 
     def invoke(self, event: dict[str, Any], context: Any) -> dict[str, Any]:
+        if not self._invoked:  # before any task can run here (see lambda_pools.accrue_metrics)
+            self._invoked = True
+            self._emf.emit({"InitSeconds": max(0.0, self.clock() - self.init_at)})
         self._request_id = str(getattr(context, "aws_request_id", "") or "")
         failures: list[dict[str, str]] = []
         for rec in event.get("Records", []):

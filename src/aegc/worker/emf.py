@@ -26,6 +26,9 @@ UNITS: dict[str, str] = {
     "ExecSeconds": "Seconds",
     "QueueWaitSeconds": "Seconds",  # submit (the engine's clock) to claim
     "BootToFirstClaimSeconds": "Seconds",
+    # Lambda pools: an execution environment's init, which Lambda bills (container images) but
+    # its Duration metric leaves out. Written before any task runs there.
+    "InitSeconds": "Seconds",
     "Interruptions": "Count",  # Spot interruption notices
     "Releases": "Count",  # in-flight tasks handed back to the queue
     "PoisonTasks": "Count",  # delivered too often; failed without running

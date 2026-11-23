@@ -205,8 +205,11 @@ def test_an_idle_lambda_pool_doesnt_hold_back_ec2(env: Env) -> None:
 class LambdaMetrics:
     """GetMetricData answering AWS/Lambda Duration (ms) and Invocations sums per function."""
 
-    def __init__(self, by_function: dict[str, tuple[float, int]], at: float = NOON) -> None:
+    def __init__(
+        self, by_function: dict[str, tuple[float, int]], at: float = NOON, init_s: float = 0.0
+    ) -> None:
         self.by_function = by_function
+        self.init_s = init_s
         self.at = at  # when it ran: windows without it see nothing
         self.calls: list[dict[str, Any]] = []
 
@@ -220,7 +223,8 @@ class LambdaMetrics:
             stat = q["MetricStat"]
             fn = stat["Metric"]["Dimensions"][0]["Value"]
             ms, n = self.by_function.get(fn, (0.0, 0))
-            value = ms if stat["Metric"]["MetricName"] == "Duration" else float(n)
+            name = stat["Metric"]["MetricName"]
+            value = {"Duration": ms, "Invocations": float(n), "InitSeconds": self.init_s}[name]
             out.append({"Id": q["Id"], "Values": [value / 2, value / 2]})  # two hours
         return {"MetricDataResults": out}
 
@@ -239,6 +243,10 @@ def test_lambda_spend_comes_from_lambdas_metrics(env: Env) -> None:
     assert a.instance_hours == 0  # Lambda time isn't instance-hours
     (q,) = [q for q in cw.calls[0]["MetricDataQueries"] if q["Id"] == "d0"]
     assert q["MetricStat"]["Metric"]["Namespace"] == "AWS/Lambda"
+    # Found live: images are billed for init (about 5 s per environment), which Duration omits.
+    cw.init_s = 360.0
+    with_init = lambda_pools.accrue_metrics(cw, pools, NOON - 7200, NOON, "dev")
+    assert with_init.usd == pytest.approx(expect + 360 * 4 * pricing.LAMBDA_ARM_GB_S)
     prices = pricing.Prices(region=REGION)
     guard = SpendGuard(s3=env.s3, bucket=BUCKET, deployment="dev", prices=prices, cloudwatch=cw,
                        pools=pools)  # fmt: skip
@@ -399,7 +407,7 @@ def test_lease_schedules_disable_mappings() -> None:
     assert sorted(s) == ["lease-geo-lam", "lease-sci-py314", "lease-state"]
     t = s["lease-geo-lam"]["Target"]
     assert t["Arn"] == "arn:aws:scheduler:::aws-sdk:lambda:updateEventSourceMapping"
-    assert json.loads(t["Input"]) == {"UUID": LEASE.mappings[GEO_LAM], "Enabled": False}
+    assert json.loads(t["Input"]) == {"Uuid": LEASE.mappings[GEO_LAM], "Enabled": False}
     assert t["RoleArn"] == arn
     ttl = lease.schedules(replace_spec(lease_s=0, ttl_at=NOW + 86400), arn, now=NOW)
     assert sorted(ttl) == ["ttl-geo-lam", "ttl-sci-py314", "ttl-state"]
@@ -431,7 +439,7 @@ def test_lease_with_mappings_ensure_renew_fire(
                        now=NOW)  # fmt: skip
     got = sch.get_schedule(Name="lease-geo-lam", GroupName="aegc-dev")
     assert json.loads(got["Target"]["Input"]) == {
-        "UUID": entry["event_source_mapping"],
+        "Uuid": entry["event_source_mapping"],
         "Enabled": False,
     }
     assert lease.renew(sch, "dev", 7200, now=NOW + 3600) == 3
