@@ -3,8 +3,10 @@
 Each one names the substrate issue that tracks it. When substrate fixes the issue, delete the
 workaround and its uses, so the test exercises substrate directly.
 
-Gaps without code here (substrate v0.131.0 fixed #1522, #1594-#1596, #1618, #1620, #1622, #1623):
+Gaps without code here (substrate v0.131.0 fixed #1594-#1596, #1618, #1620, #1622, #1623):
 - substrate#1524: no ECR lifecycle policy preview (a strict xfail in test_images.py).
+- substrate#1522 (partial in v0.131.0): DescribeNetworkInterfaces answers, but instances have no
+  primary ENI, so ``verify_destroyed``'s ENI check always sees none.
 """
 
 from __future__ import annotations
