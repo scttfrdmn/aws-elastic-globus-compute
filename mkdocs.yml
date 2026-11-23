@@ -49,6 +49,12 @@ nav:
   - Get started:
       - Home: index.md
       - Quickstart: quickstart.md
+  - Tutorials:
+      - Overview: tutorials/index.md
+      - "Sentinel-2 NDVI, from a notebook to nightly": tutorials/sentinel2-ndvi.md
+      - "Slice before you ship: 1000 Genomes": tutorials/genomics-slice.md
+      - A Spot sweep that survives interruptions: tutorials/spot-sweep.md
+      - One flow, two endpoints: tutorials/two-endpoints.md
   - Concepts:
       - Architecture: concepts/architecture.md
       - When to use aegc: concepts/when-to-use.md

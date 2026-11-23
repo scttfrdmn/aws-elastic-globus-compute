@@ -1,0 +1,29 @@
+{
+  "Comment": "aegc tutorial: a manifest from a laptop endpoint, the work on aegc next to the data",
+  "StartAt": "Manifest",
+  "States": {
+    "Manifest": {
+      "Type": "Action",
+      "ActionUrl": "https://compute.actions.globus.org/v3",
+      "Parameters": {
+        "endpoint_id.$": "$.laptop_endpoint",
+        "tasks": [{"function_id.$": "$.manifest_function", "args.$": "$.manifest_args"}]
+      },
+      "ResultPath": "$.Manifest",
+      "WaitTime": 600,
+      "Next": "Summarize"
+    },
+    "Summarize": {
+      "Type": "Action",
+      "ActionUrl": "https://compute.actions.globus.org/v3",
+      "Parameters": {
+        "endpoint_id.$": "$.process_endpoint",
+        "user_endpoint_config.$": "$.process_config",
+        "tasks": [{"function_id.$": "$.summarize_function", "args.$": "$.Manifest.details.result"}]
+      },
+      "ResultPath": "$.Summary",
+      "WaitTime": 1800,
+      "End": true
+    }
+  }
+}

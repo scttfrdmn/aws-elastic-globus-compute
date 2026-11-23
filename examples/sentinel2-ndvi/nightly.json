@@ -1,0 +1,18 @@
+{
+  "Comment": "aegc tutorial: NDVI of the latest clear Sentinel-2 scene over an area of interest",
+  "StartAt": "NDVI",
+  "States": {
+    "NDVI": {
+      "Type": "Action",
+      "ActionUrl": "https://compute.actions.globus.org/v3",
+      "Parameters": {
+        "endpoint_id": "ENDPOINT_ID",
+        "user_endpoint_config": {"env": "earth-observation", "python": "3.14"},
+        "tasks": [{"function_id": "FUNCTION_ID", "args.$": "$.args"}]
+      },
+      "ResultPath": "$.NDVI",
+      "WaitTime": 1800,
+      "End": true
+    }
+  }
+}

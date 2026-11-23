@@ -1,0 +1,8 @@
+{
+  "laptop_endpoint": "LAPTOP_ENDPOINT_ID",
+  "manifest_function": "MANIFEST_FUNCTION_ID",
+  "manifest_args": ["/data", "BUCKET", "two-endpoints/inputs/"],
+  "process_endpoint": "AEGC_ENDPOINT_ID",
+  "process_config": {"env": "plain", "python": "3.14"},
+  "summarize_function": "SUMMARIZE_FUNCTION_ID"
+}
