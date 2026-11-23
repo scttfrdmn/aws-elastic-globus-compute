@@ -1,4 +1,4 @@
-"""Deployment lease and TTL with EventBridge Scheduler (no Lambda).
+"""Deployment lease and TTL with EventBridge Scheduler (no function of its own).
 
 If no endpoint renews a deployment for ``lease_s`` (48 h by default), one-shot schedules
 freeze it:
@@ -7,7 +7,8 @@ freeze it:
   ``arn:aws:scheduler:::aws-sdk:ssm:putParameter``. Workers see it, fail anything queued, and
   leave their groups.
 - ``lease-<pool>`` sets each group's minimum to 0 through ``autoscaling:updateAutoScalingGroup``,
-  so ``min>0`` workers can leave too.
+  so ``min>0`` workers can leave too. For a Lambda pool (#21) it disables the pool's event source
+  mapping through ``lambda:updateEventSourceMapping`` instead.
 
 Engines push the lease forward every hour (:func:`renew`). ``--ttl`` adds ``ttl-*`` schedules
 that nothing renews: a hard end date. Everything lives in a tagged schedule group ``aegc-<d>``
@@ -39,6 +40,10 @@ def renew_interval(lease_s: int) -> float:
 
 SSM_TARGET = "arn:aws:scheduler:::aws-sdk:ssm:putParameter"
 ASG_TARGET = "arn:aws:scheduler:::aws-sdk:autoscaling:updateAutoScalingGroup"
+#: Universal targets take a REST API's URI parameters and body fields together, named as in the
+#: API reference: ``{"UUID": ..., "Enabled": false}`` (Scheduler user guide, "Using universal
+#: targets").
+LAMBDA_TARGET = "arn:aws:scheduler:::aws-sdk:lambda:updateEventSourceMapping"
 POLICY = "aegc-lease"
 
 
@@ -136,6 +141,12 @@ def schedules(spec: LeaseSpec, role_arn: str, *, now: float) -> dict[str, dict[s
                     "Input": json.dumps({"AutoScalingGroupName": group, "MinSize": 0}),
                 },
             )
+        for pool, uuid in sorted(spec.mappings.items()):
+            add(
+                f"{prefix}-{pool}",
+                when,
+                {"Arn": LAMBDA_TARGET, "Input": json.dumps({"UUID": uuid, "Enabled": False})},
+            )
 
     if spec.lease_s:
         kind(
@@ -153,6 +164,7 @@ def schedules(spec: LeaseSpec, role_arn: str, *, now: float) -> dict[str, dict[s
 
 def _role_documents(spec: LeaseSpec) -> tuple[dict[str, Any], dict[str, Any]]:
     d, r, a = spec.deployment, spec.region, spec.account
+    functions = f"arn:aws:lambda:{r}:{a}:function:{naming.PREFIX}-{d}-*"
     trust = {
         "Version": "2012-10-17",
         "Statement": [
@@ -178,6 +190,16 @@ def _role_documents(spec: LeaseSpec) -> tuple[dict[str, Any], dict[str, Any]]:
                 "Resource": "*",
                 "Condition": {
                     "StringEquals": {f"autoscaling:ResourceTag/{naming.TAG_DEPLOYMENT}": d}
+                },
+            },
+            {
+                # Lambda pools' mappings: tagged as this deployment's, feeding its functions.
+                "Effect": "Allow",
+                "Action": "lambda:UpdateEventSourceMapping",
+                "Resource": f"arn:aws:lambda:{r}:{a}:event-source-mapping:*",
+                "Condition": {
+                    "StringEquals": {f"aws:ResourceTag/{naming.TAG_DEPLOYMENT}": d},
+                    "ArnLike": {"lambda:FunctionArn": functions},
                 },
             },
         ],
@@ -402,7 +424,14 @@ def destroy_lease(
 
 
 def fire(
-    ssm: Any, autoscaling: Any, deployment: str, groups: dict[str, str], *, prefix: str = "lease"
+    ssm: Any,
+    autoscaling: Any,
+    deployment: str,
+    groups: dict[str, str],
+    *,
+    prefix: str = "lease",
+    lam: Any = None,
+    mappings: dict[str, str] | None = None,
 ) -> None:
     """Do exactly what the ``<prefix>-*`` schedules do when they fire."""
     write_state(
@@ -412,3 +441,5 @@ def fire(
     )
     for group in groups.values():
         autoscaling.update_auto_scaling_group(AutoScalingGroupName=group, MinSize=0)
+    for uuid in (mappings or {}).values():
+        lam.update_event_source_mapping(UUID=uuid, Enabled=False)

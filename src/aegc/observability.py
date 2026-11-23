@@ -2,7 +2,8 @@
 
 Workers write EMF lines (:mod:`aegc.worker.emf`) that CloudWatch turns into metrics in namespace
 ``aegc``, and one JSON ``task_finished`` log line per task to ``/aegc/<d>``. ``aegc metrics``
-reads the metrics, and the Auto Scaling group metrics deploy turns on, with GetMetricData;
+reads the metrics, the Auto Scaling group metrics deploy turns on (for a Lambda pool, its
+function's AWS/Lambda metrics), with GetMetricData;
 ``aegc provenance`` finds a task's lines with FilterLogEvents. Both are in the operator policy.
 """
 
@@ -14,7 +15,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from aegc import naming
+from aegc import lambda_pools, naming
 from aegc.worker import emf
 
 #: (metric, CloudWatch statistic) pairs read per pool, from the [Deployment, Pool] set.
@@ -36,6 +37,8 @@ _POOL_STATS = (
 )
 #: Auto Scaling group metrics (namespace AWS/Auto Scaling), in the group's capacity units.
 _GROUP_STATS = (("GroupInServiceCapacity", "Maximum"), ("GroupDesiredCapacity", "Maximum"))
+#: Lambda pools' function metrics (namespace AWS/Lambda, dimension FunctionName).
+_FUNCTION_STATS = (("ConcurrentExecutions", "Maximum"), ("Throttles", "Sum"))
 
 
 def period_for(span_s: float) -> int:
@@ -66,6 +69,8 @@ class PoolMetrics:
     in_service_max: float | None = None
     desired_max: float | None = None
     unit: str = "vCPUs"
+    kind: str = "ec2"
+    throttles: float = 0  # Lambda pools: invocations Lambda throttled
 
     def render(self) -> list[str]:
         def outcomes(names: tuple[str, ...]) -> str:
@@ -92,7 +97,12 @@ class PoolMetrics:
             f"interruptions {self.interruptions:g}, releases {self.releases:g}, "
             f"poison {self.poison:g}, worker exits {self.worker_exits:g}"
         )
-        if self.in_service_max is not None or self.desired_max is not None:
+        if self.kind == lambda_pools.KIND:
+            events = (
+                f"releases {self.releases:g}, poison {self.poison:g} | concurrent executions max "
+                f"{_n(self.in_service_max)}, throttles {self.throttles:g}"
+            )
+        elif self.in_service_max is not None or self.desired_max is not None:
             events += (
                 f" | {self.unit} in service max {_n(self.in_service_max)}, "
                 f"desired max {_n(self.desired_max)}"
@@ -187,6 +197,13 @@ def metrics(
         ):
             for o in outcomes:
                 add(name, f"Outcome:{o}", "Sum", emf.NAMESPACE, metric, {**dims, "Outcome": o})
+        if lambda_pools.is_lambda(pools[name]):
+            fn = str(
+                pools[name].get("function_name") or lambda_pools.function_name(deployment, name)
+            )
+            for metric, stat in _FUNCTION_STATS:
+                add(name, metric, stat, "AWS/Lambda", metric, {"FunctionName": fn})
+            continue
         group = str(
             pools[name].get("auto_scaling_group") or naming.auto_scaling_group(deployment, name)
         )
@@ -245,6 +262,10 @@ def metrics(
             desired_max=agg.get((name, "GroupDesiredCapacity", "Maximum")),
             unit="vCPUs" if pools[name].get("capacity_type") == "vcpu" else "instances",
         )
+        if lambda_pools.is_lambda(pools[name]):
+            pm.kind, pm.unit = lambda_pools.KIND, "concurrent executions"
+            pm.in_service_max = agg.get((name, "ConcurrentExecutions", "Maximum"))
+            pm.throttles = get("Throttles")
         out.pools.append(pm)
     return out
 

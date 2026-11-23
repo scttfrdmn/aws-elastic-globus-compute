@@ -7,6 +7,8 @@ The cloud endpoint's host runs this every 5 minutes:
    fires when it's missing or 0.
 2. **Caps (#51).** Check spend against the deployment's limits and trip it, as an engine would,
    even when no engine (user endpoint process) is running.
+   Lambda pools (#21) then follow the state: their event source mappings are enabled while the
+   deployment runs (a cap whose period ended reads as running) and disabled otherwise.
 3. **Lease.** Renew it, but only while the endpoint is online: the lease stays a dead-man switch
    for the endpoint, so a deployment whose endpoint is gone still freezes.
 4. **Reap.** Delete result queues of user endpoint processes long gone.
@@ -22,7 +24,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from aegc import caps, lease, ops
+from aegc import caps, lambda_pools, lease, ops
 from aegc.infra.deployment import read_manifest
 from aegc.infra.iam import ENDPOINT_NAMESPACE
 from aegc.pricing import Prices
@@ -40,6 +42,7 @@ class Evaluation:
     tripped: str = ""
     lease_renewed: int = 0
     reaped: list[str] = field(default_factory=list)
+    mappings: dict[str, str] = field(default_factory=dict)  # Lambda pool -> enabled/disabled/error
     errors: list[str] = field(default_factory=list)
     dry_run: bool = False
 
@@ -54,6 +57,10 @@ class Evaluation:
             lines.append(f"  {verb}cap it: {self.tripped}")
         if self.lease_renewed:
             lines.append(f"  {verb}renew the lease ({self.lease_renewed} schedule(s))")
+        for pool, change in sorted(self.mappings.items()):
+            if change in ("enabled", "disabled"):
+                done = f"would {change[:-1]}" if self.dry_run else change
+                lines.append(f"  {done} Lambda pool {pool}'s event source mapping")
         for q in self.reaped:
             lines.append(f"  {verb}delete idle result queue {q}")
         for e in self.errors:
@@ -105,8 +112,8 @@ def evaluate(
     dry_run: bool = False,
     now: float | None = None,
 ) -> Evaluation:
-    """One pass. ``clients`` needs ssm, s3, autoscaling, scheduler, sqs (ec2 and pricing are
-    optional, for live prices)."""
+    """One pass. ``clients`` needs ssm, s3, autoscaling, scheduler, sqs, and lambda for a
+    deployment with Lambda pools (ec2 and pricing are optional, for live prices)."""
     now = time.time() if now is None else now
     ev = Evaluation(deployment=deployment, dry_run=dry_run)
 
@@ -148,13 +155,33 @@ def evaluate(
                     _, err = caps.trip(
                         ssm=clients["ssm"], autoscaling=clients["autoscaling"],
                         deployment=deployment, cap=trip, limits=limits, groups=groups,
-                        by="evaluator", now=now,
+                        by="evaluator", now=now, lam=clients.get("lambda"),
+                        mappings=lambda_pools.mappings(m.get("pools", {})),
                     )  # fmt: skip
                     if err is not None:
                         ev.errors.append(f"cap: {err}")
                     ev.state = "capped"
         except Exception as e:
             ev.errors.append(f"spend check: {e}")
+
+    pools = m.get("pools", {})
+    if lambda_pools.mappings(pools):
+        if "lambda" not in clients:
+            ev.errors.append("Lambda pools: no lambda client")
+        else:
+            try:
+                running = ev.state == "running"
+                _, ev.mappings = lambda_pools.reconcile(
+                    clients["lambda"], pools, running, dry_run=dry_run,
+                    confirm=lambda: read_state(clients["ssm"], deployment, now=now).running,
+                )  # fmt: skip
+                ev.errors += [
+                    f"Lambda pool {n}: {c}"
+                    for n, c in ev.mappings.items()
+                    if c not in ("enabled", "disabled")
+                ]
+            except Exception as e:
+                ev.errors.append(f"Lambda pools: {e}")
 
     lease_s = int((m.get("lease") or {}).get("lease_s") or 0)
     if ev.online and lease_s and ev.state in ("running", "capped"):
@@ -181,7 +208,11 @@ def evaluate(
 
 
 def _group_minimums(autoscaling: Any, manifest: dict[str, Any]) -> dict[str, int]:
-    names = [str(p["auto_scaling_group"]) for p in manifest.get("pools", {}).values()]
+    names = [
+        str(p["auto_scaling_group"])
+        for p in manifest.get("pools", {}).values()
+        if not lambda_pools.is_lambda(p) and p.get("auto_scaling_group")
+    ]
     out: dict[str, int] = {}
     for i in range(0, len(names), 50):
         resp = autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=names[i : i + 50])
