@@ -32,33 +32,26 @@ import os
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from multiprocessing.context import BaseContext
 from pathlib import Path
 from typing import Any
 
-from aegc import __version__, ledger, naming, payloads, pricing, protocol
+from aegc import __version__, ledger, naming, pricing
 from aegc.awsutil import error_code
-from aegc.gcresult import failed_result
-from aegc.protocol import ErrorInfo, ProtocolError, ResultMessage, TaskMessage
+from aegc.protocol import ProtocolError, TaskMessage
 from aegc.state import State, read_state
-from aegc.worker import emf, provenance, runner
+from aegc.worker import emf, runner
 from aegc.worker.config import WorkerConfig
 from aegc.worker.imds import Metadata, NoMetadata, Notice
+from aegc.worker.process import Finished, Handled, Job, Processor
 
 log = logging.getLogger("aegc.worker")
 
 
-@dataclass
-class InFlight:
-    msg: TaskMessage
-    receipt: str
-    received_at: float
-    receive_count: int
-    future: Future[Any] | None = None
-    released: bool = False
-    queue_wait_s: float = 0.0  # submitted (the engine's clock) to claimed
+#: A claimed task (the shared message path's Job).
+InFlight = Job
 
 
 @dataclass
@@ -129,8 +122,19 @@ class Agent:
             self.config.pool,
             properties={"instance_id": self.config.instance_id} if self.config.instance_id else {},
         )
-        self._first_claim = False
         self._prices = pricing.Prices(region=self.config.region)  # static: no pricing IAM
+        self._proc = Processor(
+            sqs=self.sqs,
+            s3=self.s3,
+            deployment=self.config.deployment,
+            bucket=self.config.bucket,
+            ack=self._ack,
+            release=lambda receipt: self._change_visibility(receipt, 0),
+            worker_info=self._worker_info,
+            provenance=self._provenance,
+            emitter=self._emf,
+            max_deliveries=self.config.max_deliveries,
+        )
 
     # --- public -----------------------------------------------------------------------------
 
@@ -233,205 +237,46 @@ class Agent:
     # --- claim → run → post -----------------------------------------------------------------
 
     def _accept(self, m: dict[str, Any]) -> None:
-        receipt = m["ReceiptHandle"]
         receive_count = int(m.get("Attributes", {}).get("ApproximateReceiveCount", 1))
-        try:
-            msg = TaskMessage.decode(m["Body"])
-        except ProtocolError as e:
-            # No usable reply_to: leave it for redelivery and, eventually, the DLQ.
-            log.error("undecodable task message %s: %s", m.get("MessageId"), e)
+        got = self._proc.accept(
+            m, receive_count=receive_count, halt=self._halt, started_at=self._started_at
+        )
+        if isinstance(got, Handled):
+            if got.reason != "undecodable":
+                self.stats.claimed += 1
+                self._touch()
+            if got.reason == "poison":
+                self.stats.poison += 1
             return
         self.stats.claimed += 1
         self._touch()
-        now = time.time()
-        if not self._first_claim:
-            self._first_claim = True
-            self._emf.emit({"BootToFirstClaimSeconds": max(0.0, now - self._started_at)})
-        log.info(
-            "claimed %s (delivery %d)",
-            msg.executor_task_id,
-            receive_count,
-            extra=_task_fields(msg, receive_count),
-        )
-        if self._halt is not None:
-            if self._post_refusal(msg, self._halt):
-                self._ack(receipt)
-            return
-        if receive_count > self.config.max_deliveries:
-            self.stats.poison += 1
-            self._emf.emit({"PoisonTasks": 1, "TasksFailed": 1}, outcome="poison")
-            self._post_failure(
-                msg,
-                "WORKER_LOST_REPEATEDLY",
-                f"delivered {receive_count} times without completing; not retrying",
-                receive_count,
-            )
-            self._ack(receipt)
-            return
-        try:
-            body = payloads.read_payload(msg.task, s3=self.s3)
-        except payloads.PayloadMissing as e:
-            self._post_failure(msg, "PAYLOAD_MISSING", str(e), receive_count)
-            self._emf.emit({"TasksFailed": 1}, outcome="payload_missing")
-            self._ack(receipt)
-            return
-        except Exception:
-            log.exception("couldn't fetch payload for %s; releasing", msg.executor_task_id)
-            self._change_visibility(receipt, 0)
-            return
-        job = InFlight(
-            msg=msg,
-            receipt=receipt,
-            received_at=now,
-            receive_count=receive_count,
-            queue_wait_s=max(0.0, now - msg.submitted_at),  # clocks differ: never negative
-        )
-        self._emf.emit({"QueueWaitSeconds": job.queue_wait_s})
         with self._lock:
-            self._inflight[receipt] = job
-        self._post(
-            ResultMessage(
-                kind="started",
-                task_uuid=msg.task_uuid,
-                attempt=msg.attempt,
-                endpoint_id=msg.endpoint_id,
-                worker=self._worker_info(),
-                receive_count=receive_count,
-            ),
-            msg.reply_to,
-            best_effort=True,
-        )
-        job.future = self._pool.submit(self._run, job, body)
+            self._inflight[got.receipt] = got
+        got.future = self._pool.submit(self._run, got)
 
-    def _run(self, job: InFlight, body: bytes) -> None:
-        msg = job.msg
-        run_dir = self._scratch / "tasks" / msg.executor_task_id.replace(":", "_")
-        started = time.time()
+    def _run(self, job: Job) -> None:
+        fin: Finished | None = None
         try:
-            outcome = runner.run_task(
+            fin = self._proc.run(
+                job,
                 ctx=self._ctx,
-                task_body=body,
-                task_uuid=msg.task_uuid,
-                endpoint_id=msg.endpoint_id,
-                run_dir=run_dir,
-                walltime_s=msg.walltime_s,
-                run_in_sandbox=msg.call.run_in_sandbox,
-                task_deserializers=msg.call.task_deserializers,
-                result_serializers=msg.call.result_serializers,
+                scratch=self._scratch,
                 task_uid=self._task_uid,
                 task_env=self.task_env or None,
             )
-        except Exception as e:
-            log.exception("runner failed for %s", msg.executor_task_id)
-            outcome = runner.RunOutcome("crashed", None, f"runner error: {e}")
-        finished = time.time()
-        self._busy_slot_s += finished - started
-        timings = {
-            "received_at": job.received_at,
-            "started_at": started,
-            "finished_at": finished,
-            "exec_s": finished - started,
-            "queue_wait_s": job.queue_wait_s,
-        }
-        prov: dict[str, Any] = {}
-        status: str = outcome.outcome  # what the task_finished line and the metrics report
-        posted = False
-        try:
-            prov = self._provenance(job, timings)
-            if job.released:
-                status = "released"
-                return  # its message is visible again: another worker will run it
-            # Stopping, but this one finished (a claim can race the stop's release): post it.
-            if outcome.outcome == "crashed":
-                self.stats.failed += 1
-                self._post_failure(msg, "CHILD_CRASHED", outcome.detail, job.receive_count, timings)
-            else:
-                assert outcome.result is not None
-                if outcome.outcome == "walltime":
-                    self.stats.failed += 1
-                else:
-                    self.stats.completed += 1
-                packed, is_error = provenance.merge(outcome.result, prov)
-                if outcome.outcome == "result":
-                    status = "task_error" if is_error else "ok"
-                result = payloads.make_payload(
-                    packed,
-                    s3=self.s3,
-                    bucket=self.config.bucket,
-                    key=protocol.result_payload_key(
-                        self.config.deployment, msg.task_uuid, msg.attempt
-                    ),
-                )
-                if not self._post(
-                    ResultMessage(
-                        kind="result",
-                        task_uuid=msg.task_uuid,
-                        attempt=msg.attempt,
-                        endpoint_id=msg.endpoint_id,
-                        result=result,
-                        worker=self._worker_info(),
-                        timings=timings,
-                        receive_count=job.receive_count,
-                    ),
-                    msg.reply_to,
-                ):
-                    return  # couldn't post: don't ack; redelivery (and the DLQ) keep it
-            posted = True
-            self._ack(job.receipt)
-            count = "TasksCompleted" if status in emf.COMPLETED_OUTCOMES else "TasksFailed"
-            self._emf.emit({count: 1, "ExecSeconds": timings["exec_s"]}, outcome=status)
         finally:
+            if fin is not None:
+                self._busy_slot_s += fin.timings["exec_s"]
+                if fin.status != "released":
+                    if fin.outcome in ("crashed", "walltime"):
+                        self.stats.failed += 1
+                    else:
+                        self.stats.completed += 1
             with self._lock:
                 self._inflight.pop(job.receipt, None)
-            runner.clean(run_dir, self._scratch)
             self._touch()
-            log.info(
-                "task finished: %s %s in %.1f s",
-                msg.executor_task_id,
-                status,
-                timings["exec_s"],
-                extra={
-                    "event": "task_finished",
-                    **_task_fields(msg, job.receive_count),
-                    "outcome": status,
-                    "posted": posted,
-                    **{k: round(v, 3) for k, v in timings.items()},
-                    "provenance": prov,
-                },
-            )
 
     # --- SQS --------------------------------------------------------------------------------
-
-    def _post(self, m: ResultMessage, reply_to: str, *, best_effort: bool = False) -> bool:
-        try:
-            self.sqs.send_message(QueueUrl=reply_to, MessageBody=m.encode())
-            return True
-        except Exception as e:
-            level = logging.WARNING if best_effort else logging.ERROR
-            log.log(level, "couldn't post %s for %s: %s", m.kind, m.executor_task_id, e)
-            return False
-
-    def _post_failure(
-        self,
-        msg: TaskMessage,
-        code: str,
-        message: str,
-        receive_count: int,
-        timings: dict[str, float] | None = None,
-    ) -> None:
-        self._post(
-            ResultMessage(
-                kind="system_failure",
-                task_uuid=msg.task_uuid,
-                attempt=msg.attempt,
-                endpoint_id=msg.endpoint_id,
-                error=ErrorInfo(code=code, message=message),
-                worker=self._worker_info(),
-                timings=timings or {},
-                receive_count=receive_count,
-            ),
-            msg.reply_to,
-        )
 
     def _ack(self, receipt: str) -> None:
         try:
@@ -573,33 +418,8 @@ class Agent:
         self._halt = st
         return st
 
-    def _refusal(self, st: State) -> tuple[str, str]:
-        return st.failure_code or "AEGC_STOPPED", st.explain(self.config.deployment)
-
     def _post_refusal(self, msg: TaskMessage, st: State) -> bool:
-        """Post a final failed Result (never retried) for ``msg``."""
-        code, text = self._refusal(st)
-        packed = failed_result(msg.task_uuid, code, text)
-        result = payloads.make_payload(
-            packed,
-            s3=self.s3,
-            bucket=self.config.bucket,
-            key=protocol.result_payload_key(self.config.deployment, msg.task_uuid, msg.attempt),
-        )
-        posted = self._post(
-            ResultMessage(
-                kind="result",
-                task_uuid=msg.task_uuid,
-                attempt=msg.attempt,
-                endpoint_id=msg.endpoint_id,
-                result=result,
-                worker=self._worker_info(),
-            ),
-            msg.reply_to,
-        )
-        if posted:
-            self._emf.emit({"TasksFailed": 1}, outcome="refused")
-        return posted
+        return self._proc.post_refusal(msg, st)
 
     def fail_queued_once(self, st: State) -> int:
         """Receive queued tasks and fail each with a clear result. Returns how many."""
@@ -816,16 +636,6 @@ class Agent:
             "availability_zone": self.config.availability_zone,
             "lifecycle": self.config.lifecycle,
         }
-
-
-def _task_fields(msg: TaskMessage, receive_count: int) -> dict[str, Any]:
-    """The per-task fields of a JSON log line."""
-    return {
-        "task_uuid": msg.task_uuid,
-        "attempt": msg.attempt,
-        "etid": msg.executor_task_id,
-        "receive_count": receive_count,
-    }
 
 
 def _boot_time() -> float:
