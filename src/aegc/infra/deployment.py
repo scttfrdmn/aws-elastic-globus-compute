@@ -71,6 +71,17 @@ class PoolSpec:
     # Task processes run as uid 57439 without instance-role access, with the task role's
     # credentials (#32). Needs an image built with aegc 0.4 or later.
     isolate_tasks: bool = False
+    # Lambda pools (#21, aegc.lambda_pools): "ec2" (an Auto Scaling group) or "lambda" (a
+    # function fed by an SQS event source mapping). The fields below apply to Lambda pools only.
+    kind: str = "ec2"
+    memory_mib: int = 0  # the function's memory (0: lambda_pools.DEFAULT_MEMORY_MIB)
+    timeout_s: int = 0  # the function's timeout (0: lambda_pools.DEFAULT_TIMEOUT_S)
+    max_concurrency: int = 0  # the mapping's MaximumConcurrency (0: DEFAULT_CONCURRENCY)
+    ephemeral_mib: int = 0  # /tmp (0: Lambda's 512)
+
+    @property
+    def is_lambda(self) -> bool:
+        return self.kind == "lambda"
 
     def __post_init__(self) -> None:
         naming.validate_name("pool", self.name)
@@ -200,6 +211,8 @@ class Clients:
     secretsmanager: Any = None
     cloudwatch: Any = None
     sns: Any = None
+    # Lambda pools (#21); optional: without it, deploy refuses Lambda pools.
+    lambda_: Any = None
 
 
 ACCESS_DENIED = {

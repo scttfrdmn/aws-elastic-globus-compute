@@ -394,7 +394,9 @@ def _clients(sess: object) -> object:
         "iam", "ec2", "autoscaling", "sqs", "logs", "ssm", "ecr", "scheduler", "secretsmanager",
         "cloudwatch", "sns",
     )  # fmt: skip
-    return Clients(**{s: awsutil.client(sess, s) for s in services})  # type: ignore[arg-type]
+    clients = {s: awsutil.client(sess, s) for s in (*services, "lambda")}  # type: ignore[arg-type]
+    clients["lambda_"] = clients.pop("lambda")
+    return Clients(**clients)
 
 
 def parse_pool(text: str) -> dict[str, Any]:

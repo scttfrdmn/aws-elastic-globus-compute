@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -84,6 +84,8 @@ class LeaseSpec:
     region: str
     account: str
     groups: dict[str, str]  # pool name -> Auto Scaling group name
+    #: Lambda pools (#21): pool name -> event source mapping UUID (disabled when the lease ends).
+    mappings: dict[str, str] = field(default_factory=dict)
     lease_s: int = DEFAULT_LEASE_S
     ttl_at: float = 0.0  # absolute UTC time; 0: no TTL
 
