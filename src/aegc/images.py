@@ -241,6 +241,85 @@ def ensure_repository(
     return str(repo["repositoryUri"])
 
 
+# --- Lambda pools (#21) -------------------------------------------------------------------------
+
+#: The statement aegc keeps in each aegc/<env> repository policy so Lambda can pull for aegc's
+#: functions. Other statements are left as they are.
+LAMBDA_PULL_SID = "AegcLambdaPull"
+
+
+def lambda_pull_statement(region: str, account: str) -> dict[str, Any]:
+    """Lambda (the service) may pull for functions named ``aegc-*`` in this account and region.
+    Region-wide like the repositories, so it doesn't change per deployment or on destroy."""
+    return {
+        "Sid": LAMBDA_PULL_SID,
+        "Effect": "Allow",
+        "Principal": {"Service": "lambda.amazonaws.com"},
+        "Action": ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"],
+        "Condition": {
+            "ArnLike": {
+                "aws:sourceArn": f"arn:aws:lambda:{region}:{account}:function:{naming.PREFIX}-*"
+            }
+        },
+    }
+
+
+def allow_lambda_pulls(
+    ecr: Any, env: str, *, region: str, account: str, report: Report, dry_run: bool = False,
+    repository: str = "",
+) -> Outcome:  # fmt: skip
+    """Put :func:`lambda_pull_statement` in the repository's policy, if it isn't there.
+
+    Set here rather than left to CreateFunction, which adds an unconditioned statement for any
+    function, and only if its caller may set repository policies.
+    """
+    name = repository or naming.image_repository(env)
+    _owned_repository(ecr, name)
+    try:
+        current = json.loads(ecr.get_repository_policy(repositoryName=name)["policyText"])
+    except Exception as e:
+        if not is_not_found(e):  # RepositoryPolicyNotFoundException: none yet
+            raise
+        current = None
+    want = lambda_pull_statement(region, account)
+    statements = (current or {}).get("Statement", [])
+    if isinstance(statements, dict):
+        statements = [statements]
+    ours = [st for st in statements if st.get("Sid") == LAMBDA_PULL_SID]
+    outcome: Outcome
+    if ours == [want]:
+        outcome = "exists"
+    else:
+        outcome = (
+            ("would-update" if dry_run else "updated")
+            if current
+            else ("would-create" if dry_run else "created")
+        )
+        doc = {
+            "Version": (current or {}).get("Version", "2012-10-17"),
+            "Statement": [*(st for st in statements if st.get("Sid") != LAMBDA_PULL_SID), want],
+        }
+        if not dry_run:
+            ecr.set_repository_policy(repositoryName=name, policyText=json.dumps(doc))
+    report.add("ecr repository policy", name, outcome, f"{LAMBDA_PULL_SID}: Lambda pulls")
+    return outcome
+
+
+def image_size(ecr: Any, digest_ref: str) -> int | None:
+    """The pinned image's size as ECR reports it (compressed layers), or None if unknown."""
+    repo_ref, _, digest = digest_ref.partition("@")
+    name = repo_ref.split("/", 1)[-1]
+    try:
+        d = ecr.describe_images(repositoryName=name, imageIds=[{"imageDigest": digest}])
+    except Exception as e:
+        if is_not_found(e) or error_code(e) == "ImageNotFoundException":
+            return None
+        raise
+    details = d.get("imageDetails") or []
+    size = details[0].get("imageSizeInBytes") if details else None
+    return int(size) if size is not None else None
+
+
 # --- in-use tags (#27) -------------------------------------------------------------------------
 
 

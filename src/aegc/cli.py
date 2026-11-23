@@ -399,17 +399,46 @@ def _clients(sess: object) -> object:
     return Clients(**clients)
 
 
+#: Pool options a Lambda pool takes (``env:lambda,...``); the rest are EC2-only.
+LAMBDA_POOL_OPTIONS = {"lambda", "memory", "timeout", "concurrency", "tmp", "walltime",
+                       "max_walltime", "python"}  # fmt: skip
+
+
 def parse_pool(text: str) -> dict[str, Any]:
-    """``env[:key=value,...]``, e.g. ``geospatial:max_vcpus=32,vcpu=4-16,mem=8192,on-demand``.
+    """``env[:key=value,...]``, e.g. ``geospatial:max_vcpus=32,vcpu=4-16,mem=8192,on-demand``,
+    or a Lambda pool (#21), ``geospatial:lambda,memory=4096,timeout=900,concurrency=20``.
 
     Only the options given are returned, so a redeploy keeps the rest from the last deploy.
     ``max=``/``min=`` (workers) are the v0.1 spelling, converted to vCPUs by the caller.
     """
     env, _, opts = text.partition(":")
     out: dict[str, Any] = {"env": env}
+    keys = [o.partition("=")[0] for o in filter(None, opts.split(","))]
+    if "lambda" in keys:
+        if ec2 := [k for k in keys if k not in LAMBDA_POOL_OPTIONS]:
+            raise SystemExit(
+                f"aegc: {', '.join(ec2)} {'is' if len(ec2) == 1 else 'are'} for EC2 pools, not "
+                f"Lambda pools ({text!r}); a Lambda pool takes "
+                f"{', '.join(sorted(LAMBDA_POOL_OPTIONS - {'lambda'}))}"
+            )
+    elif lam := [k for k in keys if k in LAMBDA_POOL_OPTIONS - {"walltime", "max_walltime",
+                                                                  "python"}]:  # fmt: skip
+        raise SystemExit(f"aegc: {', '.join(lam)} need a Lambda pool: {env}:lambda,... ({text!r})")
     for opt in filter(None, opts.split(",")):
         key, _, value = opt.partition("=")
-        if key == "max_vcpus":
+        if key == "lambda":
+            if value:
+                raise SystemExit(f"aegc: lambda takes no value ({text!r})")
+            out["kind"] = "lambda"
+        elif key == "memory":
+            out["memory_mib"] = int(value)
+        elif key == "timeout":
+            out["timeout_s"] = int(value)
+        elif key == "concurrency":
+            out["max_concurrency"] = int(value)
+        elif key == "tmp":
+            out["ephemeral_mib"] = int(value)
+        elif key == "max_vcpus":
             out["max_vcpus"] = int(value)
         elif key == "min_vcpus":
             out["min_vcpus"] = int(value)
@@ -480,6 +509,8 @@ def _pool_spec(
             f"Python {rec.python_minor} image has {rec.aegc_version}, whose workers ignore sizes); "
             "rebuild it with `aegc image build`"
         )
+    if opts.get("kind") == "lambda":
+        return _lambda_pool_spec(args, env, rec, opts, prev_pools)
     name = f"{env}-py{rec.python_minor.replace('.', '')}" + (f"-{size}" if size else "")
     base: dict[str, Any] = {}
     if name in prev_pools:  # a redeploy keeps the options it isn't given (#30)
@@ -527,6 +558,48 @@ def _pool_spec(
         raise SystemExit(f"aegc: {e}{hint}") from None
 
 
+#: Lambda pools run ``aegc-worker lambda``, which images built before aegc 0.7 lack.
+LAMBDA_IMAGE_VERSION = (0, 7)
+
+
+def _lambda_pool_spec(
+    args: argparse.Namespace,
+    env: str,
+    rec: Any,
+    opts: dict[str, Any],
+    prev_pools: dict[str, dict[str, Any]],
+) -> Any:
+    """A Lambda pool (#21), ``<env>-py<NNN>-lambda``: the options given over the last deploy's."""
+    from dataclasses import asdict
+
+    from aegc import lambda_pools
+    from aegc.infra import deployment
+
+    if _version(rec.aegc_version) < LAMBDA_IMAGE_VERSION and not args.allow_old_image:
+        raise SystemExit(
+            f"aegc: a Lambda pool needs a worker image built with aegc 0.7 or later (the {env!r} "
+            f"Python {rec.python_minor} image has {rec.aegc_version}, which has no "
+            "`aegc-worker lambda`); rebuild it with `aegc image build`"
+        )
+    name = f"{env}-py{rec.python_minor.replace('.', '')}-{lambda_pools.KIND}"
+    base: dict[str, Any] = {}
+    if name in prev_pools:  # a redeploy keeps the options it isn't given (#30)
+        base = asdict(deployment.PoolSpec.from_manifest(name, prev_pools[name]))
+        # Walltimes derived from the old timeout follow a new one.
+        if "timeout_s" in opts and "max_walltime_s" not in opts:
+            ceiling = int(base["timeout_s"]) - lambda_pools.MARGIN_S
+            if base.get("max_walltime_s") == ceiling:
+                base.pop("max_walltime_s")
+                if base.get("walltime_s") == ceiling and "walltime_s" not in opts:
+                    base.pop("walltime_s")
+    kw = {**base, **opts, "name": name, "env": env, "python_minor": rec.python_minor}
+    kw.update(image=rec.image, kind=lambda_pools.KIND, isolate_tasks=False)
+    try:
+        return deployment.PoolSpec(**kw)
+    except ValueError as e:
+        raise SystemExit(f"aegc: {e}") from None
+
+
 def _deploy(args: argparse.Namespace) -> int:
     import time
     from dataclasses import asdict
@@ -556,10 +629,13 @@ def _deploy(args: argparse.Namespace) -> int:
                 f"aegc: no image recorded for env {env!r}; run `aegc image build --env {env} ...`"
             ) from None
         size = str(parsed.get("size_class", ""))
+        kind = str(parsed.get("kind", "ec2"))
         deployed = {
             str(p.get("python_minor"))
             for p in prev_pools.values()
-            if p.get("env") == env and str(p.get("size_class", "")) == size
+            if p.get("env") == env
+            and str(p.get("size_class", "")) == size
+            and str(p.get("kind") or "ec2") == kind
         }
         if want:
             if want not in records:
@@ -584,6 +660,17 @@ def _deploy(args: argparse.Namespace) -> int:
                 print(
                     f"warning: skipping {env} Python {', '.join(old)}: built with aegc < 0.2 "
                     f"(rebuild, or `aegc image forget --env {env} --python {old[0]}`)",
+                    file=sys.stderr,
+                )
+                records = {m: r for m, r in records.items() if m not in old}
+        if kind == "lambda" and not want and not deployed and not args.allow_old_image:
+            old = sorted(
+                m for m, r in records.items() if _version(r.aegc_version) < LAMBDA_IMAGE_VERSION
+            )
+            if old and len(old) < len(records):
+                print(
+                    f"warning: no Lambda pool for {env} Python {', '.join(old)}: built with "
+                    "aegc < 0.7, which has no `aegc-worker lambda` (rebuild it)",
                     file=sys.stderr,
                 )
                 records = {m: r for m, r in records.items() if m not in old}
@@ -642,27 +729,32 @@ def _deploy(args: argparse.Namespace) -> int:
         ttl_at = time.time() + ttl if ttl else 0.0
     else:
         ttl_at = float(prev_lease.get("ttl_at") or 0.0)
-    spec = deployment.DeploymentSpec(
-        deployment=args.deployment,
-        account=account,
-        region=region,
-        bucket=naming.bucket_name(account, region),
-        pools=tuple(pools),
-        limits=limits.to_dict(),
-        lease_s=lease_s,
-        ttl_at=ttl_at,
-        grants=deploy_grants(
-            args.grant, prev, deployment=args.deployment, account=account, region=region
-        ),
+    grants = deploy_grants(
+        args.grant, prev, deployment=args.deployment, account=account, region=region
     )
-    if old := [p.name for p in pools if not p.isolate_tasks]:
+    try:
+        spec = deployment.DeploymentSpec(
+            deployment=args.deployment,
+            account=account,
+            region=region,
+            bucket=naming.bucket_name(account, region),
+            pools=tuple(pools),
+            limits=limits.to_dict(),
+            lease_s=lease_s,
+            ttl_at=ttl_at,
+            grants=grants,
+        )
+    except ValueError as e:  # e.g. a Lambda pool's names too long for Lambda and IAM
+        raise SystemExit(f"aegc: {e}") from None
+    if old := [p.name for p in pools if not p.isolate_tasks and not p.is_lambda]:
         print(
             f"warning: {', '.join(old)}: images built before aegc 0.4 run tasks with the worker "
             "role's credentials (they can read other tasks' payloads and post results); rebuild "
             "them with `aegc image build` to isolate tasks",
             file=sys.stderr,
         )
-    errors = _quota_preflight(sess, [asdict(p) for p in pools])
+    # vCPU quotas are for EC2 pools; Lambda pools are bounded by their mappings' concurrency.
+    errors = _quota_preflight(sess, [asdict(p) for p in pools if not p.is_lambda])
     if errors and not args.dry_run:
         raise SystemExit("aegc: " + "\naegc: ".join(errors))
     if not limits.any:
@@ -671,6 +763,10 @@ def _deploy(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     c = _clients(sess)
+    try:  # a Lambda pool's image or environment too large: say so before anything changes
+        deployment.check_lambda_pools(c, spec)  # type: ignore[arg-type]
+    except ValueError as e:
+        raise SystemExit(f"aegc: {e}") from None
     report = deployment.deploy(c, spec, dry_run=args.dry_run)  # type: ignore[arg-type]
     if omitted and args.prune:
         for n in omitted:
@@ -907,6 +1003,15 @@ def _footprint(args: argparse.Namespace) -> int:
         deployment=args.deployment,
         region=region,
     )
+    from aegc.awsutil import error_code
+    from aegc.infra import deployment
+
+    try:  # Lambda pools (#21): functions and mappings, with look-alikes
+        deployment.lambda_footprint(awsutil.client(sess, "lambda"), fp, args.deployment)  # type: ignore[arg-type]
+    except Exception as e:
+        if error_code(e) not in deployment.ACCESS_DENIED:
+            raise
+        print(f"note: Lambda pools {deployment.LAMBDA_DENIED}", file=sys.stderr)
     print(fp.render())
     return 0
 
@@ -1028,7 +1133,8 @@ def build_parser() -> argparse.ArgumentParser:
         "deployer: aegc deploy/destroy/stop/resume/reap/footprint. "
         "bootstrap: aegc bootstrap/unbootstrap. builder: aegc image build. task: task code on "
         "isolated pools, besides the grants (aegc-task on the task role). endpoint: the cloud "
-        "endpoint host. endpoint-deployer: aegc endpoint deploy/undeploy, with deployer.",
+        "endpoint host. endpoint-deployer: aegc endpoint deploy/undeploy, with deployer. "
+        "lambda-deployer: aegc deploy/destroy of Lambda pools, with deployer.",
     )
     p.add_argument(
         "kind",
@@ -1041,6 +1147,7 @@ def build_parser() -> argparse.ArgumentParser:
             "task",
             "endpoint",
             "endpoint-deployer",
+            "lambda-deployer",
         ],
     )
     p.add_argument("--deployment", default="default", help="deployment name (worker, operator)")
@@ -1115,7 +1222,10 @@ def build_parser() -> argparse.ArgumentParser:
         "repeatable. One pool per Python minor the env has images for (python= picks one). "
         "max_vcpus caps the pool (default 8); vcpu is each worker's size range (default 2-8, "
         "at most max_vcpus); disk: root gp3 GiB (30-16384, default 30); throughput: its MiB/s "
-        "(125-1000, default 125); lifetime: 3600-259200 s (default 86400). On a redeploy, "
+        "(125-1000, default 125); lifetime: 3600-259200 s (default 86400). A Lambda pool, "
+        "<env>-py<NNN>-lambda: env:lambda[,memory=MiB,timeout=S,concurrency=N,tmp=MiB,"
+        "walltime=S,max_walltime=S,python=3.NN] (memory 128-10240, default 2048; timeout "
+        "60-1800, default 900; concurrency 2-1000, default 10; tmp 512-10240). On a redeploy, "
         "options not given keep their last values.",
     )  # fmt: skip
     _limit_args(dp)

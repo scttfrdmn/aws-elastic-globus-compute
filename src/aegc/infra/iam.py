@@ -384,6 +384,102 @@ def worker_policy(*, deployment: str, region: str, account: str, bucket: str) ->
     }
 
 
+#: A Lambda pool's function role's own inline policy (grants go in aegc-grants next to it).
+FUNCTION_POLICY = "aegc-function"
+
+
+def lambda_trust_policy() -> dict[str, Any]:
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"Service": "lambda.amazonaws.com"},
+                "Action": "sts:AssumeRole",
+            }
+        ],
+    }
+
+
+def function_policy(
+    *, deployment: str, pool: str, env: str, region: str, account: str, bucket: str
+) -> dict[str, Any]:
+    """A Lambda pool's function role (#21): what ``aegc-worker lambda`` does, for one pool.
+
+    The event source mapping receives from the pool's task queue with this role; the handler
+    deletes and releases its messages, moves payloads, posts results, reads the deployment's
+    state (and the manifest, for aegc.outputs' current grants), writes the cost ledger and its
+    log streams in ``/aegc/<d>``, and the image is pulled from ``aegc/<env>``. No Auto Scaling
+    and no task role: Lambda pools aren't isolated, so this role holds the grants itself.
+    """
+    sqs = f"arn:aws:sqs:{region}:{account}"
+    d = deployment
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "ConsumeTasks",
+                "Effect": "Allow",
+                "Action": [
+                    "sqs:ReceiveMessage",
+                    "sqs:DeleteMessage",
+                    "sqs:ChangeMessageVisibility",
+                    "sqs:GetQueueAttributes",
+                ],
+                "Resource": f"{sqs}:{naming.task_queue(d, pool)}",
+            },
+            {
+                "Sid": "PostResults",
+                "Effect": "Allow",
+                "Action": ["sqs:SendMessage", "sqs:GetQueueUrl"],
+                "Resource": f"{sqs}:{naming.PREFIX}-{d}-res-*",
+            },
+            {
+                "Sid": "ReadTaskPayloads",
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "Resource": f"arn:aws:s3:::{bucket}/payloads/{d}/tasks/*",
+            },
+            {
+                "Sid": "WriteResultPayloads",
+                "Effect": "Allow",
+                "Action": "s3:PutObject",
+                "Resource": f"arn:aws:s3:::{bucket}/payloads/{d}/results/*",
+            },
+            {
+                "Sid": "WriteCostLedger",
+                "Effect": "Allow",
+                "Action": "s3:PutObject",
+                "Resource": f"arn:aws:s3:::{bucket}/ledger/{d}/*",
+            },
+            {
+                "Sid": "ReadDeploymentState",
+                "Effect": "Allow",
+                "Action": "ssm:GetParameter",
+                "Resource": [
+                    f"arn:aws:ssm:{region}:{account}:parameter{naming.state_parameter(d)}",
+                    f"arn:aws:ssm:{region}:{account}:parameter"
+                    f"{naming.deployment_manifest_parameter(d)}",
+                ],
+            },
+            {
+                "Sid": "Logs",
+                "Effect": "Allow",
+                "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+                "Resource": f"arn:aws:logs:{region}:{account}:log-group:{naming.log_group(d)}:*",
+            },
+            {
+                # Same account: either this or the repository policy lets Lambda pull.
+                "Sid": "EcrPull",
+                "Effect": "Allow",
+                "Action": ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"],
+                "Resource": f"arn:aws:ecr:{region}:{account}:repository/"
+                f"{naming.image_repository(env)}",
+            },
+        ],
+    }
+
+
 def operator_policy(*, deployment: str, region: str, account: str, bucket: str) -> dict[str, Any]:
     """What AWSEngine needs at runtime, for the credentials the endpoint container runs with."""
     sqs = f"arn:aws:sqs:{region}:{account}"
@@ -549,8 +645,27 @@ def operator_policy(*, deployment: str, region: str, account: str, bucket: str) 
                 # `aegc status` finds result queues by name prefix. ListQueues has no resource.
                 "Sid": "FindResultQueues",
                 "Effect": "Allow",
-                "Action": "sqs:ListQueues",
+                "Action": ["sqs:ListQueues", "lambda:ListEventSourceMappings"],
                 "Resource": "*",
+            },
+            {
+                # Lambda pools (#21): caps, stop and resume disable and enable their mappings.
+                "Sid": "FreezeLambdaPools",
+                "Effect": "Allow",
+                "Action": ["lambda:GetEventSourceMapping", "lambda:UpdateEventSourceMapping"],
+                "Resource": f"arn:aws:lambda:{region}:{account}:event-source-mapping:*",
+                "Condition": {
+                    "ArnLike": {
+                        "lambda:FunctionArn": f"arn:aws:lambda:{region}:{account}:function:"
+                        f"{naming.PREFIX}-{d}-*"
+                    }
+                },
+            },
+            {
+                "Sid": "ReadLambdaPools",
+                "Effect": "Allow",
+                "Action": "lambda:GetFunctionConfiguration",
+                "Resource": f"arn:aws:lambda:{region}:{account}:function:{naming.PREFIX}-{d}-*",
             },
             VCPU_QUOTA_STATEMENT,
         ],
@@ -758,6 +873,60 @@ def deployer_policy(*, region: str, account: str) -> dict[str, Any]:
         },
     ]
     return {"Version": "2012-10-17", "Statement": keep}
+
+
+def lambda_deployer_policy(*, region: str, account: str) -> dict[str, Any]:
+    """What ``aegc deploy / destroy`` need for Lambda pools (#21), besides the deployer policy
+    (which is near the 6,144-character limit of a managed policy): functions ``aegc-*`` and
+    their event source mappings, passing ``/aegc/`` roles to Lambda, and the ``aegc/*``
+    repositories' policies (Lambda pulls the image as the service). The function roles
+    themselves are under the deployer's ``/aegc/`` IAM statement."""
+    r, a, p = region, account, naming.PREFIX
+    functions = f"arn:aws:lambda:{r}:{a}:function:{p}-*"
+    mappings = f"arn:aws:lambda:{r}:{a}:event-source-mapping:*"
+    managed_req = {f"aws:RequestTag/{naming.TAG_MANAGED}": "true"}
+    managed_res = {"StringEquals": {f"aws:ResourceTag/{naming.TAG_MANAGED}": "true"}}
+    of_aegc = {"ArnLike": {"lambda:FunctionArn": functions}}
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {"Sid": "CreateFunctionsTagged", "Effect": "Allow",
+             "Action": ["lambda:CreateFunction", "lambda:TagResource"],
+             "Resource": functions, "Condition": {"StringEquals": managed_req}},
+            {"Sid": "ChangeOwnedFunctions", "Effect": "Allow",
+             "Action": ["lambda:UpdateFunctionCode", "lambda:UpdateFunctionConfiguration",
+                        "lambda:DeleteFunction"],
+             "Resource": functions, "Condition": managed_res},
+            # Reads aren't tag-conditioned: a missing function must read as missing.
+            {"Sid": "ReadFunctions", "Effect": "Allow",
+             "Action": ["lambda:GetFunction", "lambda:GetFunctionConfiguration", "lambda:ListTags"],
+             "Resource": [functions, mappings]},
+            {"Sid": "CreateMappingsTagged", "Effect": "Allow",
+             "Action": "lambda:CreateEventSourceMapping", "Resource": "*",
+             "Condition": {**of_aegc, "StringEquals": managed_req}},
+            {"Sid": "TagMappingsOnCreate", "Effect": "Allow", "Action": "lambda:TagResource",
+             "Resource": mappings, "Condition": {"StringEquals": managed_req}},
+            {"Sid": "ChangeMappings", "Effect": "Allow",
+             "Action": ["lambda:GetEventSourceMapping", "lambda:UpdateEventSourceMapping",
+                        "lambda:DeleteEventSourceMapping"],
+             "Resource": mappings, "Condition": of_aegc},
+            # destroy finds function roles left by an interrupted destroy (tags decide).
+            {"Sid": "ListLambda", "Effect": "Allow",
+             "Action": ["lambda:ListFunctions", "lambda:ListEventSourceMappings",
+                        "iam:ListRoles"],
+             "Resource": "*"},
+            {"Sid": "PassFunctionRoles", "Effect": "Allow", "Action": "iam:PassRole",
+             "Resource": f"arn:aws:iam::{a}:role/{p}/{p}-*",
+             "Condition": {"StringEquals": {"iam:PassedToService": "lambda.amazonaws.com"}}},
+            # CreateFunction's caller needs the pull actions; the repository policy lets Lambda
+            # pull for aegc-* functions only, and DescribeImages checks the image's size.
+            {"Sid": "ImagesForLambda", "Effect": "Allow",
+             "Action": ["ecr:GetRepositoryPolicy", "ecr:SetRepositoryPolicy",
+                        "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer",
+                        "ecr:DescribeImages"],
+             "Resource": f"arn:aws:ecr:{r}:{a}:repository/{p}/*"},
+        ],
+    }  # fmt: skip
 
 
 def bootstrap_policy(*, region: str, account: str) -> dict[str, Any]:
@@ -1133,7 +1302,7 @@ def builder_policy(*, region: str, account: str) -> dict[str, Any]:
 
 POLICIES = {
     "worker", "operator", "deployer", "bootstrap", "builder", "task", "endpoint",
-    "endpoint-deployer",
+    "endpoint-deployer", "lambda-deployer",
 }  # fmt: skip
 
 
@@ -1157,4 +1326,6 @@ def policy(kind: str, *, deployment: str, region: str, account: str) -> dict[str
         )
     if kind == "endpoint-deployer":
         return endpoint_deployer_policy(region=region, account=account)
+    if kind == "lambda-deployer":
+        return lambda_deployer_policy(region=region, account=account)
     raise ValueError(f"unknown policy {kind!r}; choose from {sorted(POLICIES)}")

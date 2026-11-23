@@ -142,3 +142,117 @@ def instance_refreshes(autoscaling: Any) -> list[dict[str, Any]]:
 
     _stub(autoscaling, "auto-scaling", "StartInstanceRefresh", start)
     return calls
+
+
+#: Function settings substrate accepts but doesn't return (substrate#1659).
+_FUNCTION_ECHOES = ("EphemeralStorage", "LoggingConfig")
+#: Mapping settings substrate accepts but doesn't return (substrate#1659).
+_MAPPING_ECHOES = ("FunctionResponseTypes", "ScalingConfig")
+
+
+def lambda_echoes(lam: Any) -> dict[str, list[dict[str, Any]]]:
+    """substrate#1659: Lambda drops settings it was given. Functions come back without
+    ImageConfigResponse, LoggingConfig and EphemeralStorage; event source mappings without
+    FunctionResponseTypes, ScalingConfig and EventSourceMappingArn.
+
+    Not filed yet: a mapping's tags (Tags on CreateEventSourceMapping) aren't kept, and ListTags
+    on a mapping's ARN is ResourceNotFound ("Function not found"). Also without code here:
+    GetFunctionConfiguration is UnknownOperationException (deploy uses GetFunction), GetFunction
+    returns no Tags (deploy uses ListTags), functions have no LastUpdateStatus, and the tagging
+    API doesn't list mappings.
+
+    Records the requests on this client and fills those fields into its responses, as AWS
+    returns them; answers ListTags for mapping ARNs from the tags they were created with.
+    Returns the requests by operation, so tests can check what was sent.
+    """
+    sent: dict[str, list[dict[str, Any]]] = {}
+    last: dict[str, dict[str, Any]] = {}
+    functions: dict[str, dict[str, Any]] = {}
+    mappings: dict[str, dict[str, Any]] = {}
+
+    def capture(op: str) -> Any:
+        def hook(params: dict[str, Any], **_: Any) -> None:
+            last[op] = dict(params)
+            sent.setdefault(op, []).append(dict(params))
+
+        return hook
+
+    def fill_function(cfg: dict[str, Any]) -> None:
+        name = str(cfg.get("FunctionName", ""))
+        seen = functions.get(name, {})
+        for k in _FUNCTION_ECHOES:
+            if k in seen and k not in cfg:
+                cfg[k] = seen[k]
+        if "ImageConfig" in seen and "ImageConfigResponse" not in cfg:
+            cfg["ImageConfigResponse"] = {"ImageConfig": seen["ImageConfig"]}
+
+    def fill_mapping(m: dict[str, Any]) -> None:
+        uuid = str(m.get("UUID", ""))
+        seen = mappings.get(uuid, {})
+        for k in _MAPPING_ECHOES:
+            if k in seen and k not in m:
+                m[k] = seen[k]
+        if uuid and "EventSourceMappingArn" not in m:
+            region, account = str(m.get("FunctionArn", "")).split(":")[3:5]
+            m["EventSourceMappingArn"] = (
+                f"arn:aws:lambda:{region}:{account}:event-source-mapping:{uuid}"
+            )
+
+    def on_function(op: str) -> Any:
+        def hook(parsed: dict[str, Any], **_: Any) -> None:
+            req = last.get(op, {})
+            name = str(req.get("FunctionName", ""))
+            functions.setdefault(name, {}).update(
+                {k: v for k, v in req.items() if k in (*_FUNCTION_ECHOES, "ImageConfig")}
+            )
+            fill_function(parsed)
+
+        return hook
+
+    def on_mapping(op: str) -> Any:
+        def hook(parsed: dict[str, Any], **_: Any) -> None:
+            req = last.get(op, {})
+            uuid = str(parsed.get("UUID") or req.get("UUID", ""))
+            mappings.setdefault(uuid, {}).update(
+                {k: v for k, v in req.items() if k in (*_MAPPING_ECHOES, "Tags")}
+            )
+            fill_mapping(parsed)
+
+        return hook
+
+    def get_function(parsed: dict[str, Any], **_: Any) -> None:
+        if isinstance(parsed.get("Configuration"), dict):
+            fill_function(parsed["Configuration"])
+
+    def list_mappings(parsed: dict[str, Any], **_: Any) -> None:
+        for m in parsed.get("EventSourceMappings", []):
+            fill_mapping(m)
+
+    def mapping_tags(**_: Any) -> Any:
+        resource = str(last.get("ListTags", {}).get("Resource", ""))
+        if ":event-source-mapping:" not in resource:
+            return None  # a function: substrate answers
+        uuid = resource.rsplit(":", 1)[-1]
+        if uuid not in mappings:
+            err = {"Type": "User", "Message": f"not found: {uuid}"}
+            return SimpleNamespace(status_code=404, headers={}), {
+                "Error": {"Code": "ResourceNotFoundException", **err}
+            }
+        return SimpleNamespace(status_code=200, headers={}), {
+            "Tags": dict(mappings[uuid].get("Tags") or {})
+        }
+
+    ev = lam.meta.events
+    for op in ("CreateFunction", "UpdateFunctionConfiguration", "UpdateFunctionCode",
+               "CreateEventSourceMapping", "UpdateEventSourceMapping", "DeleteEventSourceMapping",
+               "DeleteFunction", "ListTags"):  # fmt: skip
+        ev.register(f"before-parameter-build.lambda.{op}", capture(op))
+    for op in ("CreateFunction", "UpdateFunctionConfiguration"):
+        ev.register(f"after-call.lambda.{op}", on_function(op))
+    for op in ("CreateEventSourceMapping", "UpdateEventSourceMapping"):
+        ev.register(f"after-call.lambda.{op}", on_mapping(op))
+    ev.register("after-call.lambda.GetFunction", get_function)
+    ev.register("after-call.lambda.GetEventSourceMapping", lambda parsed, **_: fill_mapping(parsed))
+    ev.register("after-call.lambda.ListEventSourceMappings", list_mappings)
+    ev.register("before-call.lambda.ListTags", mapping_tags)
+    return sent
