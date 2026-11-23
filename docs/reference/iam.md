@@ -1,7 +1,7 @@
 # IAM policies
 
-aegc uses eight policies, printed by
-`aegc iam-policy {worker,operator,deployer,bootstrap,builder,task,endpoint,endpoint-deployer}`.
+aegc uses nine policies, printed by
+`aegc iam-policy {worker,operator,deployer,bootstrap,builder,task,endpoint,endpoint-deployer,lambda-deployer}`.
 Each is scoped to one account and region, and the worker, operator, task and endpoint policies to
 one deployment.
 The documents below were generated with:
@@ -23,14 +23,17 @@ the command makes no AWS calls. The tests check these documents with the IAM pol
 | [builder](#builder) | The credentials you run `aegc image build`, `register`, `list` and `forget` with | The `aegc` CLI |
 | [endpoint](#endpoint) | Created by `aegc endpoint deploy` as the inline policy `aegc-endpoint` on the role `aegc-<d>-endpoint-<region>` | The [cloud endpoint](../how-to/cloud-endpoint.md)'s host: `AWSEngine` and `aegc evaluate` |
 | [endpoint-deployer](#endpoint-deployer) | The credentials you run `aegc endpoint deploy`, `undeploy` and `status` with, next to the deployer policy | The `aegc` CLI |
+| [lambda-deployer](#lambda-deployer) | The credentials you run `aegc deploy`, `destroy`, `stop`, `resume`, `status` and `footprint` with on a deployment with [Lambda pools](../how-to/lambda-pools.md), next to the deployer policy | The `aegc` CLI |
 
 `aegc deploy` also creates the [task role](#task-role), `aegc-<d>-task-<region>`, whose
 credentials task code gets in [isolated](../concepts/security.md#task-isolation) pools, with its
 inline policy `aegc-task`. With [grants](../how-to/data.md), it adds the inline policy
 [`aegc-grants`](#aegc-grants) for your own S3 prefixes to the task role (and to the worker role
-while pools with images from before aegc 0.4 remain). Two more roles of aegc's own are shown at the
-end: the [scheduler role](#scheduler-role) for the deployment lease, and (from `aegc bootstrap`)
-the [ECR creation template role](#ecr-creation-template-role).
+while pools with images from before aegc 0.4 remain). For each Lambda pool it creates a
+[function role](#function-role), `aegc-<d>-<pool>-<region>`, with the inline policy
+`aegc-function` and the grants. Two more roles of aegc's own are shown at the end: the
+[scheduler role](#scheduler-role) for the deployment lease, and (from `aegc bootstrap`) the
+[ECR creation template role](#ecr-creation-template-role).
 
 ## Why so many
 
@@ -43,7 +46,8 @@ administrator's credentials, or give the bootstrap policy only to whoever sets u
 
 The cloud endpoint's secret, alarm and topic are in a separate **endpoint-deployer** policy for
 the same reason: the deployer policy is already within 300 characters of the limit. And only
-whoever moves endpoints to the cloud needs it.
+whoever moves endpoints to the cloud needs it. Lambda pools' functions, mappings and repository
+policies are in **lambda-deployer**, for the same reasons.
 
 Sizes of the documents below, without whitespace:
 
@@ -51,12 +55,14 @@ Sizes of the documents below, without whitespace:
 |---|---|---|
 | worker | 2,192 | 10,240 for all of the role's inline policies, `aegc-grants` included |
 | task (`aegc-task`) | 182 | 10,240 for all of the role's inline policies, `aegc-grants` included |
-| operator | 3,346 | 6,144 |
+| operator | 3,962 | 6,144 |
 | deployer | 5,841 | 6,144 |
 | bootstrap | 2,311 | 6,144 |
 | builder | 1,142 | 6,144 |
-| endpoint (`aegc-endpoint`) | 4,504 (4,734 with `--session-manager`) | 10,240 for the role's inline policies |
+| endpoint (`aegc-endpoint`) | 5,120 (5,350 with `--session-manager`) | 10,240 for the role's inline policies |
 | endpoint-deployer | 1,623 | 6,144 |
+| lambda-deployer | 2,209 | 6,144 |
+| function (`aegc-function`), for the pool `geospatial-py314-lambda` | 1,254 | 10,240 for all of the role's inline policies, `aegc-grants` included |
 
 The deployer is the closest to the limit; longer region names make it a little longer.
 
@@ -373,7 +379,16 @@ limits and the lease it also:
   `UpdateAutoScalingGroup` changes, but the engine only ever sets `MinSize`, to 0 or to the
   manifest's value;
 - reads and updates the deployment's schedules, and passes the scheduler role to EventBridge
-  Scheduler (`RenewLease`, `ListLease`, `PassLeaseRole`), to renew the lease.
+  Scheduler (`RenewLease`, `ListLease`, `PassLeaseRole`), to renew the lease;
+- enables and disables the event source mappings of the deployment's
+  [Lambda pools](../how-to/lambda-pools.md) (`FreezeLambdaPools`), to freeze them on a cap and
+  turn them back on when the deployment runs again. Only mappings that feed the deployment's
+  functions (`lambda:FunctionArn` is `aegc-<d>-*`) **and** carry `aegc:deployment=<d>`, the same
+  conditions as the scheduler role's;
+- reads the functions' configuration and the mappings' state (`ReadLambdaPools`) and lists
+  mappings (`lambda:ListEventSourceMappings`, in `FindResultQueues`). The reads carry no
+  conditions: the Lambda guide lists none for `GetEventSourceMapping`, and a denied read would
+  leave a frozen pool frozen.
 
 For [`aegc provenance`](cli.md#aegc-provenance), it may also search the deployment's log group,
 `/aegc/<d>`, and no other (`ReadTaskLogs`, `logs:FilterLogEvents`). `aegc metrics` uses
@@ -553,8 +568,37 @@ For [`aegc provenance`](cli.md#aegc-provenance), it may also search the deployme
     {
       "Sid": "FindResultQueues",
       "Effect": "Allow",
-      "Action": "sqs:ListQueues",
+      "Action": [
+        "sqs:ListQueues",
+        "lambda:ListEventSourceMappings"
+      ],
       "Resource": "*"
+    },
+    {
+      "Sid": "FreezeLambdaPools",
+      "Effect": "Allow",
+      "Action": "lambda:UpdateEventSourceMapping",
+      "Resource": "arn:aws:lambda:us-west-2:123456789012:event-source-mapping:*",
+      "Condition": {
+        "ArnLike": {
+          "lambda:FunctionArn": "arn:aws:lambda:us-west-2:123456789012:function:aegc-e2e-*"
+        },
+        "StringEquals": {
+          "aws:ResourceTag/aegc:deployment": "e2e"
+        }
+      }
+    },
+    {
+      "Sid": "ReadLambdaPools",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:GetFunctionConfiguration",
+        "lambda:GetEventSourceMapping"
+      ],
+      "Resource": [
+        "arn:aws:lambda:us-west-2:123456789012:function:aegc-e2e-*",
+        "arn:aws:lambda:us-west-2:123456789012:event-source-mapping:*"
+      ]
     },
     {
       "Sid": "VcpuQuotaPreflight",
@@ -570,7 +614,8 @@ For [`aegc provenance`](cli.md#aegc-provenance), it may also search the deployme
 }
 ```
 
-`sqs:ListQueues` and `scheduler:ListSchedules` have no resource-level scoping. `aegc status` uses
+`sqs:ListQueues`, `lambda:ListEventSourceMappings` and `scheduler:ListSchedules` have no
+resource-level scoping. `aegc status` uses
 `ListQueues` to find the deployment's result queues by name prefix. The `VcpuQuotaPreflight`
 statement (Service Quotas and CloudWatch reads, also in the deployer policy) lets `status` and
 `deploy` check the account's vCPU quota, and `status` read the oldest waiting task's age.
@@ -590,7 +635,7 @@ A least-privilege starting point for `aegc deploy`, `destroy`, `stop`, `resume`,
 `metrics`, `reap` and `footprint`. Creates are conditioned on the request carrying `aegc:managed=true`, and
 changes and deletes on the resource carrying it, where the service supports tag conditions. IAM
 actions are limited to the `/aegc/` path, and roles can be passed only to EC2 and EventBridge
-Scheduler.
+Scheduler ([lambda-deployer](#lambda-deployer) passes them to Lambda).
 
 ```json
 {
@@ -1341,8 +1386,37 @@ policy starts with the whole [operator](#operator) policy, and adds:
     {
       "Sid": "FindResultQueues",
       "Effect": "Allow",
-      "Action": "sqs:ListQueues",
+      "Action": [
+        "sqs:ListQueues",
+        "lambda:ListEventSourceMappings"
+      ],
       "Resource": "*"
+    },
+    {
+      "Sid": "FreezeLambdaPools",
+      "Effect": "Allow",
+      "Action": "lambda:UpdateEventSourceMapping",
+      "Resource": "arn:aws:lambda:us-west-2:123456789012:event-source-mapping:*",
+      "Condition": {
+        "ArnLike": {
+          "lambda:FunctionArn": "arn:aws:lambda:us-west-2:123456789012:function:aegc-e2e-*"
+        },
+        "StringEquals": {
+          "aws:ResourceTag/aegc:deployment": "e2e"
+        }
+      }
+    },
+    {
+      "Sid": "ReadLambdaPools",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:GetFunctionConfiguration",
+        "lambda:GetEventSourceMapping"
+      ],
+      "Resource": [
+        "arn:aws:lambda:us-west-2:123456789012:function:aegc-e2e-*",
+        "arn:aws:lambda:us-west-2:123456789012:event-source-mapping:*"
+      ]
     },
     {
       "Sid": "VcpuQuotaPreflight",
@@ -1537,11 +1611,261 @@ next to the deployer policy, to whoever moves endpoints to the cloud.
   (and, in that case, its role) in place; see
   [Destroy a deployment](../how-to/operations.md#destroy-a-deployment).
 
+## lambda-deployer
+
+What `aegc deploy`, `destroy`, `stop`, `resume`, `status` and `footprint` need for
+[Lambda pools](../how-to/lambda-pools.md), besides the [deployer](#deployer) policy, which already
+covers their queues and function roles (under its `/aegc/` IAM statement). Attach it next to the
+deployer policy, to whoever deploys Lambda pools.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CreateFunctionsTagged",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:CreateFunction",
+        "lambda:TagResource"
+      ],
+      "Resource": "arn:aws:lambda:us-west-2:123456789012:function:aegc-*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/aegc:managed": "true"
+        }
+      }
+    },
+    {
+      "Sid": "ChangeOwnedFunctions",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:UpdateFunctionCode",
+        "lambda:UpdateFunctionConfiguration",
+        "lambda:DeleteFunction"
+      ],
+      "Resource": "arn:aws:lambda:us-west-2:123456789012:function:aegc-*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/aegc:managed": "true"
+        }
+      }
+    },
+    {
+      "Sid": "ReadFunctions",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:GetFunction",
+        "lambda:GetFunctionConfiguration",
+        "lambda:ListTags",
+        "lambda:GetEventSourceMapping"
+      ],
+      "Resource": [
+        "arn:aws:lambda:us-west-2:123456789012:function:aegc-*",
+        "arn:aws:lambda:us-west-2:123456789012:event-source-mapping:*"
+      ]
+    },
+    {
+      "Sid": "CreateMappingsTagged",
+      "Effect": "Allow",
+      "Action": "lambda:CreateEventSourceMapping",
+      "Resource": "*",
+      "Condition": {
+        "ArnLike": {
+          "lambda:FunctionArn": "arn:aws:lambda:us-west-2:123456789012:function:aegc-*"
+        },
+        "StringEquals": {
+          "aws:RequestTag/aegc:managed": "true"
+        }
+      }
+    },
+    {
+      "Sid": "TagMappingsOnCreate",
+      "Effect": "Allow",
+      "Action": "lambda:TagResource",
+      "Resource": "arn:aws:lambda:us-west-2:123456789012:event-source-mapping:*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/aegc:managed": "true"
+        }
+      }
+    },
+    {
+      "Sid": "ChangeMappings",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:UpdateEventSourceMapping",
+        "lambda:DeleteEventSourceMapping"
+      ],
+      "Resource": "arn:aws:lambda:us-west-2:123456789012:event-source-mapping:*",
+      "Condition": {
+        "ArnLike": {
+          "lambda:FunctionArn": "arn:aws:lambda:us-west-2:123456789012:function:aegc-*"
+        }
+      }
+    },
+    {
+      "Sid": "ListLambda",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:ListFunctions",
+        "lambda:ListEventSourceMappings",
+        "iam:ListRoles"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "PassFunctionRoles",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::123456789012:role/aegc/aegc-*",
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "lambda.amazonaws.com"
+        }
+      }
+    },
+    {
+      "Sid": "ImagesForLambda",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:GetRepositoryPolicy",
+        "ecr:SetRepositoryPolicy",
+        "ecr:BatchGetImage",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:DescribeImages"
+      ],
+      "Resource": "arn:aws:ecr:us-west-2:123456789012:repository/aegc/*"
+    }
+  ]
+}
+```
+
+- Functions are created only as `aegc-*` with the request tag `aegc:managed=true`, and changed or
+  deleted only when they carry it. Mappings are created, changed and deleted only for `aegc-*`
+  functions, and created only with the tag.
+- Reads aren't tag-conditioned, so a function that doesn't exist reads as missing rather than
+  denied.
+- `iam:PassRole` is limited to `/aegc/aegc-*` roles passed to Lambda.
+- `ImagesForLambda` reads and sets the `aegc/*` repositories' policies, for the
+  [`AegcLambdaPull`](resources.md#lambda-pool-aegc-deploy-pool-envlambda) statement; the pull actions are what
+  `CreateFunction`'s caller needs; `DescribeImages` checks the image's size.
+- `stop` and `resume` use `ChangeMappings` to disable and enable the mappings; `status` reads them
+  with `ReadFunctions`; `destroy` and `footprint` list functions, mappings and `/aegc/` roles with
+  `ListLambda`.
+- `aegc destroy` works without this policy, but leaves the Lambda pools' mappings, functions and
+  function roles in place; see [Destroy a deployment](../how-to/operations.md#destroy-a-deployment).
+
+## Function role
+
+`aegc deploy` creates `/aegc/aegc-<d>-<pool>-<region>` for each [Lambda pool](../how-to/lambda-pools.md).
+The function runs with it, and so does task code: Lambda pools aren't
+[isolated](../concepts/security.md#lambda-pools). Its inline policy `aegc-function` covers what
+`aegc-worker lambda` does for one pool. The deployment's grants go next to it as `aegc-grants`.
+Its trust policy:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "lambda.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+```
+
+`aegc-function`, for the pool `geospatial-py314-lambda` (the policy isn't printed by
+`aegc iam-policy`, since `deploy` writes it):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ConsumeTasks",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:ChangeMessageVisibility",
+        "sqs:GetQueueAttributes"
+      ],
+      "Resource": "arn:aws:sqs:us-west-2:123456789012:aegc-e2e-geospatial-py314-lambda-tasks"
+    },
+    {
+      "Sid": "PostResults",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:SendMessage",
+        "sqs:GetQueueUrl"
+      ],
+      "Resource": "arn:aws:sqs:us-west-2:123456789012:aegc-e2e-res-*"
+    },
+    {
+      "Sid": "ReadTaskPayloads",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::aegc-123456789012-us-west-2/payloads/e2e/tasks/*"
+    },
+    {
+      "Sid": "WriteResultPayloads",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::aegc-123456789012-us-west-2/payloads/e2e/results/*"
+    },
+    {
+      "Sid": "ReadDeploymentState",
+      "Effect": "Allow",
+      "Action": "ssm:GetParameter",
+      "Resource": [
+        "arn:aws:ssm:us-west-2:123456789012:parameter/aegc/e2e/state",
+        "arn:aws:ssm:us-west-2:123456789012:parameter/aegc/e2e/manifest"
+      ]
+    },
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:us-west-2:123456789012:log-group:/aegc/e2e:*"
+    },
+    {
+      "Sid": "EcrPull",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchGetImage",
+        "ecr:GetDownloadUrlForLayer"
+      ],
+      "Resource": "arn:aws:ecr:us-west-2:123456789012:repository/aegc/geospatial"
+    }
+  ]
+}
+```
+
+- `ConsumeTasks` is the pool's own task queue only. The event source mapping receives with this
+  role, and the handler deletes and releases messages.
+- `PostResults`, `ReadTaskPayloads` and `WriteResultPayloads` cover the whole deployment, not just
+  the pool: this is what lets a task on a Lambda pool read other pools' task payloads and forge
+  results ([#80](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/80)).
+- It has no cost ledger, Auto Scaling, task role or state writes: Lambda spend comes from
+  Lambda's own metrics.
+- `EcrPull` lets the function pull its image; the repository's `AegcLambdaPull` statement does
+  the same for the Lambda service.
+
 ## Scheduler role
 
 `aegc deploy` creates `/aegc/aegc-<d>-scheduler-<region>` for the deployment's lease and TTL
-schedules, unless the deployment has neither. It may only write the deployment's state parameter
-and update Auto Scaling groups tagged with the deployment. Its trust policy:
+schedules, unless the deployment has neither. It may only write the deployment's state parameter,
+update Auto Scaling groups tagged with the deployment, and update event source mappings that are
+tagged with the deployment and feed its functions (the `lease-<pool>` schedules of Lambda pools
+disable them). Every deploy rewrites its policy. Its trust policy:
 
 ```json
 {
@@ -1581,6 +1905,19 @@ Its inline policy, `aegc-lease`:
       "Condition": {
         "StringEquals": {
           "autoscaling:ResourceTag/aegc:deployment": "e2e"
+        }
+      }
+    },
+    {
+      "Effect": "Allow",
+      "Action": "lambda:UpdateEventSourceMapping",
+      "Resource": "arn:aws:lambda:us-west-2:123456789012:event-source-mapping:*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/aegc:deployment": "e2e"
+        },
+        "ArnLike": {
+          "lambda:FunctionArn": "arn:aws:lambda:us-west-2:123456789012:function:aegc-e2e-*"
         }
       }
     }

@@ -4,7 +4,8 @@ Results from the live Globus Compute end-to-end run on 2026-11-14 in us-west-2
 ([#15](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/15)). They come from one
 deployment on one day; Spot capacity, instance types and image size all change the numbers.
 Later runs, for [v0.2](#v02-live-run-2026-11-15), [v0.3](#v03-live-run-2026-11-15),
-[v0.4](#v04-live-run-2026-11-16) and [v0.6](#v06-live-run-2026-11-23), are at the end.
+[v0.4](#v04-live-run-2026-11-16), [v0.6](#v06-live-run-2026-11-23) and
+[v0.7](#v07-live-run-2026-11-23), are at the end.
 
 ## Setup
 
@@ -179,3 +180,32 @@ a token, and Session Manager was always on); the alarm's settings are the same. 
 - `bytes_read` came back empty on isolated workers: after `setuid` from root, Linux marks a process
   non-dumpable, and its own `/proc/self` files belong to root. Task processes restore the flag.
 - FIS returns the interrupted instances as ARNs; the sweep script now prints their ids.
+
+## v0.7 live run (2026-11-23)
+
+[Lambda pools](../how-to/lambda-pools.md)
+([#21](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/21)). us-west-2, deployment
+`lam`: a Lambda pool `plain-py314-lambda` (2048 MB, timeout 300 s, concurrency 5, the image `plain`
+built over `python:3.14-slim` with aegc 0.7) next to an EC2 pool. Tasks were submitted through a
+local `AWSEngine`, without Globus in the loop.
+
+| Check | Result |
+|---|---|
+| Runtime | `aegc-worker lambda` served invocations; cold init about **5.2 s** per execution environment (the forkserver started at init). A task saw the function role, `HOME=/tmp/aegc/home`, 2 vCPUs and 512 MB of `/tmp` |
+| Burst of 100 tasks of 1–3 s | first result **3.5 s** after submission; all 100 back in **71.7 s**; 0 errors. Provenance showed the function, memory, request id, log stream and estimated cost |
+| Walltime at submission | `walltime_s=600` refused at once with `AEGC_CONFIGURATION`, naming the 300 s timeout |
+| Walltime at run time | a task sleeping 400 s with `walltime_s=280` was killed at 279 s (remaining time less 20 s), and its `AEGC_WALLTIME_EXCEEDED` result posted before the function timed out |
+| `aegc stop`, `aegc resume` | `stop` disabled the mapping and new tasks were refused at submission; `resume` enabled it and tasks ran |
+| Cap | `aegc limits --max-usd-day 0.01` and `aegc evaluate` capped the deployment and disabled the mapping; `limits --max-usd-day 5 --resume` enabled it again |
+| TTL | a 3-minute TTL fired: state `expired`, and the mapping disabled by EventBridge Scheduler's universal target, so the scheduler role's `lambda:FunctionArn` and `aws:ResourceTag` conditions hold in AWS |
+| Cost | `aegc cost` showed `lambda-2048MB: $0.0139`, in line with about 500 s at 2 GB plus init |
+| `destroy` | the dry run listed the mapping, function, role, queues and schedules; `--yes` deleted them, verification found nothing left, and `footprint` was empty |
+
+**Found and fixed during the run:**
+- Scheduler's universal target names its fields as the SDKs serialize them: it refused `UUID`
+  ("Request payload is missing the following field(s): Uuid"). The `lease-<pool>` schedules of
+  Lambda pools now send `{"Uuid": ..., "Enabled": false}`.
+- Lambda's `Duration` metric leaves out init time, which container-image functions are billed
+  for (about 5 s per environment). The handler now writes an `InitSeconds` metric before any task
+  runs in an environment, and Lambda spend includes it.
+

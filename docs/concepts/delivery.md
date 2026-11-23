@@ -42,6 +42,33 @@ as a new attempt after a system failure, and reports the failure if the retry fa
 worst case (every delivery of both attempts lost), a function can start 8 times before the task
 fails.
 
+## Lambda pools
+
+On a [Lambda pool](../how-to/lambda-pools.md) the claim works differently, and the rest is the
+same: the handler runs each message through the worker's own path (refuse it if the deployment is
+halted, fail it after 4 deliveries, fetch the payload, post `started`, run, post the result, then
+delete the message), so delivery is still at least once and the first result still wins.
+
+- **The claim.** The event source mapping receives one message per invocation (batch size 1).
+  The message is then invisible for the queue's visibility timeout, 6 times the function's
+  timeout, so a delivery Lambda throttles isn't handed out again while Lambda retries it. When the
+  handler starts on the record, it sets the message's visibility to the invocation's remaining
+  time plus 60 s. There's no heartbeat: the invocation's deadline bounds the task.
+- **The ack.** The handler deletes the message as soon as the result is posted, rather than
+  leaving that to the mapping, so a crash after that point can't run the task again.
+- **Partial batch responses.** A record whose result couldn't be posted, or whose message couldn't
+  be decoded or its payload fetched, is returned in `batchItemFailures`, and SQS delivers it
+  again; the dead-letter queue (after 6 receives) catches the rest.
+
+| Event | What aegc does | Can the function run twice? |
+|---|---|---|
+| The task asks for more walltime than the function allows | The engine fails it at submission with `AEGC_CONFIGURATION`. No retry. | No |
+| The task reaches its walltime, or the invocation's remaining time less 20 s | The child is killed and the handler posts `AEGC_WALLTIME_EXCEEDED`. No retry. | No |
+| Less than a second of the invocation is left when the record starts | The handler makes the message visible again at once and reports it as a batch item failure. | No, it hadn't started |
+| The function times out, or its environment dies, during a task | No result is posted; the message becomes visible again about a minute after the invocation's deadline and runs again. | Yes |
+| Lambda throttles the delivery | Lambda retries it; if it still hasn't run when the 6× visibility timeout ends, SQS delivers it again. Every delivery counts toward the 4 before `WORKER_LOST_REPEATEDLY` and the dead-letter queue's 6. | No, until it runs |
+| The deployment is capped, stopped or expired | The mapping is disabled, so queued messages stay queued (and the engine fails its own). A record delivered meanwhile is refused with the state's code. Running invocations finish. No retry. | No |
+
 ## Final failures
 
 `AEGC_BUDGET_EXCEEDED`, `AEGC_STOPPED`, `AEGC_EXPIRED` and `AEGC_NO_CAPACITY`, like

@@ -46,6 +46,11 @@ deployment e2e (us-west-2): running
   `aws service-quotas` command to raise it when it falls short.
 - **result queue** lines list each user endpoint process's queue. Results that stay there mean that
   endpoint process isn't running.
+- **A [Lambda pool](lambda-pools.md)** shows its function and mapping where an EC2 pool shows
+  workers, for example `| lambda 2048 MB x 10, event source mapping Enabled`, then what one task
+  gets (`1.16 vCPU(s), 2 GiB per task`), its rate now (one busy execution environment per running
+  task) and the worst case for its running tasks. Reading the mapping needs the operator or
+  lambda-deployer policy; without either it reads `unknown (AccessDeniedException)`.
 
 The spend figures need read access to the deployment's ledger, which the
 [operator policy](../reference/iam.md#operator) has and the deployer policy doesn't; without it,
@@ -67,9 +72,16 @@ doesn't need a running endpoint.
 `--hard` (which needs `--yes`) also tells workers to fail their running tasks at once, waits
 2 minutes, and terminates any instance still in a group. This is the emergency stop.
 
+On [Lambda pools](lambda-pools.md#stop-caps-and-the-lease), `stop` disables each event source
+mapping, so nothing new is delivered. Invocations already running finish, with or without
+`--hard`: Lambda can't stop them early. With the deployer policy alone, `stop` still writes the
+state but reports `couldn't disable the event source mapping`; add the
+[lambda-deployer](../reference/iam.md#lambda-deployer) policy.
+
 `aegc resume` sets the state back to `running`, restores each group's minimum from the manifest,
-and pushes the lease forward. It works on a stopped, capped or expired deployment. A redeploy in
-the meantime keeps the minimums at 0, so only `resume` brings warm workers back. Tasks that
+enables the Lambda pools' mappings, and pushes the lease forward. It works on a stopped, capped
+or expired deployment. A redeploy in the meantime keeps the minimums at 0, so only `resume`
+brings warm workers back. Tasks that
 failed while it was stopped aren't resubmitted; submit them again.
 
 ## Spend limits and cost
@@ -142,6 +154,10 @@ which also checks the spend limits every 5 minutes, task or no task. See
     aws logs tail /aegc/e2e --follow
     ```
 
+- **Lambda pools:** the functions log to the same group, in Lambda's own streams
+  (`<yyyy>/<mm>/<dd>/[$LATEST]<id>`), with the same JSON lines; see
+  [Run short tasks on Lambda](lambda-pools.md#status-metrics-logs-and-provenance).
+
 - **Cloud endpoint:** streams `endpoint/<instance-id>` (the endpoint, with user endpoint
   process lines prefixed `[uep]`) and `endpoint/<instance-id>/evaluate` in the same log group. See
   [Logs](cloud-endpoint.md#logs).
@@ -162,6 +178,9 @@ the pool shrinks as work runs out. A worker stays up if leaving would take the g
 `min_vcpus`. After its `lifetime` (default 24 hours), a worker stops claiming and leaves once its
 tasks finish; at the group's minimum it terminates without lowering desired capacity, so the group
 launches a fresh replacement.
+
+Lambda pools aren't scaled by the engine: Lambda runs up to the pool's `concurrency=` at once.
+The stall breaker and watchdog below don't apply to them.
 
 **Stall breaker.** If a pool has wanted capacity for 15 minutes with no instance in service, the
 engine stops asking for more for 10 minutes and logs an error. Check the group's last scaling
@@ -202,14 +221,18 @@ destroys anyway, and those tasks are lost. Then it deletes, in order:
    10 minutes for each to go), the [cloud endpoint](cloud-endpoint.md)'s included,
 2. the launch templates,
 3. the security group (retrying while the terminated instances' network interfaces go away),
-4. all of the deployment's queues: task, dead-letter and result queues,
-5. the lease's schedules, schedule group and scheduler role,
-6. the worker instance profile and role, and the task role,
-7. the cloud endpoint's alarm, SNS topic, image `inuse-` tag, instance profile and role, and its
+4. the [Lambda pools](lambda-pools.md)' event source mappings, functions and function roles,
+5. all of the deployment's queues: task, dead-letter and result queues,
+6. the lease's schedules, schedule group and scheduler role,
+7. the worker instance profile and role, and the task role,
+8. the cloud endpoint's alarm, SNS topic, image `inuse-` tag, instance profile and role, and its
    login secret, if it has one,
-8. the log group,
-9. the deployment's `inuse-` tags on its images (the images stay),
-10. every parameter under `/aegc/<d>/`: the manifest and the state.
+9. the log group,
+10. the deployment's `inuse-` tags on its images (the images stay),
+11. every parameter under `/aegc/<d>/`: the manifest and the state.
+
+The `AegcLambdaPull` statement in the `aegc/<env>` repository policies stays: it's region-wide,
+for any function named `aegc-*`, like the repositories.
 
 Every deletion requires the name prefix and the ownership tags; anything else is reported as `kept`.
 Payload objects aren't deleted by `destroy`; the bucket's lifecycle rule removes them after 15
@@ -219,8 +242,9 @@ days. Cost ledger records stay until they expire after 400 days.
 volumes and network interfaces tagged with the deployment (waiting up to 10 minutes while any are
 still terminating or detaching), groups, launch templates, the security group, queues, the log
 group, `/aegc/<d>/` parameters, the worker role and instance profile, the task role, the lease's
-group and role, the cloud endpoint's role, secret, alarm and topic,
-and in-use image tags. Anything still there is reported as `remaining`, and the command exits 1.
+group and role, the cloud endpoint's role, secret, alarm and topic, the Lambda pools' mappings,
+functions and function roles, and in-use image tags. Anything still there is reported as
+`remaining`, and the command exits 1.
 `--no-verify` skips the check. `aegc destroy e2e --verify`, without `--yes`, only runs the check,
 for example to confirm an earlier destroy.
 
@@ -242,6 +266,17 @@ For a deployment that never had a cloud endpoint, that's all, and verification p
 one, its secret, alarm and topic stay; run `aegc destroy <d> --yes` again with both policies to
 remove them.
 
+**Without the lambda-deployer policy.** Lambda pools' mappings, functions and function roles need
+the [lambda-deployer](../reference/iam.md#lambda-deployer) policy. Without it, `destroy` removes
+everything else, the pools' queues included, and reports
+
+```
+        kept  lambda pools               e2e (not checked: needs the lambda-deployer policy (aegc iam-policy lambda-deployer))
+```
+
+Verification can't list them either, so it doesn't report them as `remaining`. Run
+`aegc destroy <d> --yes` again with both policies, and check with `aegc footprint <d>`.
+
 ## Find what exists
 
 ```sh
@@ -250,7 +285,9 @@ aegc footprint e2e
 
 `footprint` lists everything that exists for a deployment and changes nothing. It combines the
 Resource Groups Tagging API (everything tagged `aegc:deployment=<d>`) with a scan by name of
-queues, Auto Scaling groups, launch templates and `/aegc/<d>/` parameters. Each line is `owned`
+queues, Auto Scaling groups, launch templates, `/aegc/<d>/` parameters, and Lambda functions and
+event source mappings (which need the lambda-deployer policy's reads; without them it prints a
+note). Each line is `owned`
 (aegc's name and tags) or `look-alike` (aegc's name without its tags, which aegc never deletes).
 For a while after a destroy, the tagging API can still list terminated instances.
 
@@ -296,6 +333,26 @@ warning. If EC2 won't say (a deployer policy from before 0.6 lacks
 
 Cost estimates use the region's Spot and on-demand prices. The static fallback table holds
 us-west-2's on-demand prices, which are also us-east-1's for these types.
+
+## Upgrade to v0.7
+
+Lambda pools need aegc 0.7 throughout, but nothing changes for a deployment without them until you
+add one:
+
+1. Update the [operator policy](../reference/iam.md#operator) on the endpoint's credentials
+   (`aegc iam-policy operator --deployment <d>`): it gains `FreezeLambdaPools`,
+   `ReadLambdaPools` and `lambda:ListEventSourceMappings`. A cloud endpoint's role gets them with
+   the next `aegc endpoint ... deploy`.
+2. Attach the [lambda-deployer](../reference/iam.md#lambda-deployer) policy next to the deployer
+   policy (`aegc iam-policy lambda-deployer`).
+3. Rebuild the endpoint (`aegc endpoint ... build`, `stop`, `start`; or `endpoint ... deploy` for
+   a cloud endpoint). Engines and evaluators from before 0.7 expect every pool to have an Auto
+   Scaling group, and stop scaling once the manifest has a Lambda pool.
+4. Rebuild the image of each env you want on Lambda with `aegc image build` (images with aegc
+   before 0.7 have no `aegc-worker lambda`), then `aegc deploy <d> --pool <env>:lambda,...`. The
+   deploy also rewrites the scheduler role's policy so the lease can disable Lambda mappings.
+
+See [Run short tasks on Lambda](lambda-pools.md).
 
 ## Upgrade from v0.3
 

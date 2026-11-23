@@ -90,11 +90,11 @@ allows these keys, and the template renders them into the engine section:
 |---|---|---|---|
 | `env` | string matching `^[a-z][a-z0-9-]{0,40}$` | the `--env` given to `configure` | Science environment for this executor's tasks |
 | `python` | string matching `^3\.[0-9]{1,2}$`, e.g. `"3.14"` | the submitter's Python | Pick the env's image for this Python minor when the submission doesn't carry a Python version, as from [Globus Flows](../how-to/flows.md). Ignored when it does (the SDK's) |
-| `pool` | string matching `^[a-z][a-z0-9-]{0,39}$` | | Run on this exact pool (e.g. `geospatial-py314`); overrides `env` and `size`. `cpus` and `memory_gib`, if given, must fit it |
+| `pool` | string matching `^[a-z][a-z0-9-]{0,39}$` | | Run on this exact pool (e.g. `geospatial-py314`, or the Lambda pool `geospatial-py314-lambda`); overrides `env` and `size`. `cpus` and `memory_gib`, if given, must fit it |
 | `size` | `small`, `medium`, `mem`, `large` or `whole` | | Run on a pool of this [size class](#size-classes); a pool without one counts as `small`. `cpus` and `memory_gib`, if given too, must fit it |
 | `cpus` | number > 0 | | vCPUs a task needs: run on the cheapest pool whose tasks get at least this many |
 | `memory_gib` | number > 0 | | GiB a task needs: run on the cheapest pool whose tasks get at least this much |
-| `walltime_s` | integer ≥ 1, at most the pool's `max_walltime` (at most 41,400) | the pool's `walltime`, else 39,600 | Kill the task after this many seconds |
+| `walltime_s` | integer ≥ 1, at most the pool's `max_walltime` (at most 41,400; on a Lambda pool, at most its timeout less 20 s) | the pool's `walltime`, else 39,600 | Kill the task after this many seconds |
 
 No other keys are accepted; Globus Compute rejects the submission before it reaches aegc. Globus
 Compute runs one user endpoint process per distinct config, so each combination you use gets its
@@ -136,8 +136,10 @@ For each task the engine:
    `user_endpoint_config`), overridden by any that arrive in `resource_specification`;
 4. with `pool`, uses that pool if it exists and its Python matches the submitter;
 5. otherwise takes the pools whose env is the engine's `env` (all pools if it's empty), and keeps
-   those whose image's Python minor matches the submitter (or `python`); if neither is known and
-   those pools have more than one minor, it fails the task, asking for `python`;
+   those whose image's Python minor matches the submitter (or `python`); of those, only the EC2
+   pools if there are any, so a [Lambda pool](../how-to/lambda-pools.md) is picked here only when
+   no EC2 pool serves the env and Python. If the Python isn't known and those pools have more
+   than one minor, it fails the task, asking for `python`;
 6. from those, with `size`, picks the first by name of that class, and checks that its tasks get
    at least `cpus` and `memory_gib`; otherwise keeps the pools whose tasks get at least `cpus`
    vCPUs and `memory_gib` GiB (both 0 if not given) and picks the cheapest: the fewest vCPUs held
@@ -145,8 +147,10 @@ For each task the engine:
    least memory per task, then the name. With `pool`, it checks `cpus` and `memory_gib` against
    that pool. What a task gets: its class's vCPUs and GiB; for `whole`, `vcpu=` and `mem=`; for a
    pool without a class and with fixed `slots=N`, the low end of `vcpu=` and `mem=` divided by N;
-   otherwise 1 vCPU and 2 GiB;
-7. checks `walltime_s` against the chosen pool's `max_walltime`, or applies its default `walltime`;
+   for a Lambda pool, its memory and memory ÷ 1,769 MB vCPUs (at most 6); otherwise 1 vCPU and
+   2 GiB;
+7. checks `walltime_s` against the chosen pool's `max_walltime` (for a Lambda pool, also against
+   its timeout less 20 s), or applies its default `walltime`;
 8. fails the task with an `AEGC_CONFIGURATION` error if any of this fails.
 
 ## Size classes
@@ -195,6 +199,25 @@ manifest. Settings that `--pool` doesn't expose are fixed:
 | Scale-in protection | New instances protected; `AZRebalance` suspended |
 | Subnets | The default VPC's default subnets |
 
+### Lambda pools
+
+A pool of kind `lambda` ([Run short tasks on Lambda](../how-to/lambda-pools.md)) has these fixed
+settings instead:
+
+| Setting | Value |
+|---|---|
+| Function | `aegc-<d>-<pool>`, package type `Image`, `arm64`, the pool's image by digest, command `aegc-worker lambda` (the image's entrypoint stays), not published (`$LATEST`) |
+| Memory, timeout, `/tmp` | `memory=` (default 2048 MiB), `timeout=` (default 900 s), `tmp=` (default 512 MiB) |
+| Role | `aegc-<d>-<pool>-<region>`, with `aegc-function` and the deployment's `aegc-grants` ([function role](iam.md#function-role)) |
+| Network | no VPC configuration |
+| Logs | `/aegc/<d>`, text format, in Lambda's streams |
+| Event source mapping | from the pool's task queue: batch size 1, `ReportBatchItemFailures`, `MaximumConcurrency` = `concurrency=` (default 10); disabled while the deployment isn't running |
+| Task queue visibility | 6 × the timeout (at most 12 h); the handler sets each record's own to the invocation's remaining time + 60 s when it starts |
+| Walltime | `max_walltime` and `walltime` default to the timeout less 20 s; at run time a task gets at most the invocation's remaining time less 20 s |
+| Task isolation | none: tasks run with the function role |
+| Environment | `AEGC_WORKER_CONFIG_B64` (the worker configuration below) and `AEGC_IMAGE`, together at most 4 KB, Lambda's limit; many grants can exceed it, and `deploy` says so before changing anything |
+| Scratch, `HOME` | `/tmp/aegc`; `HOME` is `/tmp/aegc/home` when the image's isn't writable |
+
 ## Worker configuration
 
 The launch template passes this to `aegc-worker run` as base64 JSON in `AEGC_WORKER_CONFIG_B64`:
@@ -206,7 +229,7 @@ The launch template passes this to `aegc-worker run` as base64 JSON in `AEGC_WOR
 | `size_class`, `task_cpus`, `task_memory_gib` | The pool's [size class](#size-classes); only for sized pools |
 | `grants` | The deployment's [grants](../how-to/data.md), `{access, bucket, prefix}` each; only when there are any. `aegc.outputs` falls back to these if it can't read the manifest's current grants |
 | `idle_timeout_s` | The pool's `idle` (300) |
-| `visibility_s` | 300; the heartbeat runs every `visibility_s / 3` = 100 s |
+| `visibility_s` | 300; the heartbeat runs every `visibility_s / 3` = 100 s (a Lambda pool: the task queue's, 6 × the timeout; there's no heartbeat) |
 | `max_deliveries` | 4 |
 | `aegc_version` | The aegc version that deployed it |
 | `state_parameter` | `/aegc/<d>/state`, read every 60 s |

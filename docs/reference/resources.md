@@ -1,8 +1,9 @@
 # Resources and tags
 
 Everything aegc creates in AWS, with its name, its `aegc:role` tag, and what creates and deletes
-it. `<d>` is the deployment, `<pool>` the pool (`<env>-py<NNN>`, or `<env>-py<NNN>-<size>` with a
-[size class](configuration.md#size-classes)), `<account>` and `<region>` the account and region.
+it. `<d>` is the deployment, `<pool>` the pool (`<env>-py<NNN>`, `<env>-py<NNN>-<size>` with a
+[size class](configuration.md#size-classes), or `<env>-py<NNN>-lambda` for a
+[Lambda pool](#lambda-pool-aegc-deploy-pool-envlambda)), `<account>` and `<region>` the account and region.
 
 ## Tags
 
@@ -107,6 +108,31 @@ Workers of pools that [isolate tasks](../concepts/security.md#task-isolation) al
 `aegc:isolated=true`, which `deploy` uses to tell when no worker runs tasks with the worker role
 any more. Groups have 1-minute group metrics enabled.
 
+## Lambda pool: aegc deploy --pool env:lambda
+
+Deleted by `aegc destroy` and `aegc deploy --prune --yes` (with the
+[lambda-deployer](iam.md#lambda-deployer) policy). These also carry `aegc:pool=<pool>`.
+
+| Resource | Name | `aegc:role` |
+|---|---|---|
+| SQS task queue (visibility 6 × the function's timeout, at most 12 h; otherwise as above) | `aegc-<d>-<pool>-tasks` | `task-queue` |
+| SQS dead-letter queue (receives after 6 deliveries) | `aegc-<d>-<pool>-dlq` | `dlq` |
+| IAM role, path `/aegc/`, inline policies `aegc-function` and, with grants, `aegc-grants`; trusts `lambda.amazonaws.com` (see [Function role](iam.md#function-role)) | `aegc-<d>-<pool>-<region>` | `function-role` |
+| Lambda function (image, arm64, command `aegc-worker lambda`, logs to `/aegc/<d>`) | `aegc-<d>-<pool>` | `function` |
+| Lambda event source mapping from the task queue to the function (batch size 1, `ReportBatchItemFailures`, `MaximumConcurrency`) | a UUID | `mapping` |
+| EventBridge Scheduler schedules (with the deployment's others) | `lease-<pool>`, `ttl-<pool>`: disable the mapping | — |
+| CloudWatch log streams in `/aegc/<d>` | Lambda's own, `<yyyy>/<mm>/<dd>/[$LATEST]<id>` | — |
+
+Ownership is checked as for every resource: a mapping counts as aegc's only if its function has
+aegc's name for the deployment and the mapping carries the tags. Lambda pools have no launch
+template, group or instances, and no cost ledger records.
+
+**ECR repository policy.** For each env with a Lambda pool, `deploy` keeps a statement with the
+Sid `AegcLambdaPull` in the `aegc/<env>` repository policy: the Lambda service
+(`lambda.amazonaws.com`) may `ecr:BatchGetImage` and `ecr:GetDownloadUrlForLayer` for source ARNs
+`arn:aws:lambda:<region>:<account>:function:aegc-*`. Other statements are left as they are. It's
+region-wide like the repository, so `destroy` leaves it, and no aegc command removes it.
+
 ## Endpoint process: AWSEngine
 
 | Resource | Name | `aegc:role` | Deleted by |
@@ -167,7 +193,9 @@ settings (env, Python, image digest, `min_vcpus`/`max_vcpus` and `capacity_type:
 slots, idle timeout, volume, walltimes, lifetime, instance types, and the size class:
 `size_class`, `task_cpus`, `task_memory_gib`, `memory_gib_per_vcpu_min`, and `isolate_tasks`,
 true for images with aegc 0.4 or later) and the URLs and names
-of its queues, launch template and group; `limits` (`max_usd_day`, `max_usd_month`,
+of its queues, launch template and group (for a Lambda pool, `kind: lambda`, `memory_mib`,
+`timeout_s`, `max_concurrency`, `ephemeral_mib`, the walltimes, the queues, `function_name`,
+`function_arn`, `function_role_arn` and `event_source_mapping`, the mapping's UUID); `limits` (`max_usd_day`, `max_usd_month`,
 `max_instance_hours_day`, `on_cap`); `lease` (`lease_s`, `ttl_at`); `grants`
 (`{access, bucket, prefix}` each); and `generation`, a hash of the rest, which engines compare to notice a redeploy. `aegc limits` rewrites it. `AWSEngine` and
 `aegc status` read it.

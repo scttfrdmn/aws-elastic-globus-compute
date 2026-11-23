@@ -27,7 +27,8 @@ flowchart LR
 ```
 
 `<d>` is the deployment name, `<pool>` the pool name (`<env>-py<NNN>`, for example
-`geospatial-py314`), and `<uep>` the first 12 hex digits of the user endpoint process's id.
+`geospatial-py314`), and `<uep>` the first 12 hex digits of the user endpoint process's id. A pool
+can also be a [Lambda pool](#lambda-pools), with a function in place of the Auto Scaling group.
 
 ## Components
 
@@ -53,8 +54,10 @@ waiting for an engine, and publishes a liveness metric for an offline alarm. See
 - A scaler thread runs every 10 s. For each pool it reads the queue depth and the Auto Scaling
   group and raises desired capacity to the vCPUs the waiting and running tasks need, capped at the
   pool's `max_vcpus` and at what the [spend limits](cost.md#spend-limits) admit. It only scales out;
-  several endpoint processes can share a pool, and workers scale in themselves. The same thread
-  checks spend, re-reads the deployment state and manifest, and renews the lease.
+  several endpoint processes can share a pool, and workers scale in themselves. Lambda pools
+  aren't scaled; the scaler only keeps their event source mappings enabled while the deployment
+  runs, and disabled otherwise. The same thread checks spend, re-reads the deployment state and
+  manifest, and renews the lease.
 - A result thread long-polls the process's own result queue and resolves the matching futures.
 
 The engine reads the deployment's manifest (`/aegc/<d>/manifest` in SSM Parameter Store) when it
@@ -64,10 +67,11 @@ the [deployment state](#deployment-state) every 30 s. It is built to survive the
 management: `start` is fast and never raises (a misconfiguration fails tasks with a clear message
 instead), `shutdown` never touches AWS, and the status report only reads cached data.
 
-**Queues.** Each pool has a task queue (visibility timeout 300 s, long polling) and a dead-letter
-queue. Each user endpoint process creates its own result queue, which keeps messages for 14 days.
+**Queues.** Each pool has a task queue (visibility timeout 300 s, long polling; for a Lambda
+pool, 6 times the function's timeout) and a dead-letter queue. Each user endpoint process
+creates its own result queue, which keeps messages for 14 days.
 
-**Workers.** Each pool is an Auto Scaling group of Spot Graviton instances, chosen by attributes
+**Workers.** Each EC2 pool is an Auto Scaling group of Spot Graviton instances, chosen by attributes
 (vCPU and memory ranges, AWS-designed CPUs, no burstable types) with the `price-capacity-optimized`
 strategy, and sized in vCPUs (see [Capacity in vCPUs](#capacity-in-vcpus)). Instances run the stock ECS-optimized Amazon Linux 2023 arm64 AMI, resolved at deploy
 time. Their user data ([src/aegc/infra/userdata.py](../../src/aegc/infra/userdata.py)) disables the
@@ -145,6 +149,59 @@ sequenceDiagram
 
 See [Delivery and idempotency](delivery.md) for what happens when something fails along the way.
 
+## Lambda pools
+
+A pool of kind `lambda` ([Run short tasks on Lambda](../how-to/lambda-pools.md)) has the same task
+queue, dead-letter queue and protocol, but no Auto Scaling group. An SQS event source mapping
+feeds the queue to a Lambda function, `aegc-<d>-<pool>`, that runs the env's worker image with
+the command `aegc-worker lambda`:
+
+```mermaid
+flowchart LR
+    subgraph laptop["Your machine"]
+        engine["Endpoint container<br/>user endpoint process<br/><b>AWSEngine</b>"]
+    end
+    subgraph aws["AWS account, one region"]
+        tq[["Task queue<br/>aegc-&lt;d&gt;-&lt;pool&gt;-tasks<br/>+ dead-letter queue"]]
+        esm{{"Event source mapping<br/>batch size 1<br/>max concurrency"}}
+        subgraph fn["Lambda function aegc-&lt;d&gt;-&lt;pool&gt; (arm64)"]
+            env1["Execution environment<br/>aegc/&lt;env&gt;@digest<br/>aegc-worker lambda"]
+        end
+        rq[["Result queue<br/>aegc-&lt;d&gt;-res-&lt;uep&gt;"]]
+        ssm[("SSM<br/>manifest, state")]
+        cw[("CloudWatch<br/>Duration, Invocations,<br/>InitSeconds")]
+    end
+    engine -- "1 · send task" --> tq
+    tq -- "2 · poll" --> esm
+    esm -- "3 · invoke, one record" --> env1
+    env1 -- "4 · started, result" --> rq
+    rq -- "5 · long poll" --> engine
+    engine -. "enable, disable" .-> esm
+    engine -. "spend" .-> cw
+    env1 -. "read state" .-> ssm
+```
+
+- **The function** runs the same image as an EC2 pool would, by digest. `aegc-worker lambda`
+  talks to Lambda's Runtime API directly, so the image needs no Lambda runtime package. At init it
+  starts the forkserver, which imports Globus Compute; each invocation then handles one SQS record
+  on the same message path as an EC2 worker: refuse it if the deployment is halted, fetch the
+  payload, post `started`, run `execute_task` in a fresh child, post the result, delete the
+  message. Scratch and `HOME` are under `/tmp`.
+- **Lambda scales it,** up to the mapping's maximum concurrency. The engine doesn't touch its
+  capacity. Freezing a Lambda pool (stop, a cap, the lease or TTL) disables the mapping, and
+  resuming enables it; engines and `aegc evaluate` keep the mapping in line with the deployment
+  state.
+- **Walltime** is the task's, but never more than the invocation's remaining time less 20 s, kept
+  for posting the result. A task that asks for more than the function's timeout allows fails at
+  submission.
+- **Routing.** A task goes to a Lambda pool only when it names the pool, or when only Lambda pools
+  serve its env and Python, so a task without a walltime can't land on a 30-minute function by
+  accident.
+- **Tasks aren't isolated.** They run with the pool's function role; see
+  [Security model](security.md#lambda-pools).
+- **Spend** comes from Lambda's own metrics, not from a ledger record; see
+  [Cost](cost.md#lambda-pools).
+
 ## Deployment state
 
 Each deployment has a state in `/aegc/<d>/state`, a small JSON document with the mode, the reason,
@@ -182,8 +239,10 @@ These failures are final: the endpoint doesn't retry them. Workers read the stat
 first claim, so a worker that boots into a halted deployment never starts a task.
 
 A redeploy never changes the state, and while the deployment isn't `running` it keeps every
-group's minimum at 0, so it doesn't launch workers that couldn't take tasks; `aegc resume` restores
-the minimums. When a cap ends at the end of its period, the engine restores them itself. A missing
+group's minimum at 0, so it doesn't launch workers that couldn't take tasks, and every Lambda
+pool's mapping disabled; `aegc resume` restores the minimums and enables the mappings. When a cap
+ends at the end of its period, the engine restores them itself (and engines and `aegc evaluate`
+enable the mappings). A missing
 state parameter (a v0.1 deployment) reads as `running`.
 
 ## Lease and TTL
@@ -195,10 +254,13 @@ EventBridge Scheduler schedules in a schedule group `aegc-<d>`:
 - `lease-state` sets the state to `expired`, through Scheduler's universal target for
   `ssm:PutParameter`;
 - `lease-<pool>`, one per pool, sets the group's minimum to 0 through
-  `autoscaling:UpdateAutoScalingGroup`, so workers kept by `min_vcpus` can leave too.
+  `autoscaling:UpdateAutoScalingGroup`, so workers kept by `min_vcpus` can leave too. For a
+  Lambda pool it disables the event source mapping instead, through
+  `lambda:UpdateEventSourceMapping` with `{"Uuid": ..., "Enabled": false}`.
 
 They run as the role `aegc-<d>-scheduler-<region>`, which may only write the deployment's state
-parameter and update groups tagged with the deployment. No Lambda function is involved.
+parameter, update groups tagged with the deployment, and update event source mappings tagged with
+it that feed its functions. No function of aegc's own is involved.
 
 Every running engine pushes the lease schedules forward while the deployment is `running` or
 `capped`, every hour (or every third of the lease, if that's shorter), so a deployment with an
@@ -272,7 +334,7 @@ instead.
   while tasks were still running on AWS
   ([globus/globus-compute#2233](https://github.com/globus/globus-compute/issues/2233)). An idle
   process costs a few SQS long polls; AWS capacity drains itself regardless.
-- **EventBridge Scheduler for the lease.** Its universal targets call SSM and Auto Scaling directly,
-  so the lease needs no Lambda function or always-on process.
+- **EventBridge Scheduler for the lease.** Its universal targets call SSM, Auto Scaling and Lambda
+  directly, so the lease needs no function of its own or always-on process.
 - **SQS limits shape the protocol.** A claim can't be extended past 12 hours, so walltime is capped
   at 41,400 s. Messages max out at 1 MiB, so large payloads go to S3.

@@ -6,6 +6,120 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+Lambda pools: a pool can run its env's worker image as an AWS Lambda function, fed by its SQS
+task queue, for short, bursty tasks that shouldn't wait for a worker to boot or pay for one to
+idle. Stop, caps, the lease and the TTL freeze them, spend limits count them from Lambda's own
+metrics, and status, metrics and provenance show them. Their tasks aren't isolated. Validated
+live; see the [performance page](docs/reference/performance.md#v07-live-run-2026-11-23).
+
+### Added
+- **Lambda pools** (#21, #75, #76, #77, #78): `aegc deploy --pool
+  <env>:lambda[,memory=MiB,timeout=S,concurrency=N,tmp=MiB,walltime=S,max_walltime=S,python=3.NN]`
+  adds the pool `<env>-py<NNN>-lambda`: its task and dead-letter queues, a function role
+  `aegc-<d>-<pool>-<region>` (inline policy `aegc-function`, plus the deployment's grants), an
+  arm64 image function `aegc-<d>-<pool>` running the pool's image by digest with the command
+  `aegc-worker lambda`, logging to `/aegc/<d>`, and an SQS event source mapping (batch size 1,
+  `ReportBatchItemFailures`, `MaximumConcurrency`). Memory 1,024–10,240 MiB (default 2048),
+  timeout 60–1,800 s (default 900), concurrency 2–1,000 (default 10), `/tmp` 512–10,240 MiB;
+  walltime and its maximum default to the timeout less 20 s. EC2 options are refused on Lambda
+  pools and Lambda options on EC2 pools; a redeploy keeps options not given, and walltimes
+  derived from the timeout follow a new one. `deploy` refuses images built before aegc 0.7
+  (`--allow-old-image` skips the check), images over 10 GiB compressed, and function or role
+  names over 64 characters, before changing anything, and waits for the function to settle.
+  `--prune --yes`, `destroy`, verification and `footprint` cover the mappings, functions and
+  function roles, each ownership-checked (a mapping is aegc's when its function has aegc's name
+  and the mapping carries the tags). See [Run short tasks on Lambda](docs/how-to/lambda-pools.md).
+- **`aegc-worker lambda`:** a Lambda Runtime API client in the standard library, so worker images
+  need no `awslambdaric` (a compiled extension without wheels for every Python aegc images use)
+  and nothing else new. Each invocation runs one SQS record on the same message path as an EC2
+  worker (new `aegc.worker.process`), with the walltime clamped to the invocation's remaining
+  time less 20 s, scratch and `HOME` under `/tmp/aegc`, the deployment state read at most every
+  60 s, the forkserver started at init, and failed records returned as `batchItemFailures`.
+  Results carry Lambda provenance (`backend: lambda`, function, version, memory, request id, log
+  stream, estimated cost).
+- **Routing:** a task goes to a Lambda pool only when it names it (`user_endpoint_config`
+  `pool`) or when only Lambda pools serve its env and Python. A `walltime_s` over the function's
+  timeout less 20 s fails at submission with `AEGC_CONFIGURATION`, naming the timeout. `cpus` and
+  `memory_gib` are checked against the function's memory and its vCPUs (one per 1,769 MB).
+- **Freezing Lambda pools:** `aegc stop`, spend caps (engine and `aegc evaluate`), and the lease
+  and TTL disable each pool's event source mapping; `aegc resume` and `aegc limits --resume`
+  enable it. The `lease-<pool>` and `ttl-<pool>` schedules use Scheduler's universal target
+  `aws-sdk:lambda:updateEventSourceMapping`. Engines (every scaler pass) and `aegc evaluate`
+  (every 5 minutes) keep each mapping in line with the deployment state, so a cap that ends at the
+  end of its period turns its Lambda pools back on, and a mapping disabled by hand while the
+  deployment runs is enabled again. A redeploy never enables a mapping. Running invocations finish
+  on a stop, `--hard` included.
+- **Lambda spend** from Lambda's own `Duration` and `Invocations` metrics per function, plus a new
+  `InitSeconds` metric the handler writes once per execution environment (container images are
+  billed for init, about 5 s), priced at static arm64 rates ($0.0000133334 per GB-second, $0.20
+  per million requests). `aegc cost` (as `lambda-<memory>MB` by type), `aegc status` and the
+  spend limits include it; it counts toward the dollar limits, not instance-hours. Admission
+  doesn't hold Lambda pools back; their running rate counts against EC2 pools' headroom.
+- **`aegc status`** shows a Lambda pool's function, memory, concurrency and mapping state, what one
+  task gets, its rate now and the worst case for its running tasks; `--json` adds `kind`,
+  `lambda_text` and `mapping`. **`aegc metrics`** shows a Lambda pool's largest concurrent
+  executions and its throttles (`AWS/Lambda`). **`aegc provenance`** prints the function and
+  request.
+- **IAM:** `aegc iam-policy lambda-deployer`, for `deploy`, `destroy`, `stop`, `resume`, `status`
+  and `footprint` of Lambda pools next to the deployer policy (which is near the managed-policy
+  size limit): `aegc-*` functions created with the `aegc:managed=true` tag and changed only when
+  they carry it, their mappings, `iam:PassRole` of `/aegc/` roles to Lambda only, and the `aegc/*`
+  repositories' policies. The operator policy gains `FreezeLambdaPools` (update mappings that feed
+  the deployment's functions and carry its tag), `ReadLambdaPools` and
+  `lambda:ListEventSourceMappings`; the cloud endpoint's role inherits them. The scheduler role
+  may update the same mappings. `deploy` adds a statement `AegcLambdaPull` to the `aegc/<env>`
+  repository policy, letting the Lambda service pull for `aegc-*` functions in the account and
+  region; `destroy` leaves it.
+- Docs: [Run short tasks on Lambda](docs/how-to/lambda-pools.md), and Lambda pools in the
+  architecture, when-to-use, delivery, security, cost, configuration, operations, observability,
+  images, troubleshooting and reference pages, with the
+  [v0.7 live run](docs/reference/performance.md#v07-live-run-2026-11-23).
+
+### Changed
+- `aegc image build` pushes with `--provenance=false --sbom=false`, so an image's digest is a
+  single manifest, not an index with attestations; Lambda pools run the same digest.
+- The task queue of a Lambda pool has a visibility timeout of 6 times the function's timeout (at
+  most 12 h), as AWS advises for SQS event sources, and the handler sets each record's own
+  visibility to its invocation's deadline plus 60 s when it starts, so a task that crashes its
+  environment is retried after that rather than after 6 times the timeout.
+- Endpoints, cloud endpoints and the CLI need aegc 0.7 for a deployment with Lambda pools: older
+  engines and evaluators expect every pool to have an Auto Scaling group. Update the operator
+  policy, rebuild the endpoint image, and attach lambda-deployer; see
+  [Upgrade to v0.7](docs/how-to/operations.md#upgrade-to-v07).
+- The vCPU quota preflight in `deploy` and `status` leaves Lambda pools out. The account's Lambda
+  concurrency isn't checked.
+- The EC2 worker agent uses the shared message path (`aegc.worker.process`); its behaviour is
+  unchanged.
+- Tests run against substrate v0.131.0, which drops the shims for substrate #1522, #1594, #1620,
+  #1622 and #1623.
+
+### Fixed
+- Found in review, before release: Lambda spend came from per-environment ledger records that the
+  function role, and so task code, could write, and that an invocation timing out never wrote;
+  it now comes from Lambda's metrics, and the function role has no ledger access. Admission
+  counted every Lambda pool at its full concurrency, holding EC2 pools back under a cap while
+  Lambda was idle; it now uses the running rate. The queue's visibility was the function's
+  timeout plus a minute (now 6 times the timeout, with per-record deadlines); the first task in
+  an environment lost time to starting the forkserver (now started at init); the minimum memory was 128 MB (now 1 GiB, which
+  the runtime, the forkserver and the task share). The operator's mapping reads were
+  tag-conditioned, which the Lambda guide says `GetEventSourceMapping` doesn't take, so a denied
+  read could leave a frozen pool frozen; they're unconditioned now. Reconciling mappings could
+  undo a stop that landed while it enabled them (it now re-reads the state before changing
+  anything and again after enabling), and mappings whose state couldn't be read are reported.
+- Found in the live run: Scheduler's universal target refused `UUID` (it wants the SDKs' field
+  name, `Uuid`), so the lease and TTL couldn't disable mappings. And Lambda's `Duration` leaves out
+  init, which container images are billed for; the new `InitSeconds` metric counts it.
+
+### Security
+- **Lambda pools aren't isolated.** Lambda gives the role's credentials to the process and has no
+  uid to drop to, so task code runs with the pool's function role. That role is scoped to its own
+  task queue, but it can read every task payload of the deployment (`payloads/<d>/tasks/*`,
+  isolated EC2 pools' included) and write result payloads and send to every result queue, so a
+  task could forge a result for another pool's task. `deploy` prints a note for every Lambda pool,
+  and `PoolSpec` refuses `isolate_tasks` for them. Keep untrusted functions on isolated EC2 pools
+  in a deployment without Lambda pools. Per-pool payload prefixes are tracked in #80.
+- Execution environments are reused, so `/tmp` persists between tasks on the same environment.
+
 ## [0.6.0] - 2026-11-23
 
 A cloud-hosted endpoint, and tutorials that show what aegc is for: the endpoint runs on a small

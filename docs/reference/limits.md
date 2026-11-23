@@ -1,7 +1,7 @@
 # Limits
 
-Values on the main branch (v0.4 in progress). Most are constants in the source; the SQS, EC2 and
-Globus Compute limits are the services'.
+Values for v0.7. Most are constants in the source; the SQS, EC2, Lambda and Globus Compute
+limits are the services'.
 
 ## Tasks
 
@@ -57,6 +57,28 @@ Globus Compute limits are the services'.
 | Instances | Graviton (arm64) only; no GPUs |
 | Spot capacity | your account's Spot vCPU quota for standard instances (`L-34B43A08`; AWS's default is 5), checked by `aegc deploy` and `aegc status` against the sum of the pools' `max_vcpus` |
 
+## Lambda pools
+
+| Limit | Value |
+|---|---|
+| Function memory (`memory=`) | 1,024–10,240 MiB, default 2,048; aegc's minimum is 1 GiB (Lambda's is 128 MB) |
+| vCPUs per task | memory ÷ 1,769 MB, at most 6 (about 1.16 at 2,048 MB); one task per execution environment |
+| Function timeout (`timeout=`) | 60–1,800 s, default 900 |
+| Mapping concurrency (`concurrency=`) | 2–1,000, default 10 (Lambda's `MaximumConcurrency` range) |
+| `/tmp` (`tmp=`) | 512–10,240 MiB, default 512 |
+| Walltime | default and maximum: the timeout less 20 s (1,780 s at most); at run time, at most the invocation's remaining time less 20 s |
+| Task queue visibility | 6 × the timeout, at most 43,200 s; a started record's: its invocation's remaining time + 60 s |
+| Batch size | 1 record per invocation, with partial batch responses |
+| Deployment state, per execution environment | read at most every 60 s |
+| Image size | refused by `deploy` above 10 GiB compressed (as ECR reports it); Lambda's limit is 10 GB uncompressed |
+| Function environment | 4 KB for `AEGC_WORKER_CONFIG_B64` and `AEGC_IMAGE` (Lambda's limit), which bounds the grants a deployment with Lambda pools can have |
+| `deploy` wait for a function to settle | up to 900 s |
+| Mapping follows the state | every engine scaler pass (10 s) and every cloud endpoint `aegc evaluate` (5 min) |
+| Spend from Lambda's metrics | hourly sums (windows rounded out to whole hours), re-read every 300 s while limits are set |
+| Price | static, arm64: $0.0000133334 per GB-second, $0.20 per million requests (us-west-2, 2026-11-23) |
+| Account concurrency | not checked by aegc; Lambda's default is 1,000 per region, and new accounts can have less |
+| Isolation | none: tasks run with the function role (`PoolSpec` refuses `isolate_tasks` for Lambda pools) |
+
 ## Spend, state and lease
 
 | Limit | Value |
@@ -87,13 +109,15 @@ Globus Compute limits are the services'.
 | Limit | Value |
 |---|---|
 | Deployment name | 1–20 characters of `[a-z0-9-]`; starts with a letter; no trailing `-`, no `--` |
-| Pool name | the same rules, up to 40 characters; derived as `<env>-py<NNN>`, or `<env>-py<NNN>-<size>` |
-| Env name usable in a deployment | at most 34 characters, so the pool name fits in 40; with `size=`, 27 for `medium`, 30 for `mem`, 28 for the others |
+| Pool name | the same rules, up to 40 characters; derived as `<env>-py<NNN>`, `<env>-py<NNN>-<size>`, or `<env>-py<NNN>-lambda` |
+| Env name usable in a deployment | at most 34 characters, so the pool name fits in 40; with `size=`, 27 for `medium`, 30 for `mem`, 28 for the others; 27 for a Lambda pool |
+| Lambda function and function role names | `aegc-<d>-<pool>` and `aegc-<d>-<pool>-<region>`, at most 64 characters each |
 | Pools per env per deployment | one per recorded Python minor and size class |
 | Recorded images per env | one per Python minor |
 | Images kept per ECR repository | the 10 most recent, plus any with an `inuse-` tag; untagged images expire after a day; shared by all of an env's minors |
 | Worker image sources | aarchsci environments, aarchbio tools, any pinned `linux/arm64` image with Python ≥ 3.11 (`--base`), or an image you built with aegc ≥ 0.3 in it, running as root or uid 57439 (`image register`) |
 | Task isolation, JSON logs, metrics, provenance | images with aegc ≥ 0.4 |
+| Lambda pools | images with aegc ≥ 0.7 |
 
 ## Grants and outputs
 

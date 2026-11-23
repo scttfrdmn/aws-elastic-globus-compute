@@ -307,6 +307,34 @@ An image for a Python minor the env didn't have doesn't change the deployment by
 redeploy notes it, and `--pool geospatial:python=3.15` adds `geospatial-py315` next to the existing
 pool. A pool you stop listing is kept, with a warning; pass `--prune --yes` to remove it.
 
+## Images for Lambda pools
+
+A [Lambda pool](lambda-pools.md) runs the same image as an EC2 pool, as a Lambda function whose
+command is `aegc-worker lambda`. That command speaks Lambda's Runtime API itself, so the image
+needs nothing added for Lambda, but:
+
+- **It needs aegc 0.7 or later.** `deploy` refuses older images for Lambda pools (`a Lambda pool
+  needs a worker image built with aegc 0.7 or later ...`); rebuild, or register an image with the
+  current aegc wheel in it. `--allow-old-image` skips the check, and the function then fails at
+  start.
+- **One manifest per image.** `aegc image build` pushes with `--provenance=false --sbom=false`, so
+  the digest is a single arm64 image, not an index with attestations. `register` pushes from your
+  local Docker, which gives the same.
+- **At most 10 GB.** Lambda refuses images over 10 GB uncompressed. `deploy` checks the size ECR
+  reports, which is compressed, and refuses an image over 10 GiB; an image just under that may
+  still be too large once uncompressed, and Lambda then says so when `deploy` creates or updates
+  the function. The largest science images may only fit EC2 pools.
+- **The entrypoint stays.** Only the command is replaced, so conda images' entrypoint still
+  activates the environment, and pip images keep `ENTRYPOINT []`.
+- **Writable paths.** Lambda's file system is read-only except `/tmp`. The handler puts task
+  scratch in `/tmp/aegc`, and sets `HOME` to `/tmp/aegc/home` when the image's `HOME` isn't
+  writable.
+
+`deploy` also adds the statement `AegcLambdaPull` to the `aegc/<env>` repository policy, so the
+Lambda service may pull for functions named `aegc-*` in the account and region. It's left in place
+by `destroy`, like the repository. See
+[Resources and tags](../reference/resources.md#lambda-pool-aegc-deploy-pool-envlambda).
+
 ## Old images and in-use tags
 
 The repository's lifecycle policy keeps the 10 most recent images, removes untagged images after a
@@ -331,7 +359,8 @@ new builds. An env's images for every Python minor share one repository, and so 
   nothing. `--direct` pulls an aarchsci or aarchbio base from quay.io instead of the ECR cache.
 - **Env names of at most 34 characters.** The pool name `<env>-py<NNN>` must fit in 40 characters,
   and a [size class](configuration.md#size-classes) adds `-<size>`: with `size=medium`, envs can
-  have at most 27. Every aarchsci env fits; the longest, `earth-observation`, gives
+  have at most 27, and so can envs with a Lambda pool (`-lambda`). Every aarchsci env fits; the
+  longest, `earth-observation`, gives
   `earth-observation-py314`.
 - **Python must match the clients.** The aarchsci images run Python 3.14. For clients on another
   minor, add an image for it, as [above](#several-python-minors-per-env).

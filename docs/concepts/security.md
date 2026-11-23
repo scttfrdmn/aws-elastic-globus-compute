@@ -6,6 +6,9 @@
   AMQPS on port 5671 to Globus, and HTTPS to AWS APIs. Workers make outbound HTTPS calls to SQS,
   S3, ECR, CloudWatch Logs, STS and Auto Scaling. In isolated pools the worker agent serves task
   credentials on `127.0.0.1` only, behind a token (see [Task isolation](#task-isolation)).
+- **Lambda pools' functions** run without a VPC configuration, in Lambda's own network, and
+  make the same outbound calls as workers. Nothing invokes them but their SQS event source
+  mapping.
 - **Workers have no ingress.** The deployment's security group, `aegc-<d>-workers`, has no inbound
   rules; the [cloud endpoint](#the-cloud-endpoint)'s host uses it too. Instances have no SSH key
   pair. They run in the default VPC's default subnets, which give
@@ -23,12 +26,14 @@
 |---|---|---|
 | **worker** role, `aegc-<d>-worker-<region>` | The worker agent on each instance, through an instance profile | The deployment's task queues (receive, delete, extend), its result queues (send), `payloads/<d>/tasks/*` (read) and `payloads/<d>/results/*` (write), pulls from `aegc/*` ECR repositories, its log group, terminating instances in the deployment's worker groups (tagged `aegc:role=asg`), reading the deployment's state and manifest, writing `ledger/<d>/*`, and assuming the task role; plus `aegc-grants` while pools or instances with images from before aegc 0.4 remain |
 | **task** role, `aegc-<d>-task-<region>` | Task code in [isolated](#task-isolation) pools, with credentials the agent hands it | Reading the deployment's manifest (`aegc-task`, for `aegc.outputs`), and with grants, reading or writing under your granted S3 prefixes (`aegc-grants`). Nothing else. Only the worker role may assume it |
-| **operator** | The endpoint container's AWS credentials | Reading the deployment's parameters, sending tasks, creating and reading its own result queues, payloads, `SetDesiredCapacity` and `UpdateAutoScalingGroup` on the deployment's worker groups (tagged `aegc:role=asg`), receiving and deleting on its task queues, writing its state, reading its ledger, prices and Cost Explorer, renewing its lease, and searching its log group (`aegc provenance`) |
+| **function** role, `aegc-<d>-<pool>-<region>` | Task code and `aegc-worker lambda` in a [Lambda pool](#lambda-pools); one role per Lambda pool | Receiving, deleting and releasing on its own pool's task queue, sending to the deployment's result queues, `payloads/<d>/tasks/*` (read) and `payloads/<d>/results/*` (write), reading the deployment's state and manifest, its log group, pulling its env's image; plus `aegc-grants`. No cost ledger, Auto Scaling or task role |
+| **operator** | The endpoint container's AWS credentials | Reading the deployment's parameters, sending tasks, creating and reading its own result queues, payloads, `SetDesiredCapacity` and `UpdateAutoScalingGroup` on the deployment's worker groups (tagged `aegc:role=asg`), receiving and deleting on its task queues, writing its state, reading its ledger, prices and Cost Explorer, renewing its lease, searching its log group (`aegc provenance`), and enabling and disabling its Lambda pools' event source mappings |
 | **deployer** | Whoever runs `aegc deploy`, `destroy`, `stop`, `resume` | Creates conditioned on the `aegc:managed=true` request tag, changes and deletes on the resource tag where the service supports it; IAM limited to the `/aegc/` path; roles passed only to EC2 and EventBridge Scheduler |
+| **lambda-deployer** | Whoever runs `aegc deploy`, `destroy`, `stop`, `resume` on a deployment with Lambda pools, with the deployer policy | Functions named `aegc-*` (created with the `aegc:managed=true` request tag, changed and deleted when they carry it), their event source mappings, passing `/aegc/` roles to Lambda only, and the `aegc/*` repositories' policies |
 | **endpoint** role, `aegc-<d>-endpoint-<region>` | The [cloud endpoint](#the-cloud-endpoint)'s host, through an instance profile | The operator policy, plus reading its own login secret, pulling `aegc/endpoint`, writing its log streams, `PutMetricData` in `aegc/endpoint`, marking its own instance unhealthy, and deleting the deployment's result queues |
 | **endpoint-deployer** | Whoever runs `aegc endpoint deploy`, `undeploy`, `status`, with the deployer policy | Creating, updating and deleting the login secret (never reading it), the offline alarm and its SNS topic, and the host's instance refresh |
 | **bootstrap** | Whoever runs `aegc bootstrap`, `unbootstrap` | The payload bucket, the pull-through cache and its template and role, `/aegc/bootstrap`; roles passed only to ECR |
-| **scheduler** role, `aegc-<d>-scheduler-<region>` | EventBridge Scheduler, when the lease or TTL fires | Writing the deployment's state parameter and updating groups tagged with the deployment |
+| **scheduler** role, `aegc-<d>-scheduler-<region>` | EventBridge Scheduler, when the lease or TTL fires | Writing the deployment's state parameter, updating groups tagged with the deployment, and updating event source mappings tagged with it that feed its functions |
 
 The endpoint container mounts `~/.aws` read-only and uses `AWS_PROFILE` if it's set. For anything
 beyond a trial, give it a profile with only the operator policy rather than an administrator
@@ -36,8 +41,9 @@ profile. `aegc image build` uses the separate [builder policy](../reference/iam.
 
 ## Task isolation
 
-A task is arbitrary Python from whoever submitted it. In pools whose worker images were built with
-aegc 0.4 or later, it runs apart from the worker agent and without the worker role:
+A task is arbitrary Python from whoever submitted it. In EC2 pools whose worker images were built
+with aegc 0.4 or later, it runs apart from the worker agent and without the worker role
+([Lambda pools](#lambda-pools) aren't isolated):
 
 - **The agent runs as root, with little else.** The worker container runs with `--user 0`,
   `no-new-privileges` and all capabilities dropped except the six it needs to start, own and
@@ -91,7 +97,8 @@ who may submit to an endpoint, and
 which registered functions it runs.
 
 Spend limits guard against runaway scaling and forgotten deployments, not against the code you run:
-anyone who can submit can keep a pool busy up to its `max_vcpus`. Keep an AWS Budget on the
+anyone who can submit can keep a pool busy up to its `max_vcpus`, or a Lambda pool up to its
+concurrency. Keep an AWS Budget on the
 account as well.
 
 The worker only ever invokes Globus Compute's `execute_task` on a message; it never imports a
@@ -119,6 +126,33 @@ running worker launched before its pool was isolated, still runs tasks with the 
 `deploy` keeps `aegc-grants` on the worker role too. Workers of isolated pools carry the instance
 tag `aegc:isolated=true`; once no untagged workers remain, the next deploy deletes the worker
 role's copy of the grants. See [Upgrade from v0.3](../how-to/operations.md#upgrade-from-v03).
+
+## Lambda pools
+
+[Lambda pools](../how-to/lambda-pools.md) run tasks without any of the isolation above. Lambda
+gives the function role's credentials to the process in environment variables and has no uid to
+drop to, so task code runs with the pool's **function role**, `aegc-<d>-<pool>-<region>`. aegc
+keeps that role narrow: its own pool's task queue, no cost ledger (Lambda spend comes from
+Lambda's own metrics), no Auto Scaling, no task role. But payloads and results aren't kept per
+pool yet, so a task on a Lambda pool can:
+
+- read every task payload of the deployment under `payloads/<d>/tasks/`, including those of
+  isolated EC2 pools;
+- write result payloads under `payloads/<d>/results/` and send to every result queue of the
+  deployment, so it could forge a result for another pool's task;
+- use every grant of the deployment, as any task can;
+- read the deployment's state and manifest.
+
+Per-pool payload prefixes, a function role scoped to its pool's, and results checked against
+their task's pool are tracked in
+[#80](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/80). Until then, **keep
+untrusted functions on isolated EC2 pools in a deployment without Lambda pools.** Every
+`aegc deploy` with a Lambda pool prints a note saying so, and a pool can't be both a Lambda pool
+and isolated.
+
+Execution environments are reused between invocations, one task at a time: `/tmp`, where the
+task scratch (`/tmp/aegc`) and `HOME` live, persists from one task to the next in the same
+environment.
 
 ## Data access
 
@@ -171,7 +205,12 @@ removes only inline policies). Use grants instead.
 
 ## Images
 
-- Worker images are pinned by digest in the launch template; a tag is never resolved at boot.
+- Worker images are pinned by digest in the launch template, and in a Lambda pool's function; a
+  tag is never resolved at boot.
+- For Lambda pools, `deploy` adds the statement `AegcLambdaPull` to the `aegc/<env>` repository
+  policy: the Lambda service may pull, for functions named `aegc-*` in the account and region
+  only (`aws:sourceArn`). Other statements in the policy are left alone. Without it,
+  `CreateFunction` would add an unconditioned statement of its own.
 - ECR repositories `aegc/<env>` have immutable tags and scan on push.
 - aarchsci and aarchbio bases come from quay.io through the `aegc-quay` pull-through cache. Other
   bases (`aegc image build --base`) and registered images (`aegc image register`) are pulled from

@@ -155,6 +155,22 @@ Points to know:
 - **A redeploy is per pool name.** `--pool geospatial:size=mem` and `--pool geospatial` are
   different pools, so to change a sized pool, give its `size=` again.
 
+## Add a Lambda pool
+
+For short, bursty tasks, a pool can be a Lambda function instead of an Auto Scaling group:
+
+```sh
+aegc deploy e2e --pool geospatial --pool geospatial:lambda,memory=4096,timeout=300,concurrency=20
+```
+
+This adds `geospatial-py314-lambda` next to `geospatial-py314`. A Lambda pool takes `memory=`
+(1,024–10,240 MiB, default 2048), `timeout=` (60–1,800 s, default 900), `concurrency=` (2–1,000,
+default 10), `tmp=` (512–10,240 MiB), `walltime=`, `max_walltime=` (at most the timeout less
+20 s) and `python=`; the EC2 options above don't apply. Tasks go to it only when they name it with
+`pool`, or when only Lambda pools serve their env and Python. Its tasks aren't isolated, and it
+needs images built with aegc 0.7 and the lambda-deployer policy. See
+[Run short tasks on Lambda](lambda-pools.md).
+
 ## Set spend limits
 
 ```sh
@@ -197,7 +213,8 @@ need to restart them. An endpoint that started before the deployment existed doe
 A pool you leave out of a redeploy is kept, with a warning, and stays in the manifest, the lease
 and `aegc stop`/`resume`. To remove it, pass `--prune --yes`. `--prune` alone is a dry run of the
 removal: it reports what it would delete, and the rest of the deploy goes ahead. With `--yes` it
-deletes the pool's group, launch template and queues. Before changing anything, it refuses if a
+deletes the pool's group, launch template and queues (for a Lambda pool, its event source
+mapping, function, function role and queues). Before changing anything, it refuses if a
 pool to be removed has queued or running tasks; `--force` removes it anyway, losing them.
 
 ```sh
@@ -209,8 +226,9 @@ New instances pick up a changed launch template; running ones keep what they boo
 drain.
 
 A redeploy doesn't change the [deployment state](../concepts/architecture.md#deployment-state).
-While the deployment is stopped, capped or expired, a redeploy keeps every group's minimum at 0,
-and `aegc resume` sets them from `min_vcpus`.
+While the deployment is stopped, capped or expired, a redeploy keeps every group's minimum at 0
+and every Lambda pool's event source mapping disabled, and `aegc resume` sets the minimums from
+`min_vcpus` and enables the mappings.
 
 Images built with aegc before 0.2 are refused, because their workers ignore spend limits, `aegc
 stop` and the lease, and write no cost ledger. Rebuild them, or pass `--allow-old-image` to deploy
@@ -256,9 +274,11 @@ with Executor(
 
 - `env` selects the science environment. Without it, the env given to `configure` applies.
 - `size`, or `cpus` and `memory_gib`, choose the pool's [size class](#size-classes); `pool` names
-  an exact pool instead.
-- `walltime_s` (1 to the pool's `max_walltime`, at most 41,400) replaces the pool's default
-  `walltime`, else 39,600.
+  an exact pool instead. `pool` is also how tasks reach a
+  [Lambda pool](lambda-pools.md#send-tasks-to-it) in an env that has EC2 pools too:
+  `{"pool": "geospatial-py314-lambda"}`.
+- `walltime_s` (1 to the pool's `max_walltime`, at most 41,400; on a Lambda pool, at most the
+  function's timeout less 20 s) replaces the pool's default `walltime`, else 39,600.
 - The endpoint's schema accepts only these keys and checks their types; anything else is refused
   before it reaches aegc.
 - The options apply to every task from that executor. Globus Compute starts a separate user

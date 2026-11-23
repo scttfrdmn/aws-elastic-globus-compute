@@ -18,6 +18,10 @@ nothing needs an inbound port or a cluster to look after.
   endpoint; only the endpoint id changes.
 - **Spot pricing.** Pools use Spot by default. An interrupted task is released at once and rerun
   on another worker.
+- **Short, bursty tasks without the boot wait.** A [Lambda pool](../how-to/lambda-pools.md) runs
+  the same image as a Lambda function: the first result came back in 3.5 s from idle in the live
+  run, and nothing runs, or costs, between bursts. Tasks get at most 30 minutes, cost about 4 to
+  5 times Spot per vCPU-hour while they run, and aren't isolated.
 
 ## Limits and weak spots
 
@@ -28,7 +32,8 @@ These are the current limits. Numbers come from the live run in
   SQS round trips and starts a fresh process. Batch work so each task runs for at least about 10 s.
 - **Cold start.** From zero workers, the first result took 39 s (46 s on a second cold run). Larger
   images take longer to pull. Set `min_vcpus=` on a pool to keep workers warm, at the cost of paying for
-  them.
+  them, or send short tasks to a [Lambda pool](../how-to/lambda-pools.md) (3.5 s to the first
+  result; about 5 s of init per execution environment).
 - **The endpoint runs somewhere you keep running.** By default it's a container on your laptop,
   and tasks reach AWS only while it's running. Results produced while it's down wait in SQS for up
   to 14 days and are delivered when it comes back. To take tasks with the laptop closed, for
@@ -39,7 +44,8 @@ These are the current limits. Numbers come from the live run in
   have several). A client on a minor with no image gets an error, not a result.
 - **Walltime is capped at 41,400 s (11.5 h)**; the default is 39,600 s (11 h). SQS can't hold a
   claim past 12 hours. Longer tasks are tracked in
-  [#19](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/19).
+  [#19](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/19). On a Lambda pool,
+  tasks get at most the function's timeout less 20 s, 1,780 s at most.
 - **Payload size.** Globus Compute itself limits task and result sizes (about 10 MB). aegc's S3
   offload only covers the hop between the endpoint and the workers. Write large outputs to S3 with
   [`aegc.outputs`](../how-to/data.md#return-large-outputs) and return the URI.
@@ -54,9 +60,11 @@ These are the current limits. Numbers come from the live run in
   base, or as a registered image with aegc 0.3 or later in it; see
   [Worker images](../how-to/images.md).
 - **Spend limits are estimates.** They count instance time, volumes and IPv4 addresses from the
-  workers' own ledger, are checked only while an endpoint runs, and can be overshot by a few
+  workers' own ledger, and Lambda pools' time from Lambda's metrics, are checked only while an
+  endpoint runs, and can be overshot by a few
   minutes of spend plus running tasks. See [Spend limits](cost.md#spend-limits).
-- **No GPUs, no MPI, arm64 only.** Pools are Graviton CPU instances. Software that only ships for
+- **No GPUs, no MPI, arm64 only.** Pools are Graviton CPU instances, or arm64 Lambda functions.
+  Software that only ships for
   x86-64 won't run.
 - **Spot vCPU quota.** A pool can't grow past the account's Spot quota for standard instances. When
   it's exhausted the group stays below its desired capacity; `aegc status` shows the scaling error.
@@ -72,6 +80,11 @@ These are the current limits. Numbers come from the live run in
   its grants, and tasks on a worker share a uid, so they can see each other's processes and
   files. Give separate groups separate deployments. See
   [Task isolation](security.md#task-isolation).
+- **Lambda pools aren't isolated.** Their tasks run with the pool's function role, which can read
+  every task payload of the deployment and post results for any of its tasks. Keep untrusted
+  functions on isolated EC2 pools, in a deployment without Lambda pools
+  ([#80](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/80)). See
+  [Lambda pools](security.md#lambda-pools).
 - **Not high-assurance.** Task data goes to AWS; `AWSEngine` refuses high-assurance endpoints.
 - **Default VPC.** `aegc deploy` places workers in the region's default VPC and default subnets.
   Only us-west-2 has been tested live; see
@@ -79,8 +92,9 @@ These are the current limits. Numbers come from the live run in
 
 ## When to use something else
 
-- **Sub-second interactive calls:** the per-task overhead dominates. A Lambda backend for short tasks
-  is proposed in [#21](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/21).
+- **Sub-second interactive calls:** the per-task overhead dominates, even on a
+  [Lambda pool](../how-to/lambda-pools.md): every task still makes several SQS round trips and
+  starts a fresh process.
 - **GPU, MPI or tightly coupled jobs:** use an HPC cluster's Globus Compute endpoint, or AWS
   ParallelCluster or Batch.
 - **Tasks longer than 11.5 hours:** split them, or wait for #19.

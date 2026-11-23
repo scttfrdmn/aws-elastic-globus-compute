@@ -1,7 +1,8 @@
 # Cost
 
-With no tasks, an aegc deployment has no running instances. You pay for workers while they run,
-plus small amounts for storage and API requests. There is no NAT gateway, load balancer or
+With no tasks, an aegc deployment has no running instances. You pay for workers while they run
+(and for [Lambda pools](#lambda-pools), for the time their tasks run), plus small amounts for
+storage and API requests. There is no NAT gateway, load balancer or
 always-on instance, unless you choose to
 [run the endpoint in the cloud](../how-to/cloud-endpoint.md): one small on-demand instance, about
 $12 a month.
@@ -18,6 +19,7 @@ $12 a month.
 | Worker instances | From launch until the worker terminates itself, per second | Spot; see the table below |
 | Worker root volume (30 GiB gp3, 3,000 IOPS, 125 MiB/s by default) | While the instance exists | $0.08 per GB-month storage; 3,000 IOPS and 125 MiB/s are included, and each MiB/s above that is $0.04 per month: about **$0.0033 per worker-hour** (v0.1's 50 GiB at 500 MiB/s was $0.026) |
 | Public IPv4 address per worker | While the instance exists | $0.005 per hour |
+| [Lambda pools](#lambda-pools) | Each task's run time and each execution environment's init (about 5 s), per millisecond at the function's memory, plus each invocation | arm64: $0.0000133334 per GB-second and $0.20 per million requests (2026-11-23): $0.096 an hour per busy 2048 MB environment |
 | SQS requests | Every send, receive, delete, visibility change and attribute read; each 64 KB of a message counts as one request | $0.40 per million |
 | S3 payloads (bodies over 700 KB) | Until deleted after use, or expired after 15 days | $0.023 per GB-month, plus request charges |
 | ECR storage | Worker images in `aegc/<env>` (the 10 most recent builds, plus any older image a deployment still uses) and the cached bases in `aegc-quay/…` | $0.10 per GB-month |
@@ -90,7 +92,7 @@ aegc limits e2e                             # show them
 |---|---|
 | `--max-usd-day N` | Estimated dollars since 00:00 UTC |
 | `--max-usd-month N` | Estimated dollars since the 1st of the month, 00:00 UTC |
-| `--max-instance-hours-day N` | Instance-hours since 00:00 UTC, whatever the instance size |
+| `--max-instance-hours-day N` | Instance-hours since 00:00 UTC, whatever the instance size (Lambda time isn't instance-hours) |
 
 The limits live in the deployment's manifest and are kept across redeploys. Running endpoints pick
 up a change within a minute. `aegc deploy` prints a note when a deployment has no limit.
@@ -107,6 +109,9 @@ workers. A new worker is priced high on purpose: the most expensive allowed inst
 (or on-demand) price per vCPU, times the pool's smallest worker, plus its volume and IPv4 address.
 The instance-hour limit works the same way with instances instead of dollars. When admission holds
 a pool back, the engine logs `spend limits admit N of M more vCPUs`, and tasks wait in the queue.
+Lambda pools aren't admitted, since aegc doesn't scale them; what their running tasks cost now
+(one busy execution environment per task in flight) counts against the EC2 pools' headroom, and
+a Lambda burst is stopped by the cap below.
 
 For example, with `--max-usd-day 5`, $1 spent, and nothing running, the deployment may add workers
 costing up to $4 / (1 h × 1.2) ≈ $3.33 an hour. The window is a full hour at any time of day, even
@@ -118,7 +123,8 @@ fails its waiting tasks for that pool with `AEGC_BUDGET_EXCEEDED` after 10 minut
 leave them queued below a cap that may never trip. Raise a limit to run them.
 
 **The cap, once a limit is reached.** When estimated spend in the period reaches a limit, the
-engine sets the deployment's state to `capped` and lowers every group's minimum to 0. Then:
+engine sets the deployment's state to `capped`, lowers every group's minimum to 0 and disables
+every Lambda pool's event source mapping. Then:
 
 - new tasks fail at once with `AEGC_BUDGET_EXCEEDED` and a message saying which limit, until when,
   and how to raise it;
@@ -127,8 +133,10 @@ engine sets the deployment's state to `capped` and lowers every group's minimum 
 - with `--on-cap fail` (the default), running tasks finish and then their workers leave; with
   `--on-cap kill`, running tasks fail at once with `AEGC_BUDGET_EXCEEDED` and the workers leave.
 
-None of these failures is retried. A cap lasts until the end of its UTC day or month, when the
-deployment runs again by itself and the engine puts back the group minimums it lowered. To end it
+On a Lambda pool, invocations already running finish either way. None of these failures is
+retried. A cap lasts until the end of its UTC day or month, when the deployment runs again by
+itself, the engine puts back the group minimums it lowered, and engines (or a cloud endpoint's
+`aegc evaluate`) enable the Lambda pools' mappings again. To end it
 sooner, raise the limit and resume:
 
 ```sh
@@ -148,6 +156,9 @@ expire meanwhile.
   every 5 minutes, so a cap trips up to about 10 minutes after the limit is reached. With
   `--on-cap fail`, running tasks then finish, which can take up to their walltime. Auto Scaling can
   also launch an instance larger than the vCPUs asked for. Use `--on-cap kill` for a firmer limit.
+  Lambda's metrics also arrive a few minutes late, and admission doesn't hold Lambda pools back,
+  so a Lambda pool can run at its full concurrency until the cap trips, and its running
+  invocations finish after that whatever `--on-cap` says. Its `concurrency=` bounds the rate.
 - **They need a running endpoint.** Only engines check spend, and a cloud endpoint's
   `aegc evaluate`, and the engine that trips a cap writes the state with the
   [operator policy](../reference/iam.md#operator)'s permissions. Engines run only in user endpoint
@@ -157,7 +168,8 @@ expire meanwhile.
   out, but workers kept by `min_vcpus` keep running until the lease expires (48 hours by default; see
   [Architecture](architecture.md#lease-and-ttl)).
 - **They aren't a security boundary.** In [isolated](security.md#task-isolation) pools tasks can't
-  write ledger records, but anyone who can submit can still keep a pool busy up to its
+  write ledger records (nor in Lambda pools, which are counted from Lambda's own metrics), but
+  anyone who can submit can still keep a pool busy up to its
   `max_vcpus`. On workers from images built before aegc 0.4, task code runs with the worker role,
   which can write ledger records, so a task can make the estimate wrong. See
   [Security model](security.md).
@@ -174,7 +186,8 @@ is the day the instance booted (UTC). Readers look back 4 days before a period s
 the longest an instance can live (a 72-hour lifetime plus an 11.5-hour task). `aegc bootstrap` adds a lifecycle rule that deletes records after 400 days.
 `aegc destroy` leaves them, so you can still read a deployment's cost after it's gone.
 
-`aegc cost` reads the ledger and prices it:
+`aegc cost` reads the ledger and prices it, and adds the Lambda pools from Lambda's metrics
+([below](#lambda-pools)):
 
 ```sh
 aegc cost e2e                      # today (UTC)
@@ -186,7 +199,7 @@ aegc cost e2e --actual             # also ask Cost Explorer
 ```
 deployment e2e, 2026-11-14 00:00 UTC to 2026-11-14 16:20 UTC: about $0.4120 (9.52 instance-hours; prices: spot)
   geospatial-py314: $0.4120
-  estimate from the cost ledger: instance time x Spot or on-demand price, plus root volume and IPv4; SQS, S3, ECR, logs and data transfer aren't included
+  estimate from the cost ledger: instance time x Spot or on-demand price, plus root volume and IPv4; Lambda pools (lambda-<memory>MB, from Lambda's Duration and Invocations metrics): duration x memory, plus requests; SQS, S3, ECR, logs and data transfer aren't included
 ```
 
 Each record is charged from the instance's boot, so boot and the image pull count, to its last
@@ -215,7 +228,37 @@ is active, its data lags by up to a day, and each request costs $0.01.
 - A [cloud endpoint](../how-to/cloud-endpoint.md#cost)'s host, secret, alarm and metric: the
   ledger records workers only. `--actual` includes the host's instance and volume, which are
   tagged with the deployment.
-- Discounts, credits, Savings Plans and taxes.
+- Discounts, credits, Savings Plans, Lambda's free tier and taxes.
+
+## Lambda pools
+
+[Lambda pools](../how-to/lambda-pools.md) aren't in the cost ledger: their tasks run with the
+function role, so a record the function could write, task code could rewrite, and an invocation
+that times out never gets to write one. aegc reads what Lambda itself reports instead:
+
+- `Duration` and `Invocations` (namespace `AWS/Lambda`) for each pool's function, in hourly sums;
+- `InitSeconds` (namespace `aegc`), which the handler writes once per execution environment
+  before any task runs there. Lambda bills container images for init, about 5 s per environment
+  in the live run, and `Duration` leaves it out.
+
+It prices the billed seconds at the pool's memory with a static arm64 table (us-west-2, read
+2026-11-23; us-east-1's is the same): **$0.0000133334 per GB-second plus $0.20 per million
+requests**. One execution environment kept busy for an hour costs $0.048 at 1,024 MB, $0.096 at
+2048 MB (the default) and $0.48 at 10,240 MB. Per vCPU-hour (1 vCPU per 1,769 MB) that's about
+$0.083, against $0.017 to $0.024 for a Spot `.large` worker with its volume and IPv4 address:
+about 4 to 5 times Spot. But a Lambda pool costs nothing between tasks, while each EC2 worker is
+paid from boot until 5 minutes after its last task.
+
+`aegc cost` shows Lambda pools under their pool name, or with `--by type` as
+`lambda-<memory>MB`; the price source is `static`. The live run's 100 short tasks and a few
+longer ones came to `lambda-2048MB: $0.0139`, about 500 s at 2 GB plus init. The metric windows
+are whole hours, rounded out, so a window that doesn't start on the hour (`--since 90m`) runs a
+little high. Lambda's metrics need the deployment's manifest to find the functions, so once a
+deployment is destroyed `aegc cost` shows only the ledger. `aegc cost --actual` includes Lambda
+once `aegc:deployment` is an active cost allocation tag: functions carry it.
+
+The same figures count toward `--max-usd-day` and `--max-usd-month`; see
+[Spend limits](#spend-limits).
 
 ## Cost Explorer and cost allocation tags
 
@@ -256,6 +299,8 @@ $0.0154 estimated). Cost Explorer also lags by up to a day; `aegc cost` doesn't.
 - Set a spend limit, `--max-usd-day` or `--max-usd-month`, on every deployment.
 - Set `max_vcpus=` on every pool (the default is 8). The scaler never asks for more, and Auto
   Scaling enforces it, so a pool's cost is bounded whichever instance sizes Spot picks.
+- On a Lambda pool, `concurrency=` (default 10) is the bound: at most that many environments run
+  at once, so 2048 MB × 10 costs at most $0.96 an hour.
 - Keep the default `idle=300`. A longer idle period keeps workers, and their bills, around longer.
 - Don't set `min_vcpus=` unless you need warm workers; those workers run all the time.
 - Batch tiny tasks: per-task overhead costs worker time (see
@@ -277,7 +322,8 @@ aegc stop <d>                # queued tasks fail, running tasks finish, workers 
 aegc stop <d> --hard --yes   # running tasks fail too; stragglers are terminated after 2 minutes
 ```
 
-`aegc stop` sets the deployment's state to `stopped` and every group's minimum to 0. It works
+`aegc stop` sets the deployment's state to `stopped`, every group's minimum to 0, and disables
+every Lambda pool's event source mapping (Lambda invocations already running finish). It works
 without a running endpoint, because workers read the state themselves. `aegc resume <d>` undoes it.
 See [Operations](../how-to/operations.md#stop-and-resume).
 

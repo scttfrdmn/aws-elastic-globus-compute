@@ -52,6 +52,7 @@ These fail the task at once, without a retry, as `AEGC_CONFIGURATION`:
 | `no size='mem' pool for env 'x'; available: ...` | No pool of that size class for the env and the client's Python | Deploy one with `--pool x:size=mem`, or ask for another size |
 | `no pool for env 'x' gives a task N vCPUs and M GiB; available: ...` | Every pool's tasks get less than `cpus` or `memory_gib` | Deploy a larger [size class](configuration.md#size-classes), or ask for less |
 | `walltime_s must be between 1 and N` | Walltime out of range; N is the pool's `max_walltime`, at most 41,400 | Split the task, lower `walltime_s`, or redeploy the pool with a higher `max_walltime=` |
+| `walltime_s N is more than Lambda pool 'x' allows: its function ... times out after T s, so a task gets at most M s ...` | The task names a [Lambda pool](lambda-pools.md#walltime) and asks for more than its timeout less 20 s | Ask for less, raise the pool's `timeout=` (at most 1,800), or use an EC2 pool |
 
 Running engines re-read the manifest every minute, so a fixed deployment takes effect without a
 restart. The exceptions are `deployment ... not found` and `AWS setup failed`, which happen when
@@ -184,6 +185,21 @@ Check the pool in `aegc status`:
 
 The first task from zero workers takes about 40 s even when everything works.
 
+On a [Lambda pool](lambda-pools.md) there are no workers; check its line in `aegc status`
+instead:
+
+- **`event source mapping Disabled`** while the deployment is running: an engine or
+  `aegc evaluate` enables it again within seconds to minutes. If none is running, `aegc resume`
+  does.
+- **`event source mapping unknown (...)`:** the credentials can't read it (they need the operator
+  or lambda-deployer policy), or the mapping is gone; redeploy.
+- **Tasks stay `running` and `aegc metrics` shows throttles:** the account's Lambda concurrency is
+  too low for the pools' `concurrency=`; see
+  [Run short tasks on Lambda](lambda-pools.md#troubleshooting).
+- **No `task finished` lines from the function:** it may fail at start, for example on an image
+  built before aegc 0.7 deployed with `--allow-old-image`. Lambda's own error and `REPORT` lines
+  in `/aegc/<d>` say why.
+
 ## Results don't arrive
 
 - **The endpoint isn't running.** `aegc status` shows results waiting in a result queue. Start the
@@ -210,7 +226,9 @@ Each of these is retried once before the client sees it. See
 
 `AEGC_WALLTIME_EXCEEDED: task exceeded its walltime of N s and was killed`. Pass a longer
 `walltime_s` in `user_endpoint_config` (at most the pool's `max_walltime`, 41,400 at most), raise
-the pool's default with `walltime=`, or split the work.
+the pool's default with `walltime=`, or split the work. On a Lambda pool the walltime is also cut
+to the invocation's remaining time less 20 s, so the limit can be a little below the `walltime_s`
+asked for; tasks that need longer belong on an EC2 pool.
 
 ## Reading S3 data fails with Access Denied
 
@@ -429,6 +447,15 @@ See [Run the endpoint in the cloud](cloud-endpoint.md).
   `aegc destroy <d> --verify` later to check again, and `aegc footprint <d>` to see everything.
 - **`--hard fails running tasks; add --yes to confirm`** from `stop`: add `--yes`.
 - **`deployments still exist: ...`** from `unbootstrap`: destroy them first.
+- **Lambda pools:** `a Lambda pool needs a worker image built with aegc 0.7 or later`,
+  `image ... is N GiB compressed; Lambda allows 10 GiB uncompressed`, `... is longer than 64
+  characters`, `Lambda memory (memory=) must be 1024-10240 MiB` and the other ranges,
+  `max_vcpus is for EC2 pools, not Lambda pools`, `memory need a Lambda pool`, and
+  `AccessDeniedException` from Lambda or ECR calls (the
+  [lambda-deployer](../reference/iam.md#lambda-deployer) policy is missing). See
+  [Run short tasks on Lambda](lambda-pools.md#troubleshooting).
+- **`kept  lambda pools <d> (not checked: needs the lambda-deployer policy ...)`** from
+  `destroy`: run it again with that policy too.
 
 ## Building or registering images
 

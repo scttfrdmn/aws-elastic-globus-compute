@@ -77,6 +77,12 @@ filter event = "task_finished"
 `aegc-worker selftest` and `aegc-worker version`, which `aegc image build` and `register` run,
 keep plain-text logs.
 
+**Lambda pools.** A [Lambda pool](lambda-pools.md)'s function logs to the same group, in Lambda's
+own streams (`2026/11/23/[$LATEST]0123abcd...`), one per execution environment. Its lines are the
+same JSON, with `function` in place of `type`, `az` and `lifecycle`, and `instance_id` set to
+`lambda-<environment id>`; Lambda adds its own `START`, `END` and `REPORT` lines. The queries
+above work unchanged.
+
 ## Metrics
 
 Workers write their metrics as CloudWatch Embedded Metric Format (EMF) lines on stdout, and the
@@ -89,7 +95,8 @@ metrics. So workers need no `cloudwatch:PutMetricData`.
 | `TasksFailed` | Count | aegc failed it (`Outcome` `walltime`, `crashed`, `poison`, `payload_missing` or `refused`) |
 | `ExecSeconds` | Seconds | Each finished task's run time |
 | `QueueWaitSeconds` | Seconds | Each claimed task's wait from submission (the engine's clock) to claim |
-| `BootToFirstClaimSeconds` | Seconds | Once per worker: from the instance's boot to its first claim |
+| `BootToFirstClaimSeconds` | Seconds | Once per worker: from the instance's boot to its first claim (on a Lambda pool, from an execution environment's init to its first task) |
+| `InitSeconds` | Seconds | Lambda pools: once per execution environment, its init time, written before any task runs there. [Lambda spend](../concepts/cost.md#lambda-pools) includes it, because Lambda bills container images for init |
 | `Interruptions` | Count | Spot interruption notices |
 | `Releases` | Count | In-flight tasks handed back to the queue (a stop, an interruption, an exit) |
 | `PoisonTasks` | Count | Tasks failed without running because they were delivered too often |
@@ -100,6 +107,9 @@ metrics. So workers need no `cloudwatch:PutMetricData`.
 **Dimensions** are `[Deployment, Pool]` and `[Deployment]`, and on `TasksCompleted` and
 `TasksFailed` also `[Deployment, Pool, Outcome]`. Task and instance ids never become dimensions
 (each distinct value would be a metric of its own); they're in the log lines.
+
+On Lambda the EMF lines go to the function's log stream, and CloudWatch Logs turns them into
+metrics the same way. `Interruptions` and `WorkerExit` don't apply there.
 
 **Auto Scaling group metrics.** `aegc deploy` turns on each group's 1-minute group metrics
 (`GroupInServiceCapacity`, `GroupDesiredCapacity` and the others, namespace `AWS/AutoScaling`),
@@ -124,6 +134,11 @@ metrics for e2e (us-west-2), 2026-11-16 20:00 UTC to 2026-11-16 21:00 UTC (Cloud
     interruptions 0, releases 0, poison 0, worker exits 0
   total: 118 completed, 2 failed
 ```
+
+For a Lambda pool, the last line has the function's own metrics (`AWS/Lambda`) instead of the
+group's: `releases 0, poison 0 | concurrent executions max 5, throttles 0`. Throttles mean the
+account's Lambda concurrency is short; see
+[Troubleshooting](lambda-pools.md#troubleshooting).
 
 It reads every pool in the manifest with GetMetricData, at 1-minute periods for windows up to 3
 hours, 5 minutes up to a day, and an hour beyond (CloudWatch keeps 1-minute data for 15 days). The
@@ -161,6 +176,12 @@ Python and SDK versions, the endpoint id) and gains `details["aegc"]`:
 | `attempt`, `receive_count` | The engine's attempt number, and how often SQS delivered this attempt |
 | `timings` | `received_at`, `started_at`, `finished_at` (epoch seconds), `exec_s`, `queue_wait_s` |
 | `est_cost_usd`, `est_cost_source` | This task's share of its instance: the instance's $/h (with its volume and IPv4 address) ÷ slots × `exec_s`. Workers have no pricing access, so it uses aegc's static on-demand table (`static`): for Spot tasks it's an upper bound. [`aegc cost`](../concepts/cost.md#cost-ledger) is the better figure for totals |
+
+On a [Lambda pool](lambda-pools.md#status-metrics-logs-and-provenance), `details["aegc"]` has
+`backend: "lambda"`, and `function`, `function_version`, `memory_mib`, `request_id` and
+`log_stream` in place of the instance's fields; `instance_id` is `lambda-<environment id>`,
+`instance_type` `lambda-<memory>MB`, `slots` 1, and `est_cost_usd` the task's run time at the
+function's memory plus one request.
 
 ### From the SDK
 

@@ -38,6 +38,10 @@ flowchart LR
 - **See what ran where.** Workers log JSON, emit CloudWatch metrics (`aegc metrics`), and record
   each task's instance, image, timings and estimated cost (`aegc provenance`). Tasks can also come
   from Globus Flows and Timers.
+- **Short tasks on Lambda.** A pool can be a Lambda function running the same image
+  (`--pool env:lambda`): no boot wait (3.5 s to the first result in the live run) and nothing to
+  pay between bursts, for tasks of up to 30 minutes. Its tasks aren't isolated, so keep untrusted
+  code on EC2 pools.
 - **Laptop or cloud.** Run the endpoint on your laptop, or move it with `aegc endpoint deploy` to
   a small instance in your account, with the same endpoint id, a liveness alarm, and spend limits
   checked every 5 minutes even when no task runs.
@@ -51,9 +55,10 @@ flowchart LR
 
 ## Status
 
-Early release (0.x): v0.6.0 adds a cloud-hosted endpoint with an offline alarm and cloud-side
-spend checks, other regions such as us-east-1, and measured tutorials to v0.4.0's task isolation,
-JSON logs, CloudWatch metrics, provenance and Globus Flows and Timers. Work is tracked in this repo's issues, milestones and project board.
+Early release (0.x): v0.7.0 adds Lambda pools for short tasks to v0.6.0's cloud-hosted endpoint
+(with an offline alarm and cloud-side spend checks), other regions such as us-east-1, measured
+tutorials, and v0.4.0's task isolation, JSON logs, CloudWatch metrics, provenance and Globus Flows
+and Timers. Work is tracked in this repo's issues, milestones and project board.
 
 Sister projects:
 - [aws-elastic-gcs](https://github.com/scttfrdmn/aws-elastic-gcs): elastic Globus Connect Server.

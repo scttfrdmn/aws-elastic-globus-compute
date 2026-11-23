@@ -27,7 +27,7 @@ Each prints a report, one line per resource, with an outcome: `created`, `exists
 | [`image register`](#aegc-image-register) | Check an image you built (with aegc and `globus-compute-endpoint`) and record it |
 | [`image list`](#aegc-image-list) | An environment's recorded images, one per Python minor |
 | [`image forget`](#aegc-image-forget) | Drop an environment's image for one Python minor |
-| [`deploy`](#aegc-deploy) | Create or update a deployment and its worker pools |
+| [`deploy`](#aegc-deploy) | Create or update a deployment and its pools (EC2 or Lambda) |
 | [`stop`](#aegc-stop) | Stop a deployment's spending now (kill switch) |
 | [`resume`](#aegc-resume) | Resume a stopped, capped or expired deployment |
 | [`limits`](#aegc-limits) | Show or change a deployment's spend limits |
@@ -177,7 +177,7 @@ keep their last values. See [Configure pools](../how-to/configuration.md).
 | `--prune` | Remove pools not listed (a dry run of that part unless `--yes`) |
 | `--yes` | With `--prune`: actually remove them |
 | `--force` | `--prune` even with tasks queued |
-| `--allow-old-image` | Deploy images built before aegc 0.2 (their workers ignore limits and stop) |
+| `--allow-old-image` | Deploy images built before aegc 0.2 (their workers ignore limits and stop), or, for a Lambda pool, before 0.7 (no `aegc-worker lambda`) |
 | `--dry-run` | Report what would change; change nothing |
 
 Durations are `<N>m`, `<N>h` or `<N>d`. Limits, grants, lease and TTL are kept across redeploys
@@ -223,14 +223,38 @@ only the minors already deployed, and notes others the env has; `python=` picks 
 `size=` needs an image built with aegc 0.3 or later, can't be combined with `slots=N`, and
 `size=whole` needs one worker size (`vcpu=N`).
 
+A **Lambda pool** is `env:lambda[,option=value,...]`, named `<env>-py<NNN>-lambda`, and takes only
+these options (see [Run short tasks on Lambda](../how-to/lambda-pools.md)):
+
+| Option | Default | Meaning |
+|---|---|---|
+| `lambda` | | Make the pool a Lambda function fed by an SQS event source mapping |
+| `memory=MiB` | 2048 | Function memory, 1024–10240 (vCPUs in proportion, 1 per 1,769 MB) |
+| `timeout=S` | 900 | Function timeout, 60–1800 |
+| `concurrency=N` | 10 | The mapping's maximum concurrency, 2–1000 |
+| `tmp=MiB` | 512 | Function `/tmp`, 512–10240 |
+| `max_walltime=S` | timeout − 20 | Most walltime a task may request; at most timeout − 20 |
+| `walltime=S` | `max_walltime` | Default walltime for the pool's tasks |
+| `python=3.NN` | every minor | As for EC2 pools |
+
+EC2 options on a Lambda pool, and Lambda options on an EC2 pool, are refused. A Lambda pool needs
+an image built with aegc 0.7 or later, at most 10 GiB compressed, and the
+[lambda-deployer](iam.md#lambda-deployer) policy next to the deployer policy. Each deploy with
+Lambda pools prints `note: <pools>: Lambda pools aren't isolated. Their tasks run with the
+function role, which can read this deployment's task payloads and post results for any of its
+tasks; run untrusted functions on isolated EC2 pools in a deployment without Lambda pools`. The
+vCPU quota check leaves Lambda pools out; the account's Lambda concurrency isn't checked.
+
 ## aegc stop
 
 ```
 aegc stop DEPLOYMENT [--hard] [--yes]
 ```
 
-Stop a deployment's spending now: set its state to `stopped` and every group's minimum to 0.
-Queued tasks fail with `AEGC_STOPPED`, running tasks finish, and workers leave their groups. See
+Stop a deployment's spending now: set its state to `stopped`, every group's minimum to 0, and
+disable every Lambda pool's event source mapping. Queued tasks fail with `AEGC_STOPPED`, running
+tasks finish (Lambda invocations always do, even with `--hard`), and workers leave their groups.
+Lambda pools need the [lambda-deployer](iam.md#lambda-deployer) policy here. See
 [Operations](../how-to/operations.md#stop-and-resume).
 
 | Option | Meaning |
@@ -245,7 +269,7 @@ aegc resume DEPLOYMENT
 ```
 
 Resume a stopped, capped or expired deployment: set its state to `running`, restore each group's
-minimum, and push the lease forward.
+minimum, enable each Lambda pool's event source mapping, and push the lease forward.
 
 ## aegc limits
 
@@ -264,7 +288,7 @@ access to the cost ledger. See [Spend limits](../concepts/cost.md#spend-limits).
 | `--max-usd-month N|none` | Cap on estimated $ per UTC month |
 | `--max-instance-hours-day N|none` | Cap on instance-hours per UTC day |
 | `--on-cap {fail,kill}` | When a cap trips, let running tasks finish (`fail`, the default) or fail them (`kill`) |
-| `--resume` | Also end a capped state now |
+| `--resume` | Also end a capped state now (as `aegc resume` does, Lambda pools' mappings included) |
 
 ## aegc cost
 
@@ -272,7 +296,9 @@ access to the cost ledger. See [Spend limits](../concepts/cost.md#spend-limits).
 aegc cost DEPLOYMENT [--since SINCE] [--by {pool,type}] [--actual]
 ```
 
-Estimated spend from the cost ledger. See [Cost ledger](../concepts/cost.md#cost-ledger).
+Estimated spend from the cost ledger, plus Lambda pools from Lambda's `Duration` and
+`Invocations` metrics and aegc's `InitSeconds` (`lambda-<memory>MB` with `--by type`). See
+[Cost ledger](../concepts/cost.md#cost-ledger) and [Lambda pools](../concepts/cost.md#lambda-pools).
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -305,8 +331,9 @@ aegc footprint DEPLOYMENT
 ```
 
 List what exists for a deployment: resources tagged with it (Resource Groups Tagging API), and
-queues, groups, launch templates and parameters with its names, marked `owned` or `look-alike`.
-Changes nothing.
+queues, groups, launch templates, parameters, Lambda functions and event source mappings with its
+names, marked `owned` or `look-alike`. Changes nothing. Without Lambda read access it leaves the
+Lambda resources out and prints a note.
 
 ## aegc status
 
@@ -320,12 +347,14 @@ without any); the lease and TTL. Per pool: tasks queued, running and dead-letter
 service, desired and maximum (in vCPUs); its size class and what one task gets (for example
 `size mem: 2 vCPU(s), 16 GiB per task`, or `size per-vCPU: ...` for a pool without `size=`);
 workers by type, their $/h, the oldest waiting task and the worst-case cost of running tasks; the
-last scaling activity. Then the vCPU quotas, and each result queue with the results waiting in
-it. See [Operations](../how-to/operations.md#check-status).
+last scaling activity. A Lambda pool shows its function's memory and concurrency and its event
+source mapping's state (`lambda 2048 MB x 10, event source mapping Enabled`) in place of workers.
+Then the vCPU quotas (EC2 pools only), and each result queue with the results waiting in it. See
+[Operations](../how-to/operations.md#check-status).
 
 | Option | Meaning |
 |---|---|
-| `--json` | Machine-readable output; also has `grants` and each pool's `size_class`, `task_vcpus` and `task_memory_gib` |
+| `--json` | Machine-readable output; also has `grants` and each pool's `size_class`, `task_vcpus` and `task_memory_gib`, and its `kind` (`ec2` or `lambda`), `lambda_text` and `mapping` |
 
 ## aegc metrics
 
@@ -335,8 +364,9 @@ aegc metrics DEPLOYMENT [--since SINCE] [--json]
 
 Per pool: tasks completed and failed by outcome, average and maximum execution and queue-wait
 times, average boot-to-first-claim, interruptions, releases, poison tasks, worker exits, and the
-group's largest in-service and desired capacity. It reads the metrics workers emit (namespace
-`aegc`) and the Auto Scaling group metrics with GetMetricData, which the deployer and operator
+group's largest in-service and desired capacity (for a Lambda pool, the function's largest
+concurrent executions and its throttles, from `AWS/Lambda`). It reads the metrics workers emit
+(namespace `aegc`) and the Auto Scaling group metrics with GetMetricData, which the deployer and operator
 policies both allow. Workers from images built before aegc 0.4 emit none. See
 [Watch tasks](../how-to/observability.md#aegc-metrics).
 
@@ -353,7 +383,7 @@ aegc provenance DEPLOYMENT TASK_UUID [--since SINCE] [--json]
 
 Where and how a task ran: for each attempt that finished, its outcome, run and queue-wait times,
 instance type, Spot or on-demand, Availability Zone, instance id, pool, slots, vCPUs, image and
-estimated cost. It finds the task's `task_finished` lines in `/aegc/<d>` with FilterLogEvents,
+estimated cost (on a Lambda pool: the function, its memory and the request id). It finds the task's `task_finished` lines in `/aegc/<d>` with FilterLogEvents,
 which needs the [operator policy](iam.md#operator). `TASK_UUID` is the Globus Compute task id.
 The same record is in the result's `details["aegc"]`. It exits 1 if it finds none:
 `aegc: no task_finished line for <uuid> in /aegc/<d> since 14d (logs are kept 14 days; workers
@@ -381,7 +411,8 @@ Delete the deployment's result queues that are empty and haven't been modified f
 ## aegc iam-policy
 
 ```
-aegc iam-policy {worker,operator,deployer,bootstrap,builder,task,endpoint,endpoint-deployer}
+aegc iam-policy {worker,operator,deployer,bootstrap,builder,task,endpoint,endpoint-deployer,
+                 lambda-deployer}
                 [--deployment DEPLOYMENT] [--account ACCOUNT]
 ```
 
@@ -397,6 +428,7 @@ Print an IAM policy document as JSON. See [IAM policies](iam.md).
 | `task` | | `aegc-task` on the task role, besides the grants |
 | `endpoint` | | `aegc-endpoint` on the cloud endpoint host's role |
 | `endpoint-deployer` | | `aegc endpoint deploy`, `undeploy` and `status`, with the deployer policy |
+| `lambda-deployer` | | `aegc deploy`, `destroy`, `stop`, `resume`, `status` and `footprint` of Lambda pools, with the deployer policy |
 | `--deployment` | `default` | Deployment name (worker, operator, task, endpoint) |
 | `--account` | the caller's | AWS account id |
 
@@ -479,14 +511,16 @@ credentials:
 1. With `--endpoint-id`, ask Globus whether the endpoint is online (with this machine's Globus
    Compute login) and, on the cloud endpoint, publish the `EndpointOnline` metric.
 2. If the deployment is running and has spend limits, check spend and trip a cap like an engine
-   would (state `capped`, `by: evaluator`, group minimums to 0).
+   would (state `capped`, `by: evaluator`, group minimums to 0, Lambda pools' mappings disabled).
+   Then make each Lambda pool's event source mapping follow the state: enabled while the
+   deployment is running (a cap whose period ended reads as running), disabled otherwise.
 3. Renew the lease (hourly), only while Globus reports the endpoint online.
 4. Delete result queues that are empty and idle for 14 days, as `aegc reap --yes` does.
 
 | Option | Meaning |
 |---|---|
 | `--endpoint-id` | The endpoint to check with Globus; without it, no liveness check and no lease renewal |
-| `--dry-run` | Change nothing and publish nothing; the report says `would cap it`, `would renew the lease` or `would delete idle result queue` |
+| `--dry-run` | Change nothing and publish nothing; the report says `would cap it`, `would enable` (or `disable`) `Lambda pool <pool>'s event source mapping`, `would renew the lease` or `would delete idle result queue` |
 
 It prints its report on stderr, for example `evaluate e2e: endpoint online, state running`, with
 one line per action and `error:` lines for steps that failed, and exits 1 if any did. The metric
@@ -499,5 +533,6 @@ Runs inside worker images; you don't normally call it yourself.
 | Command | What it does |
 |---|---|
 | `aegc-worker run` | Claim and run tasks until drained. Reads its configuration from `AEGC_WORKER_CONFIG_B64` (set by the user data). Logs JSON lines, and writes EMF metric lines on stdout. SIGTERM releases in-flight tasks and exits (a task that finishes meanwhile posts its result); SIGUSR1 simulates a Spot interruption |
+| `aegc-worker lambda` | The command of a [Lambda pool](../how-to/lambda-pools.md)'s function: serve Lambda invocations through the Runtime API, one SQS record each, with the same message path as `run`. Reads `AEGC_WORKER_CONFIG_B64` from the function's environment; logs JSON lines and writes EMF metric lines, including `InitSeconds` once per execution environment |
 | `aegc-worker selftest` | Run a probe task through `execute_task` in this image's Python; used by `aegc image build` and `aegc image register` |
 | `aegc-worker version` | Print the aegc and `globus-compute-endpoint` versions, the Python minor and interpreter, and the uid, as one line of JSON; used by `aegc image register` |
