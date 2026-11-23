@@ -45,7 +45,7 @@ from aegc.state import State, read_state
 from aegc.worker import emf, runner
 from aegc.worker.config import WorkerConfig
 from aegc.worker.imds import Metadata, NoMetadata, Notice
-from aegc.worker.process import Finished, Handled, Job, Processor
+from aegc.worker.process import Handled, Job, Processor
 
 log = logging.getLogger("aegc.worker")
 
@@ -255,26 +255,26 @@ class Agent:
         got.future = self._pool.submit(self._run, got)
 
     def _run(self, job: Job) -> None:
-        fin: Finished | None = None
         try:
-            fin = self._proc.run(
+            self._proc.run(
                 job,
                 ctx=self._ctx,
                 scratch=self._scratch,
                 task_uid=self._task_uid,
                 task_env=self.task_env or None,
+                on_ran=self._count,
             )
         finally:
-            if fin is not None:
-                self._busy_slot_s += fin.timings["exec_s"]
-                if fin.status != "released":
-                    if fin.outcome in ("crashed", "walltime"):
-                        self.stats.failed += 1
-                    else:
-                        self.stats.completed += 1
             with self._lock:
                 self._inflight.pop(job.receipt, None)
             self._touch()
+
+    def _count(self, outcome: runner.RunOutcome, exec_s: float) -> None:
+        self._busy_slot_s += exec_s
+        if outcome.outcome in ("crashed", "walltime"):
+            self.stats.failed += 1
+        else:
+            self.stats.completed += 1
 
     # --- SQS --------------------------------------------------------------------------------
 

@@ -173,9 +173,11 @@ class Processor:
         task_uid: int | None = None,
         task_env: dict[str, str] | None = None,
         walltime_s: int | None = None,
+        on_ran: Callable[[runner.RunOutcome, float], None] | None = None,
     ) -> Finished:
         """Run ``job``, post its result and ack it. ``walltime_s`` overrides (never raises) the
-        message's walltime: a Lambda function has only so much time left."""
+        message's walltime: a Lambda function has only so much time left. ``on_ran(outcome,
+        exec_s)`` runs as soon as the task has run, before its result is posted."""
         msg = job.msg
         run_dir = scratch / "tasks" / msg.executor_task_id.replace(":", "_")
         limit = msg.walltime_s if walltime_s is None else max(1, min(msg.walltime_s, walltime_s))
@@ -199,6 +201,8 @@ class Processor:
             outcome = runner.RunOutcome("crashed", None, f"runner error: {e}")
         job.body = b""  # don't hold the payload past the run
         finished = time.time()
+        if on_ran is not None and not job.released:
+            on_ran(outcome, finished - started)
         timings = {
             "received_at": job.received_at,
             "started_at": started,
