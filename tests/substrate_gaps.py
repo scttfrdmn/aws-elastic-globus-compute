@@ -155,7 +155,7 @@ def lambda_echoes(lam: Any) -> dict[str, list[dict[str, Any]]]:
     ImageConfigResponse, LoggingConfig and EphemeralStorage; event source mappings without
     FunctionResponseTypes, ScalingConfig and EventSourceMappingArn.
 
-    Not filed yet: a mapping's tags (Tags on CreateEventSourceMapping) aren't kept, and ListTags
+    substrate#1660: a mapping's tags (Tags on CreateEventSourceMapping) aren't kept, and ListTags
     on a mapping's ARN is ResourceNotFound ("Function not found"). Also without code here:
     GetFunctionConfiguration is UnknownOperationException (deploy uses GetFunction), GetFunction
     returns no Tags (deploy uses ListTags), functions have no LastUpdateStatus, and the tagging
