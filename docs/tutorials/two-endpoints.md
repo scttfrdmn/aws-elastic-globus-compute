@@ -11,8 +11,9 @@ and compare.
 
 - **One flow, the right place for each step.** Flows passes the first step's JSON result to the
   second; neither endpoint knows about the other.
-- **Laptop vs cloud time** for the same `summarize` function: on the laptop it downloads every
-  file over your connection, on aegc it reads them in the region.
+- **Laptop vs cloud** for the same `summarize` function: on the laptop it downloads every file
+  over your connection, on aegc it reads them in the region. (The laptop can win on time; see
+  the results.)
 - **Dollars per run** on aegc, against S3 egress for the laptop run.
 
 ```mermaid
@@ -319,20 +320,27 @@ On aegc, boto3 finds the task role's credentials by itself, and the read grant c
 inputs. `AEGC_TASK_UUID` is set on aegc workers for each task, which is how `summarize` knows
 where it is.
 
-!!! abstract "Results: not yet run live"
-    This tutorial hasn't been run live yet; the values marked `TODO(live)` will come from that
-    run. Measured on TODO(live) (date), 20 files of 25 MB (TODO(live) GB in all), laptop TODO(live)
-    (machine, connection).
+!!! abstract "Results"
+    Measured on 2026-11-23 in us-west-2: 20 files of 25 MB (0.50 GB, 21.8 million rows). The
+    "laptop" was a Mac running the stock endpoint in Docker, on a fast home connection; aegc's
+    worker was a 2-vCPU Spot `c8g.large`.
 
     | Measure | Laptop + aegc | Laptop only |
     |---|---|---|
-    | `Manifest` step (start to finish, `show-logs`) | TODO(live) s | TODO(live) s |
-    | `Summarize` step (start to finish) | TODO(live) s (cold) | TODO(live) s |
-    | `summarize` in-task time (`seconds`) | TODO(live) s | TODO(live) s |
-    | Whole run, start to `SUCCEEDED` | TODO(live) s | TODO(live) s |
-    | Files verified against the manifest | TODO(live)/20 | TODO(live)/20 |
-    | Bytes over your internet connection | TODO(live) (the manifest, the result) | TODO(live) GB |
-    | Cost | $TODO(live) (`aegc cost`) | $TODO(live) egress |
+    | `Manifest` step (start to finish, `show-logs`) | 27 s (first run), 7 s (next) | 24 s |
+    | `Summarize` step (start to finish) | 104 s cold, 39 s warm | 37 s |
+    | `summarize` in-task time (`seconds`) | 36.8 s cold, 34.8 s warm | 21.6 s |
+    | Whole run, start to `SUCCEEDED` | 137 s cold, 58 s warm | 70 s |
+    | Files verified against the manifest | 20/20 | 20/20 |
+    | Bytes over your internet connection | a few KB (the manifest, the result) | 0.50 GB |
+    | Cost | $0.007 for the day (`aegc cost`); the task est. $0.0004 | about $0.045 of egress |
+
+    **What this shows, honestly:** the laptop was *faster* at `summarize` here. A recent Mac
+    beats a 2-vCPU worker, and 0.5 GB downloads quickly over a good connection. aegc's step
+    won on what didn't happen: no 0.5 GB download to the laptop, the laptop free while the step
+    ran, and the result written to S3 next to the data. With more data, a slower link or work
+    that needs more than one machine (a bigger pool, `size=large`), the cloud step pulls ahead;
+    with a small dataset and a fast laptop, keep the step local and use the flow anyway.
 
 ## What to look at
 

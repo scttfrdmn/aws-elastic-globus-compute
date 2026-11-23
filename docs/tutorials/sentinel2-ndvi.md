@@ -401,19 +401,22 @@ aegc cost ndvi --since 3d
 aegc metrics ndvi --since 3d
 ```
 
-!!! abstract "Results (part 2): not yet run live"
-    The nightly part hasn't been run live yet; the values marked `TODO(live)` will come from
-    that run.
-    Measured on TODO(live) (dates), over TODO(live) nights.
+!!! abstract "Results (part 2)"
+    Measured on 2026-11-23 in us-west-2, with the cloud endpoint on a `t4g.micro` and the
+    laptop's endpoint stopped. The timer ran once (it was then deleted); a few nights would show
+    the same per-run figures.
 
     | Measure | Value |
     |---|---|
-    | Runs started by the timer / `SUCCEEDED` | TODO(live) / TODO(live) |
-    | Flow run time, start to `SUCCEEDED` (cold) | TODO(live) s |
-    | Workers running between runs | 0 (TODO(live): confirm with `aegc status`) |
-    | Pool cost per night (`aegc cost`) | $TODO(live) |
-    | Cloud endpoint per day (EC2, volume, IPv4; not in `aegc cost`) | $TODO(live) |
-    | Cloud endpoint online within | TODO(live) min of `ep deploy` |
+    | Flow run, start to `SUCCEEDED`, cold (worker booted) | 69 s |
+    | Flow run, start to `SUCCEEDED`, warm | 14 s |
+    | Timer runs started / `SUCCEEDED` | 1 / 1 (7 s) |
+    | The task on the worker | 2.1 s on a Spot `m9g.large`; est. $0.00003 |
+    | Bytes read / scene size | 1.3 MB / 463 MB (0.28%) |
+    | Workers between runs | 0, about 6 minutes after the task |
+    | Pool cost for the day (`aegc cost`) | $0.012 (0.28 instance-hours, all of part 1 and 2) |
+    | Cloud endpoint per day (EC2, volume, IPv4; not in `aegc cost`) | about $0.43 |
+    | Cloud endpoint online after `ep deploy` | about 3 minutes |
 
 ## Teardown
 
