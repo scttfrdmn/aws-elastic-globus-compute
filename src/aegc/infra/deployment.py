@@ -5,8 +5,8 @@ log group ``/aegc/<d>``, and the manifest ``/aegc/<d>/manifest`` that the engine
 
 Pool: a task queue with a dead-letter queue, a launch template (stock ECS-optimized AL2023 arm64 AMI
 via ``resolve:ssm:``, IMDSv2 with hop limit 2, gp3 root), and a Spot Auto Scaling group with
-attribute-based Graviton selection, protected from scale-in and with AZRebalance suspended. Workers
-scale the group in themselves.
+attribute-based Graviton selection, protected from scale-in and with AZRebalance suspended, in the
+subnets whose zones offer the pool's instance types. Workers scale the group in themselves.
 
 Every create carries the ownership tags; ``destroy`` deletes only what carries them (see
 :func:`aegc.naming.is_owned`) and is a dry run unless asked otherwise.
@@ -452,6 +452,87 @@ def resolve_network(ec2: Any, spec: DeploymentSpec) -> tuple[str, list[str]]:
     if len(vpcs) != 1:
         raise ValueError("all subnets must be in one VPC")
     return vpcs.pop(), sorted(s["SubnetId"] for s in subnets)
+
+
+@dataclass
+class OfferingCache:
+    """One deploy's answers from EC2 about subnets' zones and the zones' instance types."""
+
+    zones: dict[str, tuple[str, str]] = field(default_factory=dict)  # subnet -> (name, id)
+    offered: dict[tuple[str, ...], set[str] | None] = field(default_factory=dict)
+
+
+def subnet_zones(ec2: Any, subnets: list[str], cache: OfferingCache) -> dict[str, tuple[str, str]]:
+    """Each subnet's Availability Zone, as (ZoneName, ZoneId); the id may be empty."""
+    missing = [s for s in subnets if s not in cache.zones]
+    if missing:
+        for s in ec2.describe_subnets(SubnetIds=missing)["Subnets"]:
+            cache.zones[s["SubnetId"]] = (s["AvailabilityZone"], s.get("AvailabilityZoneId", ""))
+    return {s: cache.zones[s] for s in subnets if s in cache.zones}
+
+
+def offered_zones(ec2: Any, patterns: tuple[str, ...], cache: OfferingCache) -> set[str] | None:
+    """The zone names that offer at least one instance type matching ``patterns`` (globs, as in
+    AllowedInstanceTypes). None if EC2 won't say, e.g. to a deployer policy from before 0.6."""
+    key = tuple(sorted(patterns))
+    if key not in cache.offered:
+        try:
+            cache.offered[key] = {
+                str(o["Location"])
+                for o in paginate(
+                    ec2, "describe_instance_type_offerings", "InstanceTypeOfferings",
+                    LocationType="availability-zone",
+                    Filters=[{"Name": "instance-type", "Values": list(key)}],
+                )
+            }  # fmt: skip
+        except Exception as e:
+            if not error_code(e):
+                raise
+            cache.offered[key] = None
+    return cache.offered[key]
+
+
+def pool_subnets(
+    c: Clients,
+    spec: DeploymentSpec,
+    pool: PoolSpec,
+    subnets: list[str],
+    report: Report,
+    cache: OfferingCache,
+) -> list[str]:
+    """The subnets a pool's group uses: those in zones that offer one of its instance types.
+
+    Not every zone has Graviton (us-east-1's use1-az3 has none), and a group with such a subnet
+    can fail to place or keep reporting launch errors. Default subnets in such zones are left
+    out; explicit ones (``subnet_ids``) are kept, with a warning. If no zone offers any of the
+    types, or EC2 won't say, every subnet is kept and Auto Scaling reports what it can't launch.
+    """
+    patterns = ", ".join(pool.allowed_instance_types)
+    offered = offered_zones(c.ec2, pool.allowed_instance_types, cache)
+    if offered is None:
+        report.add(
+            "subnet offerings", pool.name, "kept",
+            "all subnets: DescribeInstanceTypeOfferings failed (deployer policy before 0.6?)",
+        )  # fmt: skip
+        return subnets
+    if not offered:
+        report.add("subnet offerings", pool.name, "kept", f"all subnets: no zone offers {patterns}")
+        return subnets
+    zones = subnet_zones(c.ec2, subnets, cache)
+    keep = []
+    for s in subnets:
+        name, zid = zones.get(s, ("", ""))
+        if not name or name in offered:
+            keep.append(s)
+            continue
+        where = f"{s} ({name}{f', {zid}' if zid else ''})"
+        why = f"pool {pool.name}: the zone offers none of {patterns}"
+        if spec.subnet_ids:  # the user chose it: use it, but say so
+            keep.append(s)
+            report.add("subnet", where, "kept", why)
+        else:
+            report.add("subnet", where, "skipped", why)
+    return keep
 
 
 def _owned_ec2_filters(d: str) -> list[dict[str, Any]]:
@@ -1113,6 +1194,7 @@ def deploy(c: Clients, spec: DeploymentSpec, *, dry_run: bool = False) -> Report
     sg = ensure_security_group(c, spec, vpc, report, dry_run=dry_run)
     ensure_log_group(c, spec, report, dry_run=dry_run)
     ami = resolve_ami(c.ssm)
+    offerings = OfferingCache()
     pools: dict[str, dict[str, str]] = {}
     for pool in spec.pools:
         task_url, dlq_url = ensure_pool_queues(c, spec, pool, report, dry_run=dry_run)
@@ -1120,11 +1202,12 @@ def deploy(c: Clients, spec: DeploymentSpec, *, dry_run: bool = False) -> Report
             spec, pool, ami=ami, sg=sg, profile_arn=profile_arn, task_queue_url=task_url
         )
         lt = ensure_launch_template(c, spec, pool, data, report, dry_run=dry_run)
+        usable = pool_subnets(c, spec, pool, subnets, report, offerings)
 
         # A new instance profile takes a few seconds to become usable by Auto Scaling.
-        def make_group(pool: PoolSpec = pool, lt: str = lt) -> str:
+        def make_group(pool: PoolSpec = pool, lt: str = lt, usable: list[str] = usable) -> str:
             return ensure_auto_scaling_group(
-                c, spec, pool, lt_name=lt, subnets=subnets, report=report, dry_run=dry_run,
+                c, spec, pool, lt_name=lt, subnets=usable, report=report, dry_run=dry_run,
                 halted=halted,
             )  # fmt: skip
 

@@ -15,6 +15,7 @@ Outcome = Literal[
     "would-delete",
     "kept",
     "remaining",
+    "skipped",  # left out on purpose, e.g. a subnet in a zone without the pool's instance types
 ]
 
 

@@ -1,8 +1,10 @@
 import json
 import time
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 
+import boto3
 import pytest
 
 from aegc import images, naming
@@ -10,7 +12,7 @@ from aegc.awsutil import paginate
 from aegc.infra import OwnershipError, Report, deployment
 from aegc.infra.deployment import Clients, DeploymentSpec, PoolSpec
 from tests.conftest import ACCOUNT, REGION
-from tests.substrate_gaps import no_network_interfaces
+from tests.substrate_gaps import instance_type_offerings, no_network_interfaces
 from tests.unit.test_images import push_fake, tags_of
 
 IMAGE = f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/aegc/geospatial@sha256:" + "b" * 64
@@ -99,6 +101,152 @@ def test_subnets_must_share_a_vpc(env: tuple[Clients, DeploymentSpec]) -> None:
     spec = DeploymentSpec(**{**spec.__dict__, "subnet_ids": (mine, defaults[0])})
     with pytest.raises(ValueError, match="one VPC"):
         deployment.resolve_network(c.ec2, spec)
+
+
+# --- subnets in zones without Graviton (#64) --------------------------------------------------
+
+EAST = "us-east-1"
+#: us-east-1 as on AWS: use1-az3 (us-east-1c in substrate's default account) has no Graviton.
+EAST_OFFERINGS = {
+    "us-east-1a": ["c8g.large", "m8g.large", "c7g.large", "t3.micro"],
+    "us-east-1b": ["c8g.large", "r8g.xlarge", "t3.micro"],
+    "us-east-1c": ["c5.large", "m5.large", "t3.micro"],
+}
+
+
+@pytest.fixture
+def east(substrate: Any) -> tuple[Clients, DeploymentSpec, list[dict[str, Any]]]:
+    """A deployment in us-east-1's default VPC, with the zones' offerings shimmed."""
+    del substrate
+
+    def make(service: str) -> Any:
+        return boto3.client(service, region_name=EAST)  # type: ignore[call-overload]
+
+    ec2 = no_network_interfaces(make("ec2"))
+    calls = instance_type_offerings(ec2, EAST_OFFERINGS)  # substrate gap: no Graviton offerings
+    c = Clients(
+        iam=make("iam"), ec2=ec2, autoscaling=make("autoscaling"), sqs=make("sqs"),
+        logs=make("logs"), ssm=make("ssm"),
+    )  # fmt: skip
+    image = IMAGE.replace(REGION, EAST)
+    spec = DeploymentSpec(
+        deployment="dev",
+        account=ACCOUNT,
+        region=EAST,
+        bucket=naming.bucket_name(ACCOUNT, EAST),
+        pools=(
+            PoolSpec(name="sci-py314", env="geospatial", python_minor="3.14", image=image),
+            PoolSpec(name="big-py314", env="geospatial", python_minor="3.14", image=image),
+        ),
+    )
+    return c, spec, calls
+
+
+def zone_of(ec2: Any) -> dict[str, str]:
+    return {s["SubnetId"]: s["AvailabilityZone"] for s in ec2.describe_subnets()["Subnets"]}
+
+
+def test_default_subnets_skip_zones_without_the_pools_types(
+    east: tuple[Clients, DeploymentSpec, list[dict[str, Any]]],
+) -> None:
+    c, spec, calls = east
+    _, defaults = default_vpc(c.ec2)
+    zones = zone_of(c.ec2)
+    (az3,) = [s for s in defaults if zones[s] == "us-east-1c"]
+    report = deployment.deploy(c, spec)
+    for name in ("aegc-dev-sci-py314", "aegc-dev-big-py314"):
+        g = group(c, name)
+        assert g is not None
+        assert sorted(g["VPCZoneIdentifier"].split(",")) == [s for s in defaults if s != az3]
+    skipped = [a for a in report.actions if a.outcome == "skipped"]
+    assert [a.resource for a in skipped] == ["subnet", "subnet"]  # once per pool
+    assert all(a.name.startswith(f"{az3} (us-east-1c") for a in skipped)
+    assert "c8g.*" in skipped[0].detail and "sci-py314" in skipped[0].detail
+    assert len(calls) == 1  # both pools allow the same types: asked once per deploy
+    assert calls[0]["LocationType"] == "availability-zone"
+    # The manifest keeps the deployment's network; each group has its own subset.
+    assert deployment.read_manifest(c.ssm, "dev")["subnets"] == defaults
+
+
+def test_pools_with_other_types_get_their_own_zones(
+    east: tuple[Clients, DeploymentSpec, list[dict[str, Any]]],
+) -> None:
+    c, spec, calls = east
+    only_r8g = PoolSpec(
+        name="mem-py314", env="geospatial", python_minor="3.14", image=spec.pools[0].image,
+        allowed_instance_types=("r8g.*",),
+    )  # fmt: skip
+    spec = DeploymentSpec(**{**spec.__dict__, "pools": (spec.pools[0], only_r8g)})
+    deployment.deploy(c, spec)
+    zones = zone_of(c.ec2)
+    g = group(c, "aegc-dev-mem-py314")
+    assert g is not None
+    assert [zones[s] for s in g["VPCZoneIdentifier"].split(",")] == ["us-east-1b"]
+    assert len(calls) == 2
+
+
+def test_explicit_subnets_in_such_zones_are_kept_with_a_warning(
+    east: tuple[Clients, DeploymentSpec, list[dict[str, Any]]],
+) -> None:
+    c, spec, _ = east
+    vpc = c.ec2.create_vpc(CidrBlock="10.20.0.0/16")["Vpc"]["VpcId"]
+    subnets = sorted(
+        c.ec2.create_subnet(VpcId=vpc, CidrBlock=f"10.20.{i}.0/24", AvailabilityZone=f"{EAST}{az}")[
+            "Subnet"
+        ]["SubnetId"]
+        for i, az in enumerate("ac")
+    )
+    spec = DeploymentSpec(
+        **{**spec.__dict__, "pools": spec.pools[:1], "subnet_ids": tuple(subnets)}
+    )
+    report = deployment.deploy(c, spec)
+    g = group(c)
+    assert g is not None and sorted(g["VPCZoneIdentifier"].split(",")) == subnets
+    zones = zone_of(c.ec2)
+    (warned,) = [a for a in report.actions if a.resource == "subnet"]
+    assert warned.outcome == "kept"
+    assert warned.name.startswith(next(s for s in subnets if zones[s] == "us-east-1c"))
+
+
+def test_subnets_are_all_kept_when_ec2_wont_say(
+    east: tuple[Clients, DeploymentSpec, list[dict[str, Any]]],
+) -> None:
+    c, spec, _ = east
+
+    def denied(**_: Any) -> tuple[Any, dict[str, Any]]:
+        error = {"Code": "UnauthorizedOperation", "Message": "not allowed"}
+        return SimpleNamespace(status_code=403, headers={}), {"Error": error}
+
+    # Registered first, so it answers before the shim: a deployer policy from before 0.6.
+    c.ec2.meta.events.register_first("before-call.ec2.DescribeInstanceTypeOfferings", denied)
+    spec = DeploymentSpec(**{**spec.__dict__, "pools": spec.pools[:1]})
+    report = deployment.deploy(c, spec)
+    _, defaults = default_vpc(c.ec2)
+    g = group(c)
+    assert g is not None and sorted(g["VPCZoneIdentifier"].split(",")) == defaults
+    assert outcomes(report)[("subnet offerings", "sci-py314")] == "kept"
+
+
+def test_unshimmed_zones_all_offer_graviton(env: tuple[Clients, DeploymentSpec]) -> None:
+    # The real call on substrate, whose zones all offer the default families: nothing left out.
+    c, spec = env
+    report = deployment.deploy(c, spec)
+    g = group(c)
+    assert g is not None and sorted(g["VPCZoneIdentifier"].split(",")) == default_vpc(c.ec2)[1]
+    assert not [a for a in report.actions if a.resource in ("subnet", "subnet offerings")]
+
+
+def test_subnets_are_all_kept_when_no_zone_offers_the_types(
+    env: tuple[Clients, DeploymentSpec],
+) -> None:
+    # Filtering can't help then: nothing is left out, and Auto Scaling reports what it can't
+    # launch.
+    c, spec = env
+    pool = PoolSpec(**{**POOL.__dict__, "allowed_instance_types": ("x99g.*",)})
+    report = deployment.deploy(c, DeploymentSpec(**{**spec.__dict__, "pools": (pool,)}))
+    g = group(c)
+    assert g is not None and sorted(g["VPCZoneIdentifier"].split(",")) == default_vpc(c.ec2)[1]
+    assert outcomes(report)[("subnet offerings", "sci-py314")] == "kept"
 
 
 def test_deploy_creates_everything(env: tuple[Clients, DeploymentSpec]) -> None:

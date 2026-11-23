@@ -6,6 +6,24 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **Zones without the pool's instance types** (#64): `aegc deploy` asks EC2
+  (`DescribeInstanceTypeOfferings`, once per set of `allowed_instance_types`) which Availability
+  Zones offer at least one of a pool's types, and leaves default subnets in other zones out of
+  that pool's Auto Scaling group, reported as `skipped  subnet`. us-east-1's use1-az3 has no
+  Graviton. Explicit `subnet_ids` are all kept, with a `kept` warning for such zones. The
+  [deployer policy](docs/reference/iam.md#deployer) gains `ec2:DescribeInstanceTypeOfferings`;
+  without it, deploy keeps every subnet and says so.
+- [Other regions](docs/how-to/operations.md#other-regions): bootstrap, images, deployments and
+  endpoints per region, for example us-east-1 next to RODA datasets.
+
+### Changed
+- `aegc bootstrap` in us-east-1 creates the payload bucket without a `CreateBucketConfiguration`
+  (us-east-1 takes no `LocationConstraint`; a configuration holding only `Tags` is untested there)
+  and tags it straight after, removing it again if the tagging fails (#64).
+- The static on-demand price table is no longer labelled us-west-2 only: us-east-1's prices for
+  these types are the same (#64).
+
 ## [0.4.0] - 2026-11-16
 
 Observability, the Globus ecosystem, and task isolation: task code no longer runs with the

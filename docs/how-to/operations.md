@@ -228,6 +228,41 @@ queues, Auto Scaling groups, launch templates and `/aegc/<d>/` parameters. Each 
 (aegc's name and tags) or `look-alike` (aegc's name without its tags, which aegc never deletes).
 For a while after a destroy, the tagging API can still list terminated instances.
 
+## Other regions
+
+Every aegc resource is regional, so a second region (us-east-1, say, next to RODA datasets such as
+1000 Genomes, OpenNeuro or the NCBI BLAST databases) is a second, independent setup. Pass
+`--region` to each command, or set `AWS_DEFAULT_REGION`:
+
+1. **Bootstrap it.** `aegc --region us-east-1 bootstrap` creates that region's payload bucket
+   `aegc-<account>-us-east-1`, its pull-through cache rule, the ECR template role
+   `aegc-ecr-template-us-east-1`, and the region's `/aegc/bootstrap` parameter.
+2. **Build the images there.** Images live in the region's ECR and their records
+   (`/aegc/images/<env>`) in the region's SSM, so an image built in us-west-2 isn't visible in
+   us-east-1. Run `aegc --region us-east-1 image build --env <env> ...` again, or
+   `image register` a copy you pushed to that region's ECR.
+3. **Deploy.** `aegc --region us-east-1 deploy <d> --pool <env> ...`. The manifest, state and
+   lease are the region's, and the IAM roles carry the region in their names, so the same
+   deployment name can exist in two regions without clashing.
+4. **Run an endpoint per region.** `aegc --region us-east-1 endpoint ... configure` writes the
+   region into the endpoint's config. One endpoint serves one deployment in one region.
+
+**Zones without Graviton.** Not every Availability Zone offers the pool's instance families
+(us-east-1's use1-az3 has no Graviton at all). `deploy` asks EC2 which zones offer at least one of
+the pool's `allowed_instance_types` and leaves default subnets in other zones out of that pool's
+Auto Scaling group:
+
+```
+     skipped  subnet                     subnet-0abc (us-east-1c, use1-az3) (pool geospatial-py314: the zone offers none of c8g.*, m8g.*, ...)
+```
+
+Subnets you pass explicitly are all used; `deploy` reports one in such a zone as `kept`, as a
+warning. If EC2 won't say (a deployer policy from before 0.6 lacks
+`ec2:DescribeInstanceTypeOfferings`), every subnet is kept and the report says so.
+
+Cost estimates use the region's Spot and on-demand prices. The static fallback table holds
+us-west-2's on-demand prices, which are also us-east-1's for these types.
+
 ## Upgrade from v0.3
 
 v0.4's [task isolation](../concepts/security.md#task-isolation), JSON logs, metrics and provenance

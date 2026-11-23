@@ -14,6 +14,8 @@ Gaps without code here (substrate v0.129.0 fixed #1523 and #1525):
 
 from __future__ import annotations
 
+import fnmatch
+import re
 from types import SimpleNamespace
 from typing import Any
 
@@ -49,4 +51,36 @@ def metrics_collection(autoscaling: Any) -> list[dict[str, Any]]:
         return SimpleNamespace(status_code=200, headers={}), {}
 
     autoscaling.meta.events.register("before-call.auto-scaling.EnableMetricsCollection", ok)
+    return calls
+
+
+def instance_type_offerings(ec2: Any, offered: dict[str, list[str]]) -> list[dict[str, Any]]:
+    """substrate gap (not yet filed): DescribeInstanceTypeOfferings offers every type in every
+    zone, so a zone without Graviton (us-east-1's use1-az3) can't be modelled. Subnets also lack
+    AvailabilityZoneId.
+
+    Answers it on this client from ``offered`` (zone name -> instance types), applying the
+    ``instance-type`` filter's globs as EC2 does, for LocationType=availability-zone. Returns a
+    list that collects each call's request body, so callers can check the caching.
+    """
+    calls: list[dict[str, Any]] = []
+
+    def answer(params: dict[str, Any], **_: Any) -> tuple[Any, dict[str, Any]]:
+        body = dict(params.get("body") or {})
+        calls.append(body)
+        patterns: list[str] = []
+        for key, name in body.items():
+            m = re.fullmatch(r"Filter\.(\d+)\.Name", key)
+            if m and name == "instance-type":
+                n = m.group(1)
+                patterns += [v for k, v in body.items() if k.startswith(f"Filter.{n}.Value.")]
+        found = [
+            {"InstanceType": t, "LocationType": "availability-zone", "Location": zone}
+            for zone, types in offered.items()
+            for t in types
+            if not patterns or any(fnmatch.fnmatchcase(t, p) for p in patterns)
+        ]
+        return SimpleNamespace(status_code=200, headers={}), {"InstanceTypeOfferings": found}
+
+    ec2.meta.events.register("before-call.ec2.DescribeInstanceTypeOfferings", answer)
     return calls

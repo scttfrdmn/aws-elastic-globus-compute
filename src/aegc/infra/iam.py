@@ -834,6 +834,7 @@ def _admin_policy(*, region: str, account: str) -> dict[str, Any]:
                     "ec2:DescribeLaunchTemplateVersions",
                     "ec2:DescribeImages",
                     "ec2:DescribeInstanceTypes",
+                    "ec2:DescribeInstanceTypeOfferings",  # zones without the pool's types
                 ],
                 "Resource": "*",
             },

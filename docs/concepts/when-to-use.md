@@ -73,7 +73,8 @@ These are the current limits. Numbers come from the live run in
   [Task isolation](security.md#task-isolation).
 - **Not high-assurance.** Task data goes to AWS; `AWSEngine` refuses high-assurance endpoints.
 - **Default VPC.** `aegc deploy` places workers in the region's default VPC and default subnets.
-  Only us-west-2 has been tested live.
+  Only us-west-2 has been tested live; see
+  [Other regions](../how-to/operations.md#other-regions).
 
 ## When to use something else
 
