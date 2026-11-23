@@ -230,17 +230,17 @@ undeploy it first.
 
 **Without the endpoint-deployer policy.** The cloud endpoint's secret, alarm and topic need the
 [endpoint-deployer](../reference/iam.md#endpoint-deployer) policy. With the deployer policy alone,
-`destroy` still removes everything else and reports
+`destroy` still removes everything else, including a cloud endpoint's host, role, instance profile
+and image tags, and reports what it couldn't check:
 
 ```
+        kept  cloud endpoint alarm       aegc-e2e-endpoint-offline (not checked: needs the endpoint-deployer policy)
         kept  cloud endpoint             e2e (not checked: needs the endpoint-deployer policy (aegc iam-policy endpoint-deployer))
 ```
 
-For a deployment that never had a cloud endpoint, that's all, and verification passes. If it did
-have one, its host goes with the groups, but its secret, alarm and topic stay, and so do its role,
-instance profile and the endpoint image's `inuse-` tag, which verification reports as
-`remaining`. Run `aegc destroy <d> --yes`
-again with both policies to finish.
+For a deployment that never had a cloud endpoint, that's all, and verification passes. If it had
+one, its secret, alarm and topic stay; run `aegc destroy <d> --yes` again with both policies to
+remove them.
 
 ## Find what exists
 
