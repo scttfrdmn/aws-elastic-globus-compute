@@ -36,12 +36,6 @@ class Record:
     tasks: int = 0
     busy_slot_s: float = 0.0
     exit_reason: str = ""  # set by the final write
-    #: "ec2", or "lambda": one execution environment of a Lambda pool (#21). Lambda records are
-    #: priced by ``billed_s`` x ``memory_mib`` and ``invocations``, not by the time they cover.
-    kind: str = "ec2"
-    memory_mib: int = 0
-    billed_s: float = 0.0
-    invocations: int = 0
 
     def key(self) -> str:
         return record_key(self.deployment, self.launched_at, self.instance_id)

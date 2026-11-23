@@ -29,7 +29,9 @@ from aegc.awsutil import error_code, is_not_found
 KIND = "lambda"
 #: Lambda's limits (on-demand functions, 2026-11): timeout, memory, /tmp, mapping concurrency.
 MAX_TIMEOUT_S = 1800
-MEMORY_MIB_RANGE = (128, 10_240)
+#: At least 1 GiB: the runtime, the forkserver (which preloads globus_compute_endpoint) and the
+#: task share it, and at 1769 MB Lambda gives one vCPU.
+MEMORY_MIB_RANGE = (1024, 10_240)
 EPHEMERAL_MIB_RANGE = (512, 10_240)
 CONCURRENCY_RANGE = (2, 1000)
 MAX_IMAGE_BYTES = 10 * 2**30  # uncompressed
@@ -145,9 +147,11 @@ def reconcile(
     disabled otherwise. A cap whose period ends reads as running without anyone writing it, so
     something has to turn its pools back on; and a freeze whose mapping update failed is retried.
 
-    ``confirm`` (optional) re-reads the state before enabling anything and returns whether it's
-    still running. Returns (mapping state by pool, what changed by pool: ``enabled``,
-    ``disabled`` or the error).
+    ``confirm`` (optional) re-reads the state and returns whether it's running: it's called
+    before changing anything (nothing changes if it disagrees with ``running``) and again after
+    enabling (a stop that landed in between is undone at once). Returns (mapping state by pool,
+    what changed by pool: ``enabled``, ``disabled``, or the error, including mappings whose state
+    couldn't be read).
     """
     states: dict[str, str] = {}
     for name, uuid in mappings(pools).items():
@@ -159,14 +163,93 @@ def reconcile(
         wrong = {n: u for n, u in mappings(pools).items() if states.get(n) == "Disabled"}
     else:
         wrong = {n: u for n, u in mappings(pools).items() if states.get(n) in ENABLED_STATES}
-    if not wrong or (running and confirm is not None and not confirm()):
-        return states, {}
+    unread = {n: s for n, s in states.items() if s.startswith("unknown")}
+    if not wrong or (confirm is not None and bool(confirm()) != running):
+        return states, dict(unread)
     verb = "enabled" if running else "disabled"
     if dry_run:
-        return states, {n: verb for n in wrong}
+        return states, {**unread, **{n: verb for n in wrong}}
     errors = set_all(lam, wrong, running)
-    changes = {n: str(errors[n]) if n in errors else verb for n in wrong}
+    changes = {**unread, **{n: str(errors[n]) if n in errors else verb for n in wrong}}
     for n in wrong:
         if n not in errors:
             states[n] = "Enabling" if running else "Disabling"
+    if running and confirm is not None and not confirm():
+        # Stopped or capped while we enabled: freeze again now, not on the next pass.
+        set_all(lam, {n: u for n, u in wrong.items() if n not in errors}, False)
+        for n in wrong:
+            if n not in errors:
+                states[n], changes[n] = "Disabling", "disabled"
     return states, changes
+
+
+# --- spend ------------------------------------------------------------------------------------
+
+#: GetMetricData period: hourly sums are kept for 455 days.
+METRIC_PERIOD_S = 3600
+
+
+def accrue_metrics(
+    cloudwatch: Any, pools: dict[str, dict[str, Any]], start: float, end: float
+) -> pricing.Accrued:
+    """Lambda pools' spend in ``[start, end)`` from Lambda's own metrics (``AWS/Lambda``
+    ``Duration`` and ``Invocations`` by function), priced at each pool's memory.
+
+    Not from the cost ledger: tasks run with the function role, so anything that role could write
+    a task could rewrite, and an invocation that times out never gets to write. Init time isn't
+    in ``Duration`` (images are billed for it), so this runs a little low; hours are rounded out
+    to whole hours, so a window that doesn't start on the hour runs a little high. Lambda time
+    isn't instance-hours.
+    """
+    from datetime import UTC, datetime
+
+    lam = {n: p for n, p in sorted(pools.items()) if is_lambda(p)}
+    if not lam or end <= start:
+        return pricing.Accrued(0.0, 0.0, {}, {}, frozenset())
+    queries = []
+    for i, entry in enumerate(lam.values()):
+        fn = str(entry.get("function_name") or "")
+        for metric, stat in (("Duration", "Sum"), ("Invocations", "Sum")):
+            queries.append(
+                {
+                    "Id": f"{metric[0].lower()}{i}",
+                    "MetricStat": {
+                        "Metric": {
+                            "Namespace": "AWS/Lambda",
+                            "MetricName": metric,
+                            "Dimensions": [{"Name": "FunctionName", "Value": fn}],
+                        },
+                        "Period": METRIC_PERIOD_S,
+                        "Stat": stat,
+                    },
+                    "ReturnData": True,
+                }
+            )
+    lo = start - start % METRIC_PERIOD_S
+    totals: dict[str, float] = {}
+    for i in range(0, len(queries), 500):
+        kw: dict[str, Any] = {
+            "MetricDataQueries": queries[i : i + 500],
+            "StartTime": datetime.fromtimestamp(lo, UTC),
+            "EndTime": datetime.fromtimestamp(end, UTC),
+        }
+        while True:
+            r = cloudwatch.get_metric_data(**kw)
+            for res in r.get("MetricDataResults", []):
+                totals[res["Id"]] = totals.get(res["Id"], 0.0) + sum(res.get("Values", []))
+            if not r.get("NextToken"):
+                break
+            kw["NextToken"] = r["NextToken"]
+    usd = 0.0
+    by_pool: dict[str, float] = {}
+    by_type: dict[str, float] = {}
+    for i, (pool, entry) in enumerate(lam.items()):
+        billed_s = totals.get(f"d{i}", 0.0) / 1000
+        cost = pricing.lambda_cost(billed_s, memory_mib(entry), int(totals.get(f"i{i}", 0)))
+        if not cost:
+            continue
+        usd += cost
+        by_pool[pool] = by_pool.get(pool, 0.0) + cost
+        kind = f"lambda-{memory_mib(entry)}MB"
+        by_type[kind] = by_type.get(kind, 0.0) + cost
+    return pricing.Accrued(usd, 0.0, by_pool, by_type, frozenset({"static"} if usd else set()))

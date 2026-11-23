@@ -241,7 +241,10 @@ def status(
     if s3 is not None and prices is not None:
         from aegc.spend import SpendGuard
 
-        guard = SpendGuard(s3=s3, bucket=str(m["bucket"]), deployment=deployment, prices=prices)
+        guard = SpendGuard(
+            s3=s3, bucket=str(m["bucket"]), deployment=deployment, prices=prices, cloudwatch=cw,
+            pools=dict(m.get("pools") or {}),
+        )  # fmt: skip
         try:
             out.spend_today = round(guard.accrued("day", now).usd, 4)
             out.spend_month = round(guard.accrued("month", now).usd, 4)

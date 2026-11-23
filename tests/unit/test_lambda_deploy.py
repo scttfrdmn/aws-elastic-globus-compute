@@ -208,7 +208,7 @@ def test_deploy_creates_role_function_and_mapping(
 
     # The queue: visibility past the function's timeout (an SQS mapping needs at least that).
     a = c.sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["All"])["Attributes"]
-    assert int(a["VisibilityTimeout"]) == 900 + deployment.LAMBDA_VISIBILITY_MARGIN_S
+    assert int(a["VisibilityTimeout"]) == 900 * deployment.LAMBDA_VISIBILITY_FACTOR
     assert json.loads(a["RedrivePolicy"])["maxReceiveCount"] in (6, "6")
 
     # Lambda pulls the image as the service, for aegc-* functions only.
@@ -294,7 +294,7 @@ def test_halted_deployment_keeps_its_mapping_disabled(
     state.write_state(c.ssm, "dev", state.State(reason="resumed", by="aegc resume"))
     r = deployment.deploy(c, spec2)
     (act,) = [a for a in r.actions if a.resource == "lambda event source mapping"]
-    assert act.outcome == "kept" and "aegc resume" in act.detail
+    assert act.outcome == "kept" and "enable it while the deployment runs" in act.detail
 
 
 def test_dry_run_creates_nothing(env: tuple[Clients, DeploymentSpec, dict[str, list[Any]]]) -> None:
@@ -590,7 +590,6 @@ def test_function_role_is_scoped_to_its_pool(aws: Callable[[str], Any]) -> None:
         ("sqs:SendMessage", f"{SQS}:aegc-dev-res-1234567890ab"),
         ("s3:GetObject", f"arn:aws:s3:::{BUCKET}/payloads/dev/tasks/u/1.task"),
         ("s3:PutObject", f"arn:aws:s3:::{BUCKET}/payloads/dev/results/u/u:1.result"),
-        ("s3:PutObject", f"arn:aws:s3:::{BUCKET}/ledger/dev/2026-11-23/lambda-1.json"),
         ("ssm:GetParameter", f"arn:aws:ssm:{REGION}:{ACCOUNT}:parameter/aegc/dev/state"),
         ("logs:PutLogEvents", f"arn:aws:logs:{REGION}:{ACCOUNT}:log-group:/aegc/dev:log-stream:x"),
         ("ecr:BatchGetImage", f"{ecr}/aegc/geospatial"),
@@ -598,6 +597,8 @@ def test_function_role_is_scoped_to_its_pool(aws: Callable[[str], Any]) -> None:
         assert decide(c, arn, action, res) == "allowed", (action, res)
     for action, res in [
         ("sqs:ReceiveMessage", f"{SQS}:aegc-dev-sci-py314-tasks"),  # another pool's queue
+        # Review: tasks run with this role; Lambda spend comes from Lambda's metrics instead.
+        ("s3:PutObject", f"arn:aws:s3:::{BUCKET}/ledger/dev/2026-11-23/lambda-1.json"),
         ("sqs:ReceiveMessage", f"{SQS}:aegc-prod-{NAME}-tasks"),
         ("sqs:SendMessage", f"{SQS}:aegc-dev-{NAME}-tasks"),  # no submitting
         ("sqs:DeleteQueue", f"{SQS}:aegc-dev-{NAME}-tasks"),
@@ -649,7 +650,9 @@ def test_operator_can_freeze_only_its_own_lambda_pools(aws: Callable[[str], Any]
         aws, iam.operator_policy(deployment="dev", region=REGION, account=ACCOUNT, bucket=BUCKET)
     )
     ours = {"lambda:FunctionArn": f"{FN}:{FUNCTION}", "aws:ResourceTag/aegc:deployment": "dev"}
-    for action in ("lambda:UpdateEventSourceMapping", "lambda:GetEventSourceMapping"):
+    # Reads aren't conditioned (the Lambda guide says GetEventSourceMapping takes none).
+    assert decide(c, arn, "lambda:GetEventSourceMapping", ESM) == "allowed"
+    for action in ("lambda:UpdateEventSourceMapping",):
         assert decide(c, arn, action, ESM, **ours) == "allowed"
         for other in ({"lambda:FunctionArn": f"{FN}:aegc-prod-x"},
                       {"aws:ResourceTag/aegc:deployment": "prod"}):  # fmt: skip

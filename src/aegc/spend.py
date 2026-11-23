@@ -4,8 +4,9 @@ Admission follows the user's ASBB budget service: before scaling out, hold the p
 1.2 x the expected rate over the next hour (or the rest of the period, if shorter) and admit only
 what fits under every cap. A cap that's already reached trips the deployment to ``capped``.
 
-Spend comes from the cost ledger (:mod:`aegc.ledger`) priced by :func:`aegc.pricing.accrue`, the
-same numbers ``aegc cost`` shows.
+Spend comes from the cost ledger (:mod:`aegc.ledger`) priced by :func:`aegc.pricing.accrue`, plus
+Lambda pools' spend from Lambda's metrics (:func:`aegc.lambda_pools.accrue_metrics`): the same
+numbers ``aegc cost`` shows.
 """
 
 from __future__ import annotations
@@ -39,6 +40,8 @@ class SpendGuard:
         prices: pricing.Prices,
         clock: Callable[[], float] = time.time,
         ledger_ttl_s: float = 300.0,
+        cloudwatch: Any = None,
+        pools: dict[str, dict[str, Any]] | Callable[[], dict[str, dict[str, Any]]] | None = None,
     ) -> None:
         self.s3 = s3
         self.bucket = bucket
@@ -48,6 +51,9 @@ class SpendGuard:
         self.ledger_ttl_s = ledger_ttl_s
         self._records: list[dict[str, Any]] = []
         self._read_at = -math.inf
+        self.cloudwatch = cloudwatch
+        self._pools = pools  # the manifest's pools (or a callable giving them): Lambda pools
+        self._lambda: dict[str, tuple[float, float, pricing.Accrued]] = {}
 
     def records(self, now: float) -> list[dict[str, Any]]:
         """This month's ledger records (re-read at most every ``ledger_ttl_s``)."""
@@ -58,7 +64,22 @@ class SpendGuard:
         return self._records
 
     def accrued(self, kind: str, now: float) -> pricing.Accrued:
-        return pricing.accrue(self.records(now), period_start(kind, now), now, self.prices)
+        start = period_start(kind, now)
+        a = pricing.accrue(self.records(now), start, now, self.prices)
+        return pricing.combine(a, self.lambda_accrued(kind, start, now))
+
+    def lambda_accrued(self, kind: str, start: float, now: float) -> pricing.Accrued:
+        """Lambda pools' spend since ``start`` (re-read at most every ``ledger_ttl_s``)."""
+        from aegc import lambda_pools
+
+        pools = self._pools() if callable(self._pools) else (self._pools or {})
+        if self.cloudwatch is None or not any(lambda_pools.is_lambda(p) for p in pools.values()):
+            return pricing.Accrued(0.0, 0.0, {}, {}, frozenset())
+        hit = self._lambda.get(kind)
+        if hit is None or hit[0] != start or now - hit[1] >= self.ledger_ttl_s:
+            hit = (start, now, lambda_pools.accrue_metrics(self.cloudwatch, pools, start, now))
+            self._lambda[kind] = hit
+        return hit[2]
 
     def check(self, limits: Limits, now: float) -> Trip | None:
         """A trip if any cap is already reached."""

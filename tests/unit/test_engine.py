@@ -75,7 +75,7 @@ class Env:
         )
         self.task_queue = self.sqs.get_queue_url(QueueName="aegc-dev-geo-py314-tasks")["QueueUrl"]
 
-    def engine(self, *, python_minor: str = "3.14", **kw: Any) -> AWSEngine:
+    def engine(self, *, python_minor: str = "3.14", cloudwatch: Any = None, **kw: Any) -> AWSEngine:
         e = AWSEngine(
             deployment="dev",
             region=REGION,
@@ -94,6 +94,7 @@ class Env:
             "ec2": self.aws("ec2"),
             "pricing": self.aws("pricing"),
             "lambda": self.aws("lambda"),
+            "cloudwatch": cloudwatch or self.aws("cloudwatch"),
         }
         e.start(endpoint_id=EID, run_dir=str(self.tmp / "ep"))
         # Tests drive scale_once() with a fake clock; let the scaler's real-time first pass

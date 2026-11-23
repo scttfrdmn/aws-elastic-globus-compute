@@ -211,7 +211,8 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         try:
             sess = awsutil.session(self.aws_profile, self.region)
             self.region = self.region or (sess.region_name or "")
-            for svc in ("sqs", "s3", "ssm", "autoscaling", "ec2", "scheduler", "lambda"):
+            for svc in ("sqs", "s3", "ssm", "autoscaling", "ec2", "scheduler", "lambda",
+                        "cloudwatch"):  # fmt: skip
                 if svc not in self._clients:  # tests inject clients before start()
                     self._clients[svc] = awsutil.client(sess, svc)
             if "pricing" not in self._clients:  # the Price List API lives in us-east-1
@@ -225,6 +226,8 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
                     s3=self._clients["s3"],
                     bucket=str(self._manifest["bucket"]),
                     deployment=self.deployment,
+                    cloudwatch=self._clients.get("cloudwatch"),
+                    pools=lambda: dict((self._manifest or {}).get("pools") or {}),
                     prices=Prices(
                         region=self.region,
                         ec2=self._clients["ec2"],
@@ -908,11 +911,12 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         self._reconcile_mappings(pools, snap, now)
         limits = Limits.from_dict(self._manifest.get("limits"))
         rate_now, instances_now = self._current_rate(pools, groups)
-        snap.usd_per_hour = rate_now + self._lambda_rate(pools, snap)
-        # Admission counts Lambda pools at their worst case: every environment busy.
-        worst_rate, worst_instances = _lambda_worst_case(pools)
-        rate_now += worst_rate
-        instances_now += worst_instances
+        # Lambda pools at what's running now (in flight x hourly): their worst case (every
+        # environment busy) would hold back EC2 pools under a cap even while Lambda is idle. A
+        # Lambda burst is caught by the cap trip, from Lambda's own metrics (aegc.lambda_pools).
+        # Lambda time isn't instance-hours.
+        rate_now += self._lambda_rate(pools, snap)
+        snap.usd_per_hour = rate_now
         if limits.any and self._spend is not None and self._state.running:
             try:
                 snap.spend_today = round(self._spend.accrued("day", now).usd, 4)
@@ -1221,15 +1225,6 @@ def _prefer_ec2(pools: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """The EC2 pools, if there are any: tasks go to a Lambda pool only by name, or when only
     Lambda pools serve their env (and Python)."""
     return {n: p for n, p in pools.items() if not lambda_pools.is_lambda(p)} or pools
-
-
-def _lambda_worst_case(pools: dict[str, dict[str, Any]]) -> tuple[float, float]:
-    """($/h, busy environments) of every Lambda pool at its maximum concurrency."""
-    lam = [p for p in pools.values() if lambda_pools.is_lambda(p)]
-    return (
-        sum(lambda_pools.worst_case_usd_per_hour(p) for p in lam),
-        float(sum(lambda_pools.concurrency(p) for p in lam)),
-    )
 
 
 def _per_task(pool: dict[str, Any]) -> tuple[float, float]:

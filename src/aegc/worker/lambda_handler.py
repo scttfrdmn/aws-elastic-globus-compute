@@ -13,8 +13,13 @@ record goes through the same path as on EC2 (:mod:`aegc.worker.process`):
 - **Scratch** is ``/tmp/aegc`` (the only writable path).
 - **Failures:** a record whose result couldn't be posted (or that couldn't be read) is returned
   in ``batchItemFailures``, so SQS delivers it again; the dead-letter queue catches the rest.
-- **Ledger:** one record per execution environment, with its billed seconds and invocations,
-  written on its first invocation and then at most every :data:`LEDGER_EVERY_S`.
+- **Visibility:** the queue's visibility timeout is 6x the function's timeout (what AWS
+  recommends, so throttled deliveries aren't redelivered while they wait), and each record's is
+  set to the invocation's remaining time plus a minute when it starts: a task that crashes the
+  environment is retried after that, not after 6x.
+- **Spend** isn't written here: Lambda's own metrics price Lambda pools
+  (:func:`aegc.lambda_pools.accrue_metrics`), which task code can't change and which count
+  invocations that time out.
 
 Tasks run with the function role's credentials: Lambda pools aren't isolated (``isolate`` is
 refused for them), and their role holds only the pool's grants.
@@ -32,7 +37,7 @@ from multiprocessing.context import BaseContext
 from pathlib import Path
 from typing import Any
 
-from aegc import __version__, ledger, pricing
+from aegc import __version__, pricing
 from aegc.state import State, read_state
 from aegc.worker import emf
 from aegc.worker.config import WorkerConfig
@@ -41,9 +46,11 @@ from aegc.worker.process import Handled, Job, Processor
 log = logging.getLogger("aegc.worker")
 
 #: Kept from the invocation's remaining time for posting the result.
+#: (After the walltime, the runner gives the task 5 s to stop and 10 s more before SIGKILL.)
 MARGIN_S = 20
 STATE_TTL_S = 60.0
-LEDGER_EVERY_S = 30.0
+#: A record stays invisible this long past the invocation's deadline.
+VISIBILITY_SLACK_S = 60
 SCRATCH = "/tmp/aegc"
 
 #: When this execution environment's init began (container images are billed for init).
@@ -77,11 +84,6 @@ class Runtime:
     init_at: float = _INIT_AT
     _halt: State | None = field(default=None, init=False)
     _state_at: float = field(default=-1e18, init=False)
-    _billed_s: float = field(default=0.0, init=False)
-    _invocations: int = field(default=0, init=False)
-    _tasks: int = field(default=0, init=False)
-    _first_at: float = field(default=0.0, init=False)
-    _ledger_at: float = field(default=-1e18, init=False)
     _request_id: str = field(default="", init=False)
 
     def __post_init__(self) -> None:
@@ -110,29 +112,19 @@ class Runtime:
     # --- one invocation -----------------------------------------------------------------------
 
     def invoke(self, event: dict[str, Any], context: Any) -> dict[str, Any]:
-        entered = self.clock()
-        first = self._invocations == 0
-        self._invocations += 1
-        self._first_at = self._first_at or entered
         self._request_id = str(getattr(context, "aws_request_id", "") or "")
         failures: list[dict[str, str]] = []
-        try:
-            for rec in event.get("Records", []):
-                if not self.handle(rec, context):
-                    failures.append({"itemIdentifier": str(rec.get("messageId", ""))})
-        finally:
-            done = self.clock()
-            billed = done - entered
-            if first:
-                billed += max(0.0, entered - self.init_at)  # init, billed for images
-            self._billed_s += round(billed + 0.0005, 3)  # billed per ms, rounded up
-            if first or done - self._ledger_at >= LEDGER_EVERY_S:
-                self.write_ledger(done)
+        for rec in event.get("Records", []):
+            if not self.handle(rec, context):
+                failures.append({"itemIdentifier": str(rec.get("messageId", ""))})
         return {"batchItemFailures": failures}
 
     def handle(self, rec: dict[str, Any], context: Any) -> bool:
         """One SQS record; False: report it as a batch item failure."""
         receive_count = int((rec.get("attributes") or {}).get("ApproximateReceiveCount", 1))
+        receipt = str(rec.get("receiptHandle") or "")
+        if receipt:  # until just past this invocation's deadline (see the module docstring)
+            self._visibility(receipt, int(_remaining_s(context)) + VISIBILITY_SLACK_S)
         got = self.proc.accept(
             rec,
             receive_count=receive_count,
@@ -141,7 +133,6 @@ class Runtime:
         )
         if isinstance(got, Handled):
             return not got.retry
-        self._tasks += 1
         left_s = _remaining_s(context) - self.margin_s
         if left_s < 1:
             log.warning("no time left to run %s; releasing it", got.msg.executor_task_id)
@@ -178,14 +169,19 @@ class Runtime:
             log.warning("couldn't delete a task message: %s", e)
 
     def _release(self, receipt: str) -> None:
+        self._visibility(receipt, 0)
+
+    def _visibility(self, receipt: str, seconds: int) -> None:
         try:
             self.sqs.change_message_visibility(
-                QueueUrl=self.config.task_queue_url, ReceiptHandle=receipt, VisibilityTimeout=0
+                QueueUrl=self.config.task_queue_url,
+                ReceiptHandle=receipt,
+                VisibilityTimeout=max(0, min(seconds, 43_200)),
             )
         except Exception as e:
-            log.warning("couldn't release a task message: %s", e)
+            log.warning("couldn't change a task message's visibility: %s", e)
 
-    # --- provenance and the ledger --------------------------------------------------------
+    # --- provenance -----------------------------------------------------------------------------
 
     def worker_info(self) -> dict[str, Any]:
         return {
@@ -224,34 +220,6 @@ class Runtime:
             "est_cost_usd": round(cost, 8),
             "est_cost_source": "static",
         }
-
-    def ledger_record(self, now: float) -> ledger.Record:
-        return ledger.Record(
-            instance_id=self.env_id,
-            deployment=self.config.deployment,
-            pool=self.config.pool,
-            instance_type=self.instance_type,
-            availability_zone="",
-            lifecycle="lambda",
-            vcpus=os.cpu_count() or 0,
-            launched_at=self.init_at,
-            last_seen=now,
-            tasks=self._tasks,
-            busy_slot_s=round(self._billed_s, 3),
-            kind="lambda",
-            memory_mib=self.memory_mib,
-            billed_s=round(self._billed_s, 3),
-            invocations=self._invocations,
-        )
-
-    def write_ledger(self, now: float) -> None:
-        if not self.config.ledger:
-            return
-        try:
-            ledger.write(self.s3, self.config.bucket, self.ledger_record(now))
-            self._ledger_at = now
-        except Exception as e:
-            log.warning("couldn't write the cost ledger: %s", e)
 
 
 def _remaining_s(context: Any) -> float:
@@ -294,8 +262,20 @@ def runtime(env: dict[str, str] | None = None) -> Runtime:
             deployment=cfg.deployment, pool=cfg.pool, instance_id=rt.env_id, function=rt.function
         )
         Path(SCRATCH).mkdir(parents=True, exist_ok=True)
+        _warm_forkserver()
         _runtime = rt
     return _runtime
+
+
+def _warm_forkserver() -> None:
+    """Start the forkserver (and its globus_compute_endpoint preload) during init, so the first
+    task's start doesn't eat into the time its walltime was computed from."""
+    try:
+        from multiprocessing import forkserver
+
+        forkserver.ensure_running()
+    except Exception as e:  # pragma: no cover - the first task starts it instead
+        log.warning("couldn't start the forkserver early: %s", e)
 
 
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:

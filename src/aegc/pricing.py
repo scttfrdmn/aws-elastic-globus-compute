@@ -252,16 +252,6 @@ def accrue(records: Iterable[dict[str, Any]], start: float, end: float, prices: 
     by_type: dict[str, float] = {}
     sources: set[str] = set()
     for r in records:
-        if r.get("kind") == "lambda":
-            cost, h = _accrue_lambda(r, start, end)
-            if cost or h:
-                usd += cost
-                hours += h
-                sources.add("static")
-                pool, kind = str(r.get("pool", "")), f"lambda-{int(r.get('memory_mib', 0))}MB"
-                by_pool[pool] = by_pool.get(pool, 0.0) + cost
-                by_type[kind] = by_type.get(kind, 0.0) + cost
-            continue
         lo = max(start, float(r.get("launched_at", 0)))
         last = float(r.get("last_seen", lo))
         # Records are written every 5 min and read up to 5 min late: 20 min of slack.
@@ -288,15 +278,16 @@ def accrue(records: Iterable[dict[str, Any]], start: float, end: float, prices: 
     return Accrued(usd, hours, by_pool, by_type, frozenset(sources))
 
 
-def _accrue_lambda(r: dict[str, Any], start: float, end: float) -> tuple[float, float]:
-    """A Lambda record's dollars and busy hours in ``[start, end)``: its billed time, spread
-    evenly over the span from its first invocation to its last."""
-    first = float(r.get("launched_at", 0))
-    last = float(r.get("last_seen", first))
-    if last <= first:
-        frac = 1.0 if start <= last < end else 0.0
-    else:
-        frac = max(0.0, min(end, last) - max(start, first)) / (last - first)
-    billed = float(r.get("billed_s", 0))
-    total = lambda_cost(billed, int(r.get("memory_mib", 0)), int(r.get("invocations", 0)))
-    return total * frac, billed / 3600 * frac
+def combine(a: Accrued, b: Accrued) -> Accrued:
+    """``a`` and ``b`` together (the ledger's instances and Lambda's metrics)."""
+
+    def add(x: dict[str, float], y: dict[str, float]) -> dict[str, float]:
+        return {k: x.get(k, 0.0) + y.get(k, 0.0) for k in {*x, *y}}
+
+    return Accrued(
+        a.usd + b.usd,
+        a.instance_hours + b.instance_hours,
+        add(a.by_pool, b.by_pool),
+        add(a.by_type, b.by_type),
+        a.sources | b.sources,
+    )

@@ -69,7 +69,8 @@ def stop(
     Workers see the state within a minute, fail anything still queued with AEGC_STOPPED, finish
     their tasks (or, with ``hard``, fail them now), then leave their groups. With ``hard``, any
     instance still in a group after ``grace_s`` is terminated. Lambda invocations already running
-    finish; records delivered after the state changed are refused with a final result.
+    finish; records delivered after the state changed are refused with a final result (an execution
+    environment rereads the state at most a minute apart, so a few may still run).
     """
     report = ControlReport()
     m = read_manifest(ssm, deployment)
@@ -227,8 +228,9 @@ class CostReport:
             lines.append(f"  {key or '?'}: ${usd:.4f}")
         lines.append(
             "  estimate from the cost ledger: instance time x Spot or on-demand price, plus root "
-            "volume and IPv4; Lambda pools (lambda-<memory>MB): billed time x memory, plus "
-            "requests; SQS, S3, ECR, logs and data transfer aren't included"
+            "volume and IPv4; Lambda pools (lambda-<memory>MB, from Lambda's Duration and "
+            "Invocations metrics): duration x memory, plus requests; SQS, S3, ECR, logs and "
+            "data transfer aren't included"
         )
         if self.actual:
             lines.append(self.actual)
@@ -248,11 +250,20 @@ def cost(
     since: str = "today",
     by: str = "pool",
     now: float | None = None,
+    cloudwatch: Any = None,
+    pools: dict[str, dict[str, Any]] | None = None,
 ) -> CostReport:
+    """The ledger's instances, plus Lambda pools (``pools``, the manifest's) from Lambda's
+    metrics when ``cloudwatch`` is given."""
+    from aegc import lambda_pools
+
     now = time.time() if now is None else now
     start = window_start(since, now)
     recs = list(ledger.read(s3, bucket, deployment, start, now))
-    return CostReport(deployment, start, now, pricing.accrue(recs, start, now, prices), by)
+    a = pricing.accrue(recs, start, now, prices)
+    if cloudwatch is not None and pools:
+        a = pricing.combine(a, lambda_pools.accrue_metrics(cloudwatch, pools, start, now))
+    return CostReport(deployment, start, now, a, by)
 
 
 def window_start(since: str, now: float) -> float:

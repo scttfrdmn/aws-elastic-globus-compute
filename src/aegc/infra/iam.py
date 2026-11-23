@@ -408,8 +408,8 @@ def function_policy(
 
     The event source mapping receives from the pool's task queue with this role; the handler
     deletes and releases its messages, moves payloads, posts results, reads the deployment's
-    state (and the manifest, for aegc.outputs' current grants), writes the cost ledger and its
-    log streams in ``/aegc/<d>``, and the image is pulled from ``aegc/<env>``. No Auto Scaling
+    state (and the manifest, for aegc.outputs' current grants) and writes its log streams in
+    ``/aegc/<d>``, and the image is pulled from ``aegc/<env>``. No Auto Scaling
     and no task role: Lambda pools aren't isolated, so this role holds the grants itself.
     """
     sqs = f"arn:aws:sqs:{region}:{account}"
@@ -445,12 +445,6 @@ def function_policy(
                 "Effect": "Allow",
                 "Action": "s3:PutObject",
                 "Resource": f"arn:aws:s3:::{bucket}/payloads/{d}/results/*",
-            },
-            {
-                "Sid": "WriteCostLedger",
-                "Effect": "Allow",
-                "Action": "s3:PutObject",
-                "Resource": f"arn:aws:s3:::{bucket}/ledger/{d}/*",
             },
             {
                 "Sid": "ReadDeploymentState",
@@ -652,7 +646,7 @@ def operator_policy(*, deployment: str, region: str, account: str, bucket: str) 
                 # Lambda pools (#21): caps, stop and resume disable and enable their mappings.
                 "Sid": "FreezeLambdaPools",
                 "Effect": "Allow",
-                "Action": ["lambda:GetEventSourceMapping", "lambda:UpdateEventSourceMapping"],
+                "Action": "lambda:UpdateEventSourceMapping",
                 "Resource": f"arn:aws:lambda:{region}:{account}:event-source-mapping:*",
                 "Condition": {
                     "ArnLike": {
@@ -663,10 +657,15 @@ def operator_policy(*, deployment: str, region: str, account: str, bucket: str) 
                 },
             },
             {
+                # Reads unconditioned: the Lambda guide says GetEventSourceMapping takes no
+                # conditions, and a denied read would leave a frozen pool frozen.
                 "Sid": "ReadLambdaPools",
                 "Effect": "Allow",
-                "Action": "lambda:GetFunctionConfiguration",
-                "Resource": f"arn:aws:lambda:{region}:{account}:function:{naming.PREFIX}-{d}-*",
+                "Action": ["lambda:GetFunctionConfiguration", "lambda:GetEventSourceMapping"],
+                "Resource": [
+                    f"arn:aws:lambda:{region}:{account}:function:{naming.PREFIX}-{d}-*",
+                    f"arn:aws:lambda:{region}:{account}:event-source-mapping:*",
+                ],
             },
             VCPU_QUOTA_STATEMENT,
         ],
@@ -900,7 +899,8 @@ def lambda_deployer_policy(*, region: str, account: str) -> dict[str, Any]:
              "Resource": functions, "Condition": managed_res},
             # Reads aren't tag-conditioned: a missing function must read as missing.
             {"Sid": "ReadFunctions", "Effect": "Allow",
-             "Action": ["lambda:GetFunction", "lambda:GetFunctionConfiguration", "lambda:ListTags"],
+             "Action": ["lambda:GetFunction", "lambda:GetFunctionConfiguration", "lambda:ListTags",
+                        "lambda:GetEventSourceMapping"],
              "Resource": [functions, mappings]},
             {"Sid": "CreateMappingsTagged", "Effect": "Allow",
              "Action": "lambda:CreateEventSourceMapping", "Resource": "*",
@@ -908,8 +908,7 @@ def lambda_deployer_policy(*, region: str, account: str) -> dict[str, Any]:
             {"Sid": "TagMappingsOnCreate", "Effect": "Allow", "Action": "lambda:TagResource",
              "Resource": mappings, "Condition": {"StringEquals": managed_req}},
             {"Sid": "ChangeMappings", "Effect": "Allow",
-             "Action": ["lambda:GetEventSourceMapping", "lambda:UpdateEventSourceMapping",
-                        "lambda:DeleteEventSourceMapping"],
+             "Action": ["lambda:UpdateEventSourceMapping", "lambda:DeleteEventSourceMapping"],
              "Resource": mappings, "Condition": of_aegc},
             # destroy finds function roles left by an interrupted destroy (tags decide).
             {"Sid": "ListLambda", "Effect": "Allow",

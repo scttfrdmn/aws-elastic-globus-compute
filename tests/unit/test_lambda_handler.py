@@ -9,9 +9,9 @@ from typing import Any
 
 import pytest
 
-from aegc import ledger, pricing, state
+from aegc import ledger, state
 from aegc.worker import emf
-from aegc.worker.lambda_handler import Runtime, environment_id
+from aegc.worker.lambda_handler import VISIBILITY_SLACK_S, Runtime, environment_id
 from tests.unit.test_worker import BUCKET, Rig, double, sleeper, value_of
 from tests.unit.test_worker import rig as rig  # the fixture
 
@@ -62,7 +62,7 @@ def event(rig: Rig, n: int = 1) -> dict[str, Any]:
 
 
 @pytest.mark.timeout(120)
-def test_runs_a_task_and_records_lambda_provenance_and_cost(rig: Rig) -> None:
+def test_runs_a_task_with_lambda_provenance(rig: Rig) -> None:
     rt = runtime(rig)
     tid = rig.submit(double, 21)
     assert rt.invoke(event(rig), Context()) == {"batchItemFailures": []}
@@ -70,9 +70,7 @@ def test_runs_a_task_and_records_lambda_provenance_and_cost(rig: Rig) -> None:
     assert value_of(res, rig.s3) == (False, 42)
     assert res.worker["backend"] == "lambda" and res.worker["instance_id"] == environment_id(STREAM)
     assert rig.task_queue_empty()  # deleted, not left for the mapping
-    (rec,) = [json.loads(o["Body"].read()) for o in _ledger(rig)]
-    assert rec["kind"] == "lambda" and rec["invocations"] == 1 and rec["memory_mib"] == 2048
-    assert rec["billed_s"] > 0 and rec["tasks"] == 1
+    assert not _ledger(rig)  # Lambda spend comes from Lambda's metrics, not the function role
     assert rig.metric_values("TasksCompleted", "ok") == [1.0]
 
 
@@ -144,16 +142,19 @@ def test_environment_ids_are_ledger_safe() -> None:
     assert "/" not in environment_id("a/b/[1]c/d")
 
 
-def test_lambda_ledger_records_are_priced_by_billed_time() -> None:
-    rec = {"kind": "lambda", "pool": "p", "memory_mib": 2048, "billed_s": 1000.0,
-           "invocations": 1000, "launched_at": 0.0, "last_seen": 3600.0}  # fmt: skip
-    p = pricing.Prices(region="us-west-2")
-    whole = pricing.accrue([rec], 0, 7200, p)
-    expect = 1000 * 2 * pricing.LAMBDA_ARM_GB_S + 1000 * pricing.LAMBDA_REQUEST
-    assert whole.usd == pytest.approx(expect) and whole.by_type == {"lambda-2048MB": whole.usd}
-    half = pricing.accrue([rec], 1800, 7200, p)  # half its span: half its cost
-    assert half.usd == pytest.approx(expect / 2)
-    assert pricing.accrue([{**rec, "last_seen": 0.0}], 10, 20, p).usd == 0
+@pytest.mark.timeout(60)
+def test_a_started_record_is_invisible_until_just_past_the_deadline(rig: Rig) -> None:
+    # Review: the queue's visibility is 6x the timeout (AWS's advice for throttling); each
+    # record's own is set to the invocation's remaining time plus a minute when it starts.
+    calls: list[dict[str, Any]] = []
+    rig.sqs.meta.events.register(
+        "provide-client-params.sqs.ChangeMessageVisibility",
+        lambda params, **_: calls.append(dict(params)),
+    )
+    rt = runtime(rig)
+    rig.submit(double, 4)
+    rt.invoke(event(rig), Context(remaining_s=300))
+    assert calls and calls[0]["VisibilityTimeout"] == 300 + VISIBILITY_SLACK_S
 
 
 def test_runtime_api_loop() -> None:

@@ -753,6 +753,14 @@ def _deploy(args: argparse.Namespace) -> int:
             "them with `aegc image build` to isolate tasks",
             file=sys.stderr,
         )
+    if lam := [p.name for p in pools if p.is_lambda]:
+        print(
+            f"note: {', '.join(lam)}: Lambda pools aren't isolated. Their tasks run with the "
+            "function role, which can read this deployment's task payloads and post results for "
+            "any of its tasks; run untrusted functions on isolated EC2 pools in a deployment "
+            "without Lambda pools",
+            file=sys.stderr,
+        )
     # vCPU quotas are for EC2 pools; Lambda pools are bounded by their mappings' concurrency.
     errors = _quota_preflight(sess, [asdict(p) for p in pools if not p.is_lambda])
     if errors and not args.dry_run:
@@ -879,10 +887,18 @@ def _limits(args: argparse.Namespace) -> int:
     from aegc.spend import SpendGuard
 
     sess, region, account = _ctx(args)
+
+    def pools() -> dict[str, dict[str, Any]]:
+        from aegc.infra.deployment import read_manifest
+
+        return dict(read_manifest(awsutil.client(sess, "ssm"), args.deployment).get("pools") or {})  # type: ignore[arg-type]
+
     spend = SpendGuard(
         s3=awsutil.client(sess, "s3"),  # type: ignore[arg-type]
         bucket=naming.bucket_name(account, region),
         deployment=args.deployment,
+        cloudwatch=awsutil.client(sess, "cloudwatch"),  # type: ignore[arg-type]
+        pools=pools,
         prices=pricing.Prices(
             region=region,
             ec2=awsutil.client(sess, "ec2"),  # type: ignore[arg-type]
@@ -918,6 +934,12 @@ def _cost(args: argparse.Namespace) -> int:
         ec2=awsutil.client(sess, "ec2"),  # type: ignore[arg-type]
         pricing=awsutil.client(awsutil.session(args.profile, "us-east-1"), "pricing"),
     )
+    try:
+        from aegc.infra.deployment import read_manifest
+
+        pools = dict(read_manifest(awsutil.client(sess, "ssm"), args.deployment).get("pools") or {})  # type: ignore[arg-type]
+    except Exception:  # destroyed: the ledger is all there is
+        pools = {}
     report = control.cost(
         s3=awsutil.client(sess, "s3"),  # type: ignore[arg-type]
         bucket=naming.bucket_name(account, region),
@@ -925,6 +947,8 @@ def _cost(args: argparse.Namespace) -> int:
         prices=prices,
         since=args.since,
         by=args.by,
+        cloudwatch=awsutil.client(sess, "cloudwatch"),  # type: ignore[arg-type]
+        pools=pools,
     )
     if args.actual:
         report.actual = control.actual_cost(

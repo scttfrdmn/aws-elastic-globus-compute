@@ -146,6 +146,8 @@ def evaluate(
                 prices=Prices(
                     region=region, ec2=clients.get("ec2"), pricing=clients.get("pricing")
                 ),
+                cloudwatch=clients.get("cloudwatch"),
+                pools=dict(m.get("pools") or {}),
             )
             trip = guard.check(limits, now)
             if trip is not None:

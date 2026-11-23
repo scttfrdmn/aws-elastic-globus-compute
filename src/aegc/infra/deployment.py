@@ -51,7 +51,10 @@ EC2_ONLY = (
 )  # fmt: skip
 #: PoolSpec fields only Lambda pools use; EC2 pools keep them 0.
 LAMBDA_ONLY = ("memory_mib", "timeout_s", "max_concurrency", "ephemeral_mib")
-LAMBDA_VISIBILITY_MARGIN_S = 60
+#: AWS recommends a queue visibility of 6x the function's timeout for an SQS mapping, so a
+#: throttled delivery isn't redelivered while it waits; the handler shortens each record's own
+#: visibility to its invocation's deadline plus a minute once it starts.
+LAMBDA_VISIBILITY_FACTOR = 6
 
 
 @dataclass(frozen=True)
@@ -765,10 +768,10 @@ def ensure_queue(
 
 
 def task_visibility_s(pool: PoolSpec) -> int:
-    """The task queue's visibility timeout. An SQS event source mapping needs it to be at least
-    the function's timeout; the margin covers the mapping's own handling."""
+    """The task queue's visibility timeout. An SQS event source mapping needs at least the
+    function's timeout (AWS recommends 6x; SQS allows 12 h at most)."""
     if pool.is_lambda:
-        return max(TASK_VISIBILITY_S, pool.timeout_s + LAMBDA_VISIBILITY_MARGIN_S)
+        return min(43_200, max(TASK_VISIBILITY_S, pool.timeout_s * LAMBDA_VISIBILITY_FACTOR))
     return TASK_VISIBILITY_S
 
 
@@ -1464,7 +1467,8 @@ def ensure_mapping(
             report.add("lambda event source mapping", label, "exists", uuid)
         else:
             report.add("lambda event source mapping", label, "kept",
-                       f"{uuid} is disabled; `aegc resume` enables it")  # fmt: skip
+                       f"{uuid} is disabled; engines and the evaluator enable it while the "
+                       "deployment runs")  # fmt: skip
         return uuid
     detail = ", ".join(changes)
     if dry_run:

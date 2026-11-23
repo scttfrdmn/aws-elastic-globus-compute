@@ -187,33 +187,72 @@ def test_lambda_pools_are_not_scaled_but_reported(env: Env) -> None:
 
 
 @pytest.mark.timeout(60)
-def test_admission_counts_lambda_pools_at_their_worst_case(env: Env) -> None:
+def test_an_idle_lambda_pool_doesnt_hold_back_ec2(env: Env) -> None:
+    # Review: admission charged every Lambda pool at full concurrency (10 x 2 GB, about
+    # $0.96/h), so a $1.50/day cap admitted 4 of 8 vCPUs with Lambda idle. Lambda is counted at
+    # what's running; its bursts are caught by the cap trip, from Lambda's metrics.
     add_lambda_pool(env.aws, GEO_LAM, memory_mib=2048, concurrency=10)
     e = env.engine()
     try:
-        # Worst case: 10 x 2 GB busy for an hour, about $0.96/h. $1.50/day leaves 1.50/1.2 - 0.96
-        # = $0.29/h for EC2: 4 vCPUs (2 workers) at $0.0686 per vCPU, of the 8 wanted.
-        worst = 10 * pricing.lambda_hourly(2048)
-        assert worst == pytest.approx(0.96, abs=0.001)
         engine_limits(env, e, max_usd_day=1.50)
         env.demand(8)
         m = e.scale_once(now=NOON).pools["geo-py314"]
-        assert m.admitted == 4 and env.group()["DesiredCapacity"] == 4
+        assert m.admitted == 8 and env.group()["DesiredCapacity"] == 8
     finally:
         e.shutdown()
+
+
+class LambdaMetrics:
+    """GetMetricData answering AWS/Lambda Duration (ms) and Invocations sums per function."""
+
+    def __init__(self, by_function: dict[str, tuple[float, int]], at: float = NOON) -> None:
+        self.by_function = by_function
+        self.at = at  # when it ran: windows without it see nothing
+        self.calls: list[dict[str, Any]] = []
+
+    def get_metric_data(self, **kw: Any) -> dict[str, Any]:
+        self.calls.append(kw)
+        out = []
+        if not kw["StartTime"].timestamp() <= self.at <= kw["EndTime"].timestamp():
+            return {"MetricDataResults": [{"Id": q["Id"], "Values": []}
+                                          for q in kw["MetricDataQueries"]]}  # fmt: skip
+        for q in kw["MetricDataQueries"]:
+            stat = q["MetricStat"]
+            fn = stat["Metric"]["Dimensions"][0]["Value"]
+            ms, n = self.by_function.get(fn, (0.0, 0))
+            value = ms if stat["Metric"]["MetricName"] == "Duration" else float(n)
+            out.append({"Id": q["Id"], "Values": [value / 2, value / 2]})  # two hours
+        return {"MetricDataResults": out}
+
+
+def test_lambda_spend_comes_from_lambdas_metrics(env: Env) -> None:
+    from aegc.spend import SpendGuard
+    from aegc.state import Limits
+
+    pools = {GEO_LAM: {"kind": "lambda", "function_name": "aegc-dev-geo-lam",
+                       "memory_mib": 4096},
+             "geo-py314": {"auto_scaling_group": "g"}}  # fmt: skip
+    cw = LambdaMetrics({"aegc-dev-geo-lam": (3_600_000.0, 1000)})  # an hour of 4 GB
+    a = lambda_pools.accrue_metrics(cw, pools, NOON - 7200, NOON)
+    expect = 3600 * 4 * pricing.LAMBDA_ARM_GB_S + 1000 * pricing.LAMBDA_REQUEST
+    assert a.usd == pytest.approx(expect) and a.by_type == {"lambda-4096MB": a.usd}
+    assert a.instance_hours == 0  # Lambda time isn't instance-hours
+    (q,) = [q for q in cw.calls[0]["MetricDataQueries"] if q["Id"] == "d0"]
+    assert q["MetricStat"]["Metric"]["Namespace"] == "AWS/Lambda"
+    prices = pricing.Prices(region=REGION)
+    guard = SpendGuard(s3=env.s3, bucket=BUCKET, deployment="dev", prices=prices, cloudwatch=cw,
+                       pools=pools)  # fmt: skip
+    trip = guard.check(Limits(max_usd_day=0.10), NOON)
+    assert trip is not None and "/day" in trip.reason  # about $0.19 of Lambda
 
 
 @pytest.mark.timeout(60)
 def test_cap_trip_disables_mappings_and_the_next_period_enables_them(env: Env) -> None:
     entry = add_lambda_pool(env.aws, GEO_LAM)
-    e = env.engine()
+    # An hour of 2 GB, from Lambda's metrics (about $0.10).
+    e = env.engine(cloudwatch=LambdaMetrics({entry["function_name"]: (3_600_000.0, 10)}))
     try:
         engine_limits(env, e, max_usd_day=0.05)
-        ledger.write(env.s3, BUCKET, ledger.Record(
-            instance_id="lambda-1", deployment="dev", pool=GEO_LAM, instance_type="",
-            availability_zone="", lifecycle="lambda", vcpus=0, launched_at=NOON - 3600,
-            last_seen=NOON - 60, kind="lambda", memory_mib=2048, billed_s=3600, invocations=10,
-        ))  # fmt: skip
         e.scale_once(now=NOON)
         assert state.read_state(env.ssm, "dev", now=NOON).mode == "capped"
         assert mapping(env.aws, entry) == "Disabled"
@@ -479,13 +518,10 @@ def test_metrics_read_the_function_not_a_group() -> None:
 def test_cost_shows_lambda(aws: Callable[[str], Any]) -> None:
     s3 = aws("s3")
     s3.create_bucket(Bucket=BUCKET, CreateBucketConfiguration={"LocationConstraint": REGION})
-    ledger.write(s3, BUCKET, ledger.Record(
-        instance_id="lambda-1", deployment="dev", pool=GEO_LAM, instance_type="",
-        availability_zone="", lifecycle="lambda", vcpus=0, launched_at=NOON - 600,
-        last_seen=NOON - 60, kind="lambda", memory_mib=2048, billed_s=360, invocations=4,
-    ))  # fmt: skip
+    pools = {GEO_LAM: {"kind": "lambda", "function_name": "aegc-dev-geo-lam", "memory_mib": 2048}}
+    cw = LambdaMetrics({"aegc-dev-geo-lam": (360_000.0, 4)})
     r = control.cost(s3=s3, bucket=BUCKET, deployment="dev", prices=pricing.Prices(region=REGION),
-                     by="type", now=NOON)  # fmt: skip
+                     by="type", now=NOON, cloudwatch=cw, pools=pools)  # fmt: skip
     usd = pricing.lambda_cost(360, 2048, 4)
     assert f"  lambda-2048MB: ${usd:.4f}" in r.render()
     r.by = "pool"
@@ -503,3 +539,27 @@ def test_contract_helpers() -> None:
     assert lambda_pools.mappings(pools) == {"a": "u-a"}
     assert lambda_pools.per_task(pools["a"]) == (2.0, 3538 / 1024)
     assert lambda_pools.describe(pools["a"]) == "lambda 3538 MB x 10"
+
+
+def test_reconcile_undoes_an_enable_that_raced_a_stop_and_reports_unread_mappings() -> None:
+    class Lam:
+        def __init__(self) -> None:
+            self.state = {"u-a": "Disabled", "u-b": "Disabled"}
+            self.updates: list[tuple[str, bool]] = []
+
+        def get_event_source_mapping(self, UUID: str) -> dict[str, Any]:
+            if UUID == "u-b":
+                raise RuntimeError("AccessDenied")
+            return {"State": self.state[UUID]}
+
+        def update_event_source_mapping(self, UUID: str, Enabled: bool) -> None:
+            self.updates.append((UUID, Enabled))
+
+    pools = {"a": {"kind": "lambda", "event_source_mapping": "u-a"},
+             "b": {"kind": "lambda", "event_source_mapping": "u-b"}}  # fmt: skip
+    answers = iter([True, False])  # running before enabling, stopped right after
+    lam = Lam()
+    states, changes = lambda_pools.reconcile(lam, pools, True, confirm=lambda: next(answers))
+    assert lam.updates == [("u-a", True), ("u-a", False)]
+    assert changes["a"] == "disabled" and states["a"] == "Disabling"
+    assert changes["b"].startswith("unknown")  # a mapping it couldn't read is reported
