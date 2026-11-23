@@ -16,9 +16,11 @@ image and your Globus login), a clone of this repository with its `.venv` on Pyt
 bucket of your own for outputs. The code is in [examples/](../../examples/), one directory per
 tutorial: the task functions in a module, and a script that runs them.
 
-**The numbers.** Each page has a **Results** box for the figures from a live run. Until a
-tutorial has been run live, its box says `TODO(live)`. Your numbers will differ with the day's
-Spot prices, the instance types Spot provides, and your network.
+**The numbers.** Each page has a **Results** box with the figures from a live run. The 1000
+Genomes slice, the Spot sweep and part 1 of the NDVI tutorial were run on 2026-11-23. The NDVI
+tutorial's nightly part and One flow, two endpoints haven't been run live yet: their boxes say
+"not yet run live" and show `TODO(live)` where the numbers will go. Your numbers will differ with
+the day's Spot prices, the instance types Spot provides, and your network.
 
 !!! warning "Cost and teardown"
     The tutorials create AWS resources that cost money while they run, usually cents, and each

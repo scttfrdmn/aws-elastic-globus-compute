@@ -133,7 +133,8 @@ the workers' images may predate 0.4. Metrics arrive a few minutes after the fact
 
 ### Alarms
 
-aegc creates no alarms, but the metrics work with ordinary CloudWatch alarms. For example, to be
+aegc creates no alarms on these metrics (only a [cloud endpoint](cloud-endpoint.md#the-offline-alarm)
+gets one, on its own liveness metric), but they work with ordinary CloudWatch alarms. For example, to be
 told about any failed task in `e2e`:
 
 ```sh

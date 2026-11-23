@@ -7,27 +7,96 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Cloud-hosted endpoint** (#22): `aegc endpoint deploy` runs a local endpoint on an on-demand
+  Graviton instance (`--instance-type`, default `t4g.micro`) in an Auto Scaling group of one, with
+  the **same endpoint id**, as your own Globus login. The login (`storage.db`) and the endpoint id
+  go into the Secrets Manager secret `aegc-<d>-endpoint`, whose resource policy denies
+  `GetSecretValue` to every principal but the host's role, `aegc-<d>-endpoint-<region>`. The
+  endpoint image is built for `linux/arm64` and pushed to ECR `aegc/endpoint` (or given with
+  `--image`), and protected from the repository's lifecycle while deployed. The host restores the
+  login at boot, configures the endpoint as `aegc endpoint configure` does, and runs it under
+  systemd, logging to `/aegc/<d>` (`endpoint/<instance-id>`, with user endpoint process lines
+  prefixed `[uep]`). The cloud endpoint keeps the local endpoint's allowed functions unless
+  `--allow-function` says otherwise. One endpoint id runs in one place: `deploy` refuses while the
+  local endpoint runs (`--stop-local` stops it) and refuses an id that's another deployment's
+  cloud endpoint. A changed launch template or login replaces the host with an instance refresh
+  that terminates the old one first; `AZRebalance` is suspended, so there are never two hosts on
+  one id. A boot that fails after retries marks the instance unhealthy, so the group replaces it.
+  Session Manager on the host is opt-in (`--session-manager`). `--dry-run` stops, builds and
+  writes nothing. `aegc endpoint status` shows the host, the endpoint and the alarm;
+  `aegc endpoint undeploy [--yes]` removes it all, and so does `aegc destroy`. The host costs
+  about $12 a month and isn't counted by `aegc cost` or the spend limits. See
+  [Run the endpoint in the cloud](docs/how-to/cloud-endpoint.md).
+- **`aegc evaluate <d> [--endpoint-id ID] [--dry-run]`** (#51): the cloud endpoint runs it every
+  5 minutes. It trips spend caps without an engine (state `capped`, `by: evaluator`, minimums to 0;
+  the engine and the evaluator share the code in `aegc.caps`), renews the lease only while Globus
+  reports the endpoint online, deletes result queues that are empty and idle for 14 days, and
+  publishes the liveness metric. A dry run from a laptop changes and publishes nothing.
+- **Offline alarm** (#60): `aegc-<d>-endpoint-offline` fires when the endpoint is offline or the
+  evaluator stops reporting for 15 minutes (about 20 to 25 minutes after the endpoint goes
+  offline, measured live). The metric, `EndpointOnline` in the namespace `aegc/endpoint`, is
+  published with PutMetricData and has a `Token` dimension only the host knows, so task code
+  printing EMF can't keep the alarm quiet. `deploy` seeds one datapoint, so a new alarm doesn't
+  start in `ALARM`. `--alarm-email` subscribes an address to the SNS topic
+  `aegc-<d>-endpoint-alarm`; a redeploy without it keeps the topic.
+- **IAM policies** `endpoint` (the host's role: the operator policy plus its own secret, the
+  endpoint image, its log streams, the liveness metric, `SetInstanceHealth` on its own group and
+  `DeleteQueue` on result queues) and `endpoint-deployer` (the secret, without ever reading it, the
+  alarm, the topic and the instance refresh), printed by `aegc iam-policy`. `endpoint deploy`,
+  `undeploy` and `status` need endpoint-deployer next to the deployer policy.
+- **`aegc image build --allow-change PACKAGE`** (repeatable) lets named packages of the base
+  change, in the conda step and the pip step (they're left out of the pip constraints), for example
+  `python-dateutil` when a base's is newer than botocore accepts. `click` may always change.
 - **Zones without the pool's instance types** (#64): `aegc deploy` asks EC2
   (`DescribeInstanceTypeOfferings`, once per set of `allowed_instance_types`) which Availability
   Zones offer at least one of a pool's types, and leaves default subnets in other zones out of
   that pool's Auto Scaling group, reported as `skipped  subnet`. us-east-1's use1-az3 has no
   Graviton. Explicit `subnet_ids` are all kept, with a `kept` warning for such zones. The
   [deployer policy](docs/reference/iam.md#deployer) gains `ec2:DescribeInstanceTypeOfferings`;
-  without it, deploy keeps every subnet and says so.
+  without it, deploy keeps every subnet and says so. The cloud endpoint's host is filtered the
+  same way, by its instance type.
 - [Other regions](docs/how-to/operations.md#other-regions): bootstrap, images, deployments and
   endpoints per region, for example us-east-1 next to RODA datasets.
 - [Tutorials](docs/tutorials/index.md) with runnable code in `examples/` (#65): Sentinel-2 NDVI
   from a notebook to a nightly flow on the cloud endpoint (#71), slicing 1000 Genomes in
   us-east-1 with a bring-your-own bcftools image (#72), a Spot sweep under FIS interruptions
-  (#73), and one flow across a laptop endpoint and aegc (#74). Each has a Results box for its
-  measured numbers, to be filled in from live runs.
+  (#73), and one flow across a laptop endpoint and aegc (#74). The slice, the sweep and NDVI part
+  1 have their measured results from the live run of 2026-11-23; NDVI's nightly part and the
+  two-endpoint flow are marked as not yet run live.
+- Docs: [Run the endpoint in the cloud](docs/how-to/cloud-endpoint.md); the cloud endpoint in the
+  security model, IAM, resources, operations, troubleshooting and cost pages; and the
+  [v0.6 live run](docs/reference/performance.md#v06-live-run-2026-11-23).
 
 ### Changed
+- **Worker and operator Auto Scaling statements require `aegc:role=asg`** as well as
+  `aegc:deployment`, so neither can touch the cloud endpoint's group. `deploy` updates the worker
+  role. An operator policy you attached yourself keeps working, but could change the endpoint's
+  group too; replace it with `aegc iam-policy operator --deployment <d>`.
+- `aegc destroy` also removes a deployment's cloud endpoint. With the deployer policy alone it
+  destroys everything else and reports `kept  cloud endpoint ... (not checked: needs the
+  endpoint-deployer policy ...)`.
+- The env name `endpoint` is reserved (`aegc/endpoint` holds the endpoint image).
 - `aegc bootstrap` in us-east-1 creates the payload bucket without a `CreateBucketConfiguration`
   (us-east-1 takes no `LocationConstraint`; a configuration holding only `Tags` is untested there)
   and tags it straight after, removing it again if the tagging fails (#64).
 - The static on-demand price table is no longer labelled us-west-2 only: us-east-1's prices for
   these types are the same (#64).
+
+### Fixed
+- Found in the live run: the cloud endpoint's host wrote `endpoint.json` before configuring the
+  endpoint, so configure skipped it and `config.yaml` was never written; the id is now written
+  after configure. User endpoint process logs didn't reach CloudWatch; the container now copies
+  them to its console, without replaying old logs after a restart.
+- Found in the NDVI tutorial: isolated tasks couldn't read their own `/proc/self` files (setuid
+  from root makes a process non-dumpable), so `/proc/self/io` was empty; task processes restore
+  the dumpable flag. Rebuild worker images to get it. And the pip step pinned every base package,
+  so a base whose python-dateutil botocore rejects couldn't be built (now `--allow-change`).
+- Found in review, before release: `destroy` called CloudWatch, SNS and Secrets Manager, which the
+  deployer policy doesn't allow, and failed halfway; secrets are found with `ListSecrets`, and
+  endpoint-deployer gained `sns:ListTopics`. A redeploy without `--alarm-email` dropped the
+  alarm's email. The evaluate timer has a timeout and 1-second accuracy, and the endpoint
+  containers run with `docker --init`. `endpoint deploy` checks that the deployment exists.
+- The Spot sweep example prints the interrupted instances' ids (FIS returns ARNs).
 
 ## [0.4.0] - 2026-11-16
 

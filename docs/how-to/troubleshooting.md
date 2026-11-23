@@ -87,7 +87,7 @@ deployment 'e2e' has reached a spend limit ($5.0123 of $5/day); new tasks are re
 (or --max-usd-month).
 ```
 
-**Cause:** the deployment's estimated spend reached one of its limits, and an engine capped it.
+**Cause:** the deployment's estimated spend reached one of its limits, and an engine capped it (or, with a [cloud endpoint](cloud-endpoint.md#the-evaluator), `aegc evaluate`).
 
 **Fix:** wait for the end of the UTC day or month, when the deployment runs again by itself (and
 its group minimums come back), or raise the limit and resume:
@@ -324,6 +324,45 @@ failed` meanwhile.
   (`configure` adds it) and pass `amqp_port=5671` to `Executor` in clients.
 - **`start` fails because the container exists:** run `aegc endpoint ... stop` first, which removes
   it.
+
+## The cloud endpoint is offline
+
+Start with `aegc endpoint --deployment <d> status` and the host's logs:
+
+```sh
+aws logs tail /aegc/<d> --log-stream-name-prefix endpoint/ --since 1h
+```
+
+- **`instance: none yet`, or instances keep changing:** the group is launching, or keeps
+  replacing a host that fails to boot. `aws autoscaling describe-scaling-activities
+  --auto-scaling-group-name aegc-<d>-endpoint` shows each launch and why it ended.
+- **The boot failed.** A host that can't pull the image, read its secret, restore the login,
+  configure the endpoint or start it retries, then logs `aegc: endpoint boot failed: <why>` and
+  marks itself unhealthy, so the group replaces it. The boot script's output is in
+  `/var/log/aegc-boot.log` and in the console, which works without any access to the instance:
+
+    ```sh
+    aws ec2 get-console-output --instance-id <id> --output text | grep aegc
+    ```
+
+    `couldn't read the secret aegc-<d>-endpoint` means the secret is gone or its policy doesn't
+    name this role: deploy again. `couldn't pull` means the image isn't in `aegc/endpoint` any more.
+- **The host runs, but Globus says offline.** Read `endpoint/<instance-id>`. Authentication errors
+  mean the stored login no longer works (revoked by `globus-compute-endpoint logout`, say): run
+  `aegc endpoint ... login` on your machine and deploy again, which replaces the host. If you
+  started the local endpoint again, stop it: one endpoint id can't run in two places.
+- **Tasks arrive but fail or hang.** The engine runs in user endpoint processes; their lines are in
+  the same stream, prefixed `[uep]`. They start when the first task arrives, so there are none
+  before that.
+- **The alarm is in `ALARM` but the endpoint is fine.** The evaluator couldn't publish: look for
+  `error:` lines in `endpoint/<instance-id>/evaluate`. A pass that can't tell (`endpoint status
+  unknown`) publishes nothing, and missing data counts as offline after 15 minutes.
+- **No alarm email.** Confirm the SNS subscription from the email AWS sent when you deployed with
+  `--alarm-email`; nothing is delivered until you do.
+- **The deployment is `capped` with `by: evaluator`.** The cloud endpoint's evaluator tripped a
+  spend limit, as an engine would. See [AEGC_BUDGET_EXCEEDED](#aegc_budget_exceeded).
+
+See [Run the endpoint in the cloud](cloud-endpoint.md).
 
 ## Deploy and destroy refuse
 

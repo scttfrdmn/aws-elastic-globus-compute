@@ -219,10 +219,12 @@ Each night the timer starts a run, the run submits the task, the pool starts a w
 worker leaves again about 5 minutes after the task. For a first test, `--stop-after-runs 1` runs
 the flow once and ends the timer; the live run did that and the run `SUCCEEDED`.
 
-Keep the endpoint running. What the action provider does when the endpoint is offline hasn't been
-tested, and a running endpoint also renews the deployment's
+Keep the endpoint running, or [run it in the cloud](cloud-endpoint.md) so it doesn't depend on
+your laptop. What the action provider does when the endpoint is offline hasn't been tested, and a
+running endpoint also renews the deployment's
 [lease](../concepts/architecture.md#lease-and-ttl), which otherwise expires after 48 hours. Spend
-limits apply as usual.
+limits apply as usual. The [NDVI tutorial](../tutorials/sentinel2-ndvi.md#part-2-nightly) does
+this end to end.
 
 ## Use the right identity
 

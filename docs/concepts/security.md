@@ -7,7 +7,8 @@
   S3, ECR, CloudWatch Logs, STS and Auto Scaling. In isolated pools the worker agent serves task
   credentials on `127.0.0.1` only, behind a token (see [Task isolation](#task-isolation)).
 - **Workers have no ingress.** The deployment's security group, `aegc-<d>-workers`, has no inbound
-  rules. Instances have no SSH key pair. They run in the default VPC's default subnets, which give
+  rules; the [cloud endpoint](#the-cloud-endpoint)'s host uses it too. Instances have no SSH key
+  pair. They run in the default VPC's default subnets, which give
   them public IPv4 addresses for outbound traffic.
 - **IMDSv2 only**, with a hop limit of 2 so the worker agent in its container can reach it, and the
   IPv6 metadata endpoint off. In isolated pools the host's firewall rejects metadata requests from
@@ -20,10 +21,12 @@
 
 | Identity | Who uses it | Scope |
 |---|---|---|
-| **worker** role, `aegc-<d>-worker-<region>` | The worker agent on each instance, through an instance profile | The deployment's task queues (receive, delete, extend), its result queues (send), `payloads/<d>/tasks/*` (read) and `payloads/<d>/results/*` (write), pulls from `aegc/*` ECR repositories, its log group, terminating instances in groups tagged with the deployment, reading the deployment's state and manifest, writing `ledger/<d>/*`, and assuming the task role; plus `aegc-grants` while pools or instances with images from before aegc 0.4 remain |
+| **worker** role, `aegc-<d>-worker-<region>` | The worker agent on each instance, through an instance profile | The deployment's task queues (receive, delete, extend), its result queues (send), `payloads/<d>/tasks/*` (read) and `payloads/<d>/results/*` (write), pulls from `aegc/*` ECR repositories, its log group, terminating instances in the deployment's worker groups (tagged `aegc:role=asg`), reading the deployment's state and manifest, writing `ledger/<d>/*`, and assuming the task role; plus `aegc-grants` while pools or instances with images from before aegc 0.4 remain |
 | **task** role, `aegc-<d>-task-<region>` | Task code in [isolated](#task-isolation) pools, with credentials the agent hands it | Reading the deployment's manifest (`aegc-task`, for `aegc.outputs`), and with grants, reading or writing under your granted S3 prefixes (`aegc-grants`). Nothing else. Only the worker role may assume it |
-| **operator** | The endpoint container's AWS credentials | Reading the deployment's parameters, sending tasks, creating and reading its own result queues, payloads, `SetDesiredCapacity` and `UpdateAutoScalingGroup` on groups tagged with the deployment, receiving and deleting on its task queues, writing its state, reading its ledger, prices and Cost Explorer, renewing its lease, and searching its log group (`aegc provenance`) |
+| **operator** | The endpoint container's AWS credentials | Reading the deployment's parameters, sending tasks, creating and reading its own result queues, payloads, `SetDesiredCapacity` and `UpdateAutoScalingGroup` on the deployment's worker groups (tagged `aegc:role=asg`), receiving and deleting on its task queues, writing its state, reading its ledger, prices and Cost Explorer, renewing its lease, and searching its log group (`aegc provenance`) |
 | **deployer** | Whoever runs `aegc deploy`, `destroy`, `stop`, `resume` | Creates conditioned on the `aegc:managed=true` request tag, changes and deletes on the resource tag where the service supports it; IAM limited to the `/aegc/` path; roles passed only to EC2 and EventBridge Scheduler |
+| **endpoint** role, `aegc-<d>-endpoint-<region>` | The [cloud endpoint](#the-cloud-endpoint)'s host, through an instance profile | The operator policy, plus reading its own login secret, pulling `aegc/endpoint`, writing its log streams, `PutMetricData` in `aegc/endpoint`, marking its own instance unhealthy, and deleting the deployment's result queues |
+| **endpoint-deployer** | Whoever runs `aegc endpoint deploy`, `undeploy`, `status`, with the deployer policy | Creating, updating and deleting the login secret (never reading it), the offline alarm and its SNS topic, and the host's instance refresh |
 | **bootstrap** | Whoever runs `aegc bootstrap`, `unbootstrap` | The payload bucket, the pull-through cache and its template and role, `/aegc/bootstrap`; roles passed only to ECR |
 | **scheduler** role, `aegc-<d>-scheduler-<region>` | EventBridge Scheduler, when the lease or TTL fires | Writing the deployment's state parameter and updating groups tagged with the deployment |
 
@@ -162,7 +165,8 @@ removes only inline policies). Use grants instead.
 - **Queues:** SQS-managed server-side encryption. Messages are kept for 14 days.
 - **Worker volumes:** encrypted gp3, deleted with the instance.
 - **Endpoint state:** the Globus login and endpoint configuration live in the Docker volume
-  `aegc-endpoint-home` on your machine.
+  `aegc-endpoint-home` on your machine. A cloud endpoint's copy is in Secrets Manager (encrypted
+  with the account's default key for Secrets Manager) and on the host's encrypted volume.
 - `AWSEngine` refuses to run on a high-assurance endpoint: task data leaves Globus's control.
 
 ## Images
@@ -194,3 +198,35 @@ reported as `kept`. Region-wide resources carry `aegc:deployment=_bootstrap`.
 `destroy`, `unbootstrap` and `reap` are dry runs unless you pass `--yes`, and `stop --hard` needs
 `--yes`. `bootstrap` and `deploy` accept `--dry-run`. `destroy` checks afterwards that nothing it
 owns remains, and `aegc footprint` lists what exists, including look-alikes aegc won't touch. See [Resources and tags](../reference/resources.md).
+
+## The cloud endpoint
+
+[`aegc endpoint deploy`](../how-to/cloud-endpoint.md) runs your endpoint on an EC2 instance in
+your account, as you: it copies your Globus login (the token storage `globus-compute-endpoint
+login` wrote) into the Secrets Manager secret `aegc-<d>-endpoint`, and the host restores it at
+boot. That makes the login the thing to protect.
+
+- **Only the host reads it.** The secret's resource policy denies `secretsmanager:GetSecretValue`
+  to every principal but the endpoint role, whatever their IAM policies say. The
+  [endpoint-deployer](../reference/iam.md#endpoint-deployer) policy has no `GetSecretValue`;
+  `status` reads the endpoint's name and id from tags. An administrator who may change the
+  secret's resource policy could lift the deny, so treat `secretsmanager:PutResourcePolicy` on
+  `aegc-*` secrets as access to your Globus login.
+- **The host has no way in.** The deployment's security group (no inbound rules), no SSH key,
+  IMDSv2 only, an encrypted volume, the login under a mode-700 directory. Its role is the operator
+  policy plus a few narrow additions ([endpoint](../reference/iam.md#endpoint)). Task code never
+  runs there: it runs on workers, whose roles can't read the secret or change the endpoint's
+  group.
+- **Session Manager is opt-in** (`--session-manager`). With it, anyone allowed `ssm:StartSession`
+  on the instance gets root there, and with it the login and the role's credentials.
+- **What the tokens can do.** Whoever holds them can act as you in Globus Compute, including
+  submitting tasks to any endpoint you may use, not just this one, until they're revoked.
+  `globus-compute-endpoint logout` (run in the `aegc-endpoint` image with your volume; see
+  [Security](../how-to/cloud-endpoint.md#security)) revokes them with Globus, which also stops the
+  cloud endpoint until you log in and deploy again.
+- **One endpoint id, one place.** `deploy` refuses while the local endpoint runs (unless
+  `--stop-local`) and refuses an id that's another deployment's cloud endpoint, and the host's
+  group never runs two instances at once.
+- **The offline alarm can't be silenced by tasks.** The liveness metric is published with
+  PutMetricData (workers have none) and carries a token dimension that only the host knows, so a
+  task printing CloudWatch EMF into the worker logs can't publish the series the alarm watches.

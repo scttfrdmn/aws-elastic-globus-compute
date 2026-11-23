@@ -319,8 +319,9 @@ On aegc, boto3 finds the task role's credentials by itself, and the read grant c
 inputs. `AEGC_TASK_UUID` is set on aegc workers for each task, which is how `summarize` knows
 where it is.
 
-!!! abstract "Results"
-    Measured on TODO(live) (date), 20 files of 25 MB (TODO(live) GB in all), laptop TODO(live)
+!!! abstract "Results: not yet run live"
+    This tutorial hasn't been run live yet; the values marked `TODO(live)` will come from that
+    run. Measured on TODO(live) (date), 20 files of 25 MB (TODO(live) GB in all), laptop TODO(live)
     (machine, connection).
 
     | Measure | Laptop + aegc | Laptop only |

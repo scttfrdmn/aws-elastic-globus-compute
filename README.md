@@ -38,6 +38,9 @@ flowchart LR
 - **See what ran where.** Workers log JSON, emit CloudWatch metrics (`aegc metrics`), and record
   each task's instance, image, timings and estimated cost (`aegc provenance`). Tasks can also come
   from Globus Flows and Timers.
+- **Laptop or cloud.** Run the endpoint on your laptop, or move it with `aegc endpoint deploy` to
+  a small instance in your account, with the same endpoint id, a liveness alarm, and spend limits
+  checked every 5 minutes even when no task runs.
 - **Managed with boto3.** Every resource is tagged when it's created, and the tool only ever deletes
   resources that carry its tags.
 
@@ -48,11 +51,11 @@ flowchart LR
 
 ## Status
 
-Early release (0.x): v0.3.0 adds bring-your-own images, several Python minors per env,
-data-access grants, `aegc.outputs` and size classes to v0.2.0's spend limits, stop and resume,
-lease and cost ledger. The main branch adds task isolation from the worker role, JSON logs,
-CloudWatch metrics, provenance, and support for Globus Flows and Timers, not yet released. Work is
-tracked in this repo's issues, milestones and project board.
+Early release (0.x): v0.4.0 adds task isolation from the worker role, JSON logs, CloudWatch
+metrics, provenance, and support for Globus Flows and Timers to v0.3.0's bring-your-own images,
+grants, outputs and size classes. The main branch adds a cloud-hosted endpoint with an offline
+alarm and cloud-side spend checks, other regions such as us-east-1, and measured tutorials, not yet
+released. Work is tracked in this repo's issues, milestones and project board.
 
 Sister projects:
 - [aws-elastic-gcs](https://github.com/scttfrdmn/aws-elastic-gcs): elastic Globus Connect Server.
