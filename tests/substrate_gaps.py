@@ -223,7 +223,7 @@ def sender_ids(sqs: Any, who: Any) -> Any:
 
 
 def rule_states(events: Any) -> list[dict[str, Any]]:
-    """substrate#TBD-eventbridge-enable-disable-rule: EnableRule and DisableRule are
+    """substrate#1685: EnableRule and DisableRule are
     UnknownOperationException ("The action DisableRule is not recognized"); PutRule, DescribeRule,
     ListRules (with State), PutTargets and tags work.
 
@@ -247,7 +247,7 @@ def rule_states(events: Any) -> list[dict[str, Any]]:
 
 
 def function_concurrency(lam: Any) -> dict[str, int]:
-    """substrate#TBD-lambda-function-concurrency: PutFunctionConcurrency and
+    """substrate#1685: PutFunctionConcurrency and
     GetFunctionConcurrency are UnknownOperationException. Also without code here:
     GetFunctionEventInvokeConfig is UnknownOperationException (PutFunctionEventInvokeConfig
     answers, without echoing DestinationConfig).
