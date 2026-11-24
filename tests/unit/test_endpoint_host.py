@@ -311,6 +311,7 @@ def test_cli_deploy_dry_run_changes_nothing_and_keeps_allowed_functions(
     fid = "11111111-1111-1111-1111-111111111111"
     monkeypatch.setattr(cli, "_clients", lambda sess: c)
     monkeypatch.setattr(ep, "is_running", lambda s, run=None: True)
+    monkeypatch.setattr(ep, "detect_multi_user", lambda s, run=None: None)
     monkeypatch.setattr(ep, "stop", lambda s, run=None: calls.append("stop"))
     monkeypatch.setattr(ep, "export_login", lambda s, run=None: replace(LOGIN, name=s.name))
     monkeypatch.setattr(ep, "local_allowed_functions", lambda s, run=None: (fid,))

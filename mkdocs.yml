@@ -69,6 +69,7 @@ nav:
       - Read and write your data: how-to/data.md
       - Operate a deployment: how-to/operations.md
       - Run the endpoint in the cloud: how-to/cloud-endpoint.md
+      - "Share an endpoint (multi-user)": how-to/multi-user.md
       - "Watch tasks: logs, metrics, provenance": how-to/observability.md
       - Use Globus Flows and Timers: how-to/flows.md
       - Troubleshooting: how-to/troubleshooting.md

@@ -1,7 +1,8 @@
 """The cloud endpoint's Globus login in Secrets Manager (#22).
 
 One secret per deployment, ``aegc-<d>-endpoint``: JSON with the endpoint's name and id and its
-token storage (globus_sdk's SQLite ``storage.db``, base64). Only the endpoint's instance role can
+token storage (globus_sdk's SQLite ``storage.db``, base64), and a multi-user endpoint's identity
+mapping. Only the endpoint's instance role can
 read it. aegc creates it tagged, changes or deletes it only if the tags say it's aegc's, and
 deletes it without a recovery window so a redeploy can reuse the name.
 """
@@ -29,17 +30,20 @@ class EndpointLogin:
     # has no Secrets Manager access) can't keep the offline alarm quiet. It's also a tag on the
     # secret, readable by whoever may ListSecrets.
     metric_token: str = ""
+    # A multi-user endpoint's identity mapping (#62): the Globus identities it admits stay out of
+    # the launch template's user data, readable only by the host role, like the login.
+    identity_mapping: list[dict[str, Any]] | None = None
 
     def to_json(self) -> str:
-        return json.dumps(
-            {
-                "name": self.name,
-                "endpoint_id": self.endpoint_id,
-                "storage_db_b64": base64.b64encode(self.storage_db).decode(),
-                "metric_token": self.metric_token,
-            },
-            sort_keys=True,
-        )
+        d: dict[str, Any] = {
+            "name": self.name,
+            "endpoint_id": self.endpoint_id,
+            "storage_db_b64": base64.b64encode(self.storage_db).decode(),
+            "metric_token": self.metric_token,
+        }
+        if self.identity_mapping is not None:  # absent for single-user: its hash is unchanged
+            d["identity_mapping"] = self.identity_mapping
+        return json.dumps(d, sort_keys=True)
 
     @classmethod
     def from_json(cls, text: str) -> EndpointLogin:
@@ -49,6 +53,7 @@ class EndpointLogin:
             endpoint_id=str(d["endpoint_id"]),
             storage_db=base64.b64decode(d["storage_db_b64"]),
             metric_token=str(d.get("metric_token", "")),
+            identity_mapping=d.get("identity_mapping"),
         )
 
 

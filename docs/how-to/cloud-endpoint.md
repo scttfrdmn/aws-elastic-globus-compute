@@ -131,6 +131,9 @@ The cloud endpoint is your endpoint, not a new one:
   deployment <d2>; one endpoint id can run in one place (`aegc endpoint undeploy` it there first)`.
 - **Allowed functions carry over.** Without `--allow-function`, the cloud endpoint gets the local
   endpoint's `allowed_functions`. `--allow-function ID` replaces the list, and `none` removes it.
+- **Multi-user endpoints move too.** `deploy` finds the mode from the local endpoint, puts the
+  identity mapping in the secret, and runs the host's container as root. Every mapped user shares
+  the host's role and deployment. See [Share an endpoint](multi-user.md#the-cloud-endpoint).
 - **A new login replaces the host.** If the stored login has changed since the last deploy (you
   ran `aegc endpoint ... login` again, say), deploy again: the secret is updated, and the host is
   replaced to pick it up.
@@ -247,7 +250,8 @@ until you confirm it. Another `--alarm-email` on a later deploy adds that addres
 The host logs to the deployment's log group, `/aegc/<d>`, next to the workers:
 
 - `endpoint/<instance-id>`: the endpoint container. Lines from user endpoint processes, where
-  `AWSEngine` runs, are copied in with a `[uep]` prefix.
+  `AWSEngine` runs, are copied in with a `[uep]` prefix (`[uep <user>]` on a
+  [multi-user](multi-user.md#the-cloud-endpoint) endpoint).
 - `endpoint/<instance-id>/evaluate`: each evaluator pass.
 
 ```sh

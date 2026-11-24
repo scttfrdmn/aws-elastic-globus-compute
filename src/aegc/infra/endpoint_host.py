@@ -55,6 +55,7 @@ class EndpointHostSpec:
     subnet_ids: tuple[str, ...] = ()
     metric_token: str = ""  # the liveness metric's Token dimension (kept in the secret)
     session_manager: bool = False
+    multi_user: bool = False  # a root core endpoint with identity mapping (#62)
 
     @property
     def deployment_spec(self) -> DeploymentSpec:
@@ -118,7 +119,7 @@ def launch_template_data(
     boot = userdata.EndpointBoot(
         deployment=d, name=spec.name, endpoint_id=spec.endpoint_id, image=spec.image,
         secret=naming.endpoint_secret(d), log_group=naming.log_group(d),
-        configure_script=spec.configure_script,
+        configure_script=spec.configure_script, multi_user=spec.multi_user,
     )  # fmt: skip
     tags = naming.tag_list(naming.tags(d, "endpoint"))
     return {

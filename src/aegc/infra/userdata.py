@@ -252,9 +252,9 @@ done
 [ -n "$$pulled" ] || fail "couldn't pull $$IMAGE"
 
 # The Globus login (token storage) and the endpoint id, from Secrets Manager.
-GC=/var/lib/aegc-endpoint/gc
-install -d -m 700 -o 1000 -g 1000 "$$GC"
-readsecret() {
+GC=${gc_host}
+install -d -m 700 -o ${gc_uid} -g ${gc_uid} "$$GC"
+${mu_dirs}readsecret() {
   SECRET=$$(aws secretsmanager get-secret-value --region "$$REGION" --secret-id ${secret} \
     --query SecretString --output text)
 }
@@ -269,20 +269,25 @@ env = "/var/lib/aegc-endpoint/evaluate.env"
 with open(env, "w") as f:
     f.write("AEGC_METRIC_TOKEN=" + s.get("metric_token", "") + "\n")
 os.chmod(env, 0o600)
+if s.get("identity_mapping") is not None:  # a multi-user endpoint's mapping (#62)
+    m = "/var/lib/aegc-endpoint/identity_mapping.json"
+    with open(m, "w") as f:
+        json.dump(s["identity_mapping"], f)
+    os.chmod(m, 0o600)
 PY
 unset SECRET
-chown -R 1000:1000 "$$GC"
+chown -R ${gc_uid}:${gc_uid} "$$GC"
 
 echo ${configure_b64} | base64 -d > /var/lib/aegc-endpoint/configure.sh
 configure() {
-  docker run --rm -v "$$GC":/home/gc/.globus_compute \
+  docker run --rm ${run_flags}-v "$$GC":${gc_mount} ${configure_mounts}\
     -v /var/lib/aegc-endpoint/configure.sh:/tmp/configure.sh:ro \
     -e AWS_REGION="$$REGION" "$$IMAGE" sh /tmp/configure.sh
 }
 retry configure || fail "couldn't configure the endpoint"
 # After configure (which creates the endpoint directory): keep the registered endpoint id.
 printf '{"endpoint_id": "%s"}' ${endpoint_id} > "$$GC"/${name}/endpoint.json
-chown 1000:1000 "$$GC"/${name}/endpoint.json
+chown ${gc_uid}:${gc_uid} "$$GC"/${name}/endpoint.json
 
 LOGS="--log-driver awslogs --log-opt awslogs-region=$$REGION --log-opt awslogs-group=${log_group}"
 cat > /etc/systemd/system/aegc-endpoint.service <<UNIT
@@ -294,9 +299,9 @@ Requires=docker.service
 Restart=always
 RestartSec=10
 ExecStartPre=-/usr/bin/docker rm -f aegc-endpoint
-ExecStart=/usr/bin/docker run --rm --init --name aegc-endpoint $$LOGS \
-  --log-opt awslogs-stream=endpoint/$$IID -v $$GC:/home/gc/.globus_compute \
-  -e GC_ENDPOINT=${name} -e GC_ENDPOINT_UUID=${endpoint_id} \
+ExecStart=/usr/bin/docker run --rm --init --name aegc-endpoint $$LOGS ${run_flags}\
+  --log-opt awslogs-stream=endpoint/$$IID -v $$GC:${gc_mount} ${home_mount}\
+  -e GC_ENDPOINT=${name} -e GC_ENDPOINT_UUID=${endpoint_id} ${mu_env}\
   -e AWS_REGION=$$REGION -e AWS_DEFAULT_REGION=$$REGION $$IMAGE
 ExecStop=/usr/bin/docker exec aegc-endpoint globus-compute-endpoint stop ${name}
 [Install]
@@ -312,7 +317,7 @@ Type=oneshot
 TimeoutStartSec=240
 EnvironmentFile=/var/lib/aegc-endpoint/evaluate.env
 ExecStart=/usr/bin/docker run --rm --init $$LOGS \
-  --log-opt awslogs-stream=endpoint/$$IID/evaluate -v $$GC:/home/gc/.globus_compute \
+  --log-opt awslogs-stream=endpoint/$$IID/evaluate ${eval_flags}-v $$GC:${gc_mount} \
   -e AWS_REGION=$$REGION -e AWS_DEFAULT_REGION=$$REGION -e AEGC_METRIC_TOKEN $$IMAGE \
   aegc --region $$REGION evaluate ${deployment} --endpoint-id ${endpoint_id}
 UNIT
@@ -343,12 +348,52 @@ class EndpointBoot:
     secret: str  # the Secrets Manager secret name
     log_group: str
     configure_script: str  # aegc.endpoint.configure_script(...), run in the image at boot
+    #: A multi-user endpoint (#62): a root core endpoint with minimal capabilities, its login in
+    #: a root-only directory, mapped users' homes on the host, the identity mapping from the secret.
+    multi_user: bool = False
+
+
+#: The multi-user endpoint container's flags (aegc.endpoint.MU_DOCKER_FLAGS, kept here to keep
+#: this module free of the endpoint module's imports).
+_MU_FLAGS = (
+    "--user 0 --security-opt no-new-privileges --cap-drop ALL "
+    + " ".join(
+        f"--cap-add {c}" for c in ("SETUID", "SETGID", "KILL", "CHOWN", "DAC_OVERRIDE", "FOWNER")
+    )
+    + " "
+)
+#: Where the cloud host's configure step finds the identity mapping (from the secret).
+MU_IDENTITY_MAPPING = "/tmp/identity_mapping.json"
+
+
+def _endpoint_mode(multi_user: bool) -> dict[str, str]:
+    if not multi_user:
+        return {
+            "gc_host": "/var/lib/aegc-endpoint/gc", "gc_uid": "1000", "mu_dirs": "",
+            "gc_mount": "/home/gc/.globus_compute", "run_flags": "", "configure_mounts": "",
+            "home_mount": "", "mu_env": "", "eval_flags": "",
+        }  # fmt: skip
+    home = "-v /var/lib/aegc-endpoint/home:/home "
+    return {
+        "gc_host": "/var/lib/aegc-endpoint/core",
+        "gc_uid": "0",
+        "mu_dirs": "install -d -m 755 -o 0 -g 0 /var/lib/aegc-endpoint/home\n",
+        "gc_mount": "/root/.globus_compute",
+        "run_flags": _MU_FLAGS,
+        "configure_mounts": home + "-v /var/lib/aegc-endpoint/identity_mapping.json:"
+        f"{MU_IDENTITY_MAPPING}:ro ",
+        "home_mount": home,
+        "mu_env": "-e GC_MULTI_USER=1 ",
+        # aegc evaluate reads the root-owned login; it needs no capabilities.
+        "eval_flags": "--user 0 --security-opt no-new-privileges --cap-drop ALL ",
+    }
 
 
 def render_endpoint(boot: EndpointBoot) -> str:
     if "@sha256:" not in boot.image:
         raise ValueError(f"endpoint image must be pinned by digest, got {boot.image!r}")
     return _ENDPOINT_TEMPLATE.substitute(
+        **_endpoint_mode(boot.multi_user),
         deployment=boot.deployment,
         name=shlex.quote(boot.name),
         endpoint_id=shlex.quote(boot.endpoint_id),
