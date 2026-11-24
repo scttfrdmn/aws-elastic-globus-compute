@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-24
+
 Lambda pools: a pool can run its env's worker image as an AWS Lambda function, fed by its SQS
 task queue, for short, bursty tasks that shouldn't wait for a worker to boot or pay for one to
 idle. Stop, caps, the lease and the TTL freeze them, spend limits count them from Lambda's own
@@ -669,7 +671,8 @@ Bugs found and fixed during validation:
 - the operator and deployer policies missed actions their commands use;
 - env names over 14 characters couldn't be deployed.
 
-[Unreleased]: https://github.com/scttfrdmn/aws-elastic-globus-compute/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/aws-elastic-globus-compute/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/scttfrdmn/aws-elastic-globus-compute/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/scttfrdmn/aws-elastic-globus-compute/compare/v0.4.0...v0.6.0
 [0.4.0]: https://github.com/scttfrdmn/aws-elastic-globus-compute/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/scttfrdmn/aws-elastic-globus-compute/compare/v0.2.0...v0.3.0
