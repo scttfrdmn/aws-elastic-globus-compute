@@ -55,6 +55,7 @@ nav:
       - "Slice before you ship: 1000 Genomes": tutorials/genomics-slice.md
       - A Spot sweep that survives interruptions: tutorials/spot-sweep.md
       - One flow, two endpoints: tutorials/two-endpoints.md
+      - "Genotype a gene across 1000 Genomes": tutorials/cohort-genotype.md
   - Concepts:
       - Architecture: concepts/architecture.md
       - When to use aegc: concepts/when-to-use.md

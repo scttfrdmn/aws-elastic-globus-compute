@@ -1,0 +1,12 @@
+{
+  "endpoint": "AEGC_ENDPOINT_ID",
+  "plan_function": "PLAN_FUNCTION_ID",
+  "genotype_function": "GENOTYPE_FUNCTION_ID",
+  "merge_function": "MERGE_FUNCTION_ID",
+  "region": "chr22:36253000-36268000",
+  "out_prefix": "s3://BUCKET/cohort/flow/",
+  "per_shard": 20,
+  "fan_out_pool": "genomics-py314-lambda",
+  "merge_pool": "genomics-py314",
+  "python": "3.14"
+}

@@ -309,6 +309,15 @@ secrets there.
 
 ## Troubleshooting
 
+- **`Permission denied` or `AccessDenied` reading a public bucket** (for example htslib's
+  `Failed to open FASTA index s3://1000genomes/...: Permission denied`), when the same task works
+  on an EC2 pool: Lambda gives the function role's credentials to tasks in environment variables,
+  so tools such as htslib and GDAL sign their requests, and IAM refuses a signed request to
+  another account's bucket unless the role allows it. On EC2 pools these tools find no
+  credentials they read (the task role is served in the container-credentials format) and ask
+  anonymously. Grant the public prefixes the tasks read, e.g.
+  `--grant read=s3://1000genomes/1000G_2504_high_coverage/data/`; see the
+  [cohort tutorial](../tutorials/cohort-genotype.md).
 - **Tasks wait, `aegc metrics` shows throttles.** Lambda limits concurrent executions per
   account and region (1,000 by default; new accounts can have as few as 10), shared by every
   function, and aegc doesn't check it. Lambda retries a throttled delivery for a while (the

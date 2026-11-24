@@ -1,0 +1,69 @@
+{
+  "Comment": "aegc tutorial: genotype one region across the 1000 Genomes high-coverage cohort",
+  "StartAt": "Plan",
+  "States": {
+    "Plan": {
+      "Type": "Action",
+      "ActionUrl": "https://compute.actions.globus.org/v3",
+      "Parameters": {
+        "endpoint_id.$": "$.endpoint",
+        "user_endpoint_config": {
+          "pool.$": "$.fan_out_pool",
+          "python.$": "$.python"
+        },
+        "tasks": [
+          {
+            "function_id.$": "$.plan_function",
+            "kwargs": {
+              "region.$": "$.region",
+              "out_prefix.$": "$.out_prefix",
+              "genotype_function.$": "$.genotype_function",
+              "per_shard.$": "$.per_shard"
+            }
+          }
+        ]
+      },
+      "ResultPath": "$.Plan",
+      "WaitTime": 600,
+      "Next": "Genotype"
+    },
+    "Genotype": {
+      "Type": "Action",
+      "ActionUrl": "https://compute.actions.globus.org/v3",
+      "Parameters": {
+        "endpoint_id.$": "$.endpoint",
+        "user_endpoint_config": {
+          "pool.$": "$.fan_out_pool",
+          "python.$": "$.python"
+        },
+        "tasks.$": "$.Plan.details.result[0]"
+      },
+      "ResultPath": "$.Genotype",
+      "WaitTime": 3600,
+      "Next": "Merge"
+    },
+    "Merge": {
+      "Type": "Action",
+      "ActionUrl": "https://compute.actions.globus.org/v3",
+      "Parameters": {
+        "endpoint_id.$": "$.endpoint",
+        "user_endpoint_config": {
+          "pool.$": "$.merge_pool",
+          "python.$": "$.python"
+        },
+        "tasks": [
+          {
+            "function_id.$": "$.merge_function",
+            "args.$": "$.Genotype.details.result",
+            "kwargs": {
+              "manifest.=": "out_prefix + 'manifest.json'"
+            }
+          }
+        ]
+      },
+      "ResultPath": "$.Merge",
+      "WaitTime": 1800,
+      "End": true
+    }
+  }
+}

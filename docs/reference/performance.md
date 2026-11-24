@@ -209,3 +209,28 @@ local `AWSEngine`, without Globus in the loop.
   for (about 5 s per environment). The handler now writes an `InitSeconds` metric before any task
   runs in an environment, and Lambda spend includes it.
 
+### Lambda against Spot EC2: a burst of short tasks (2026-11-24)
+
+A synthetic baseline for [Lambda pools](../how-to/lambda-pools.md): 500 tasks of 1–5 s of CPU work
+(SHA-256 rounds; 1,460 s of work in all, the same durations every run), sent through Globus Compute
+to a Lambda pool (2048 MB, concurrency 16) and to a Spot pool of up to sixteen 2-vCPU workers
+(16 slots) in us-west-2, each from idle. [examples/lambda-burst/](../../examples/lambda-burst/)
+has the script. The real-data comparison is the
+[cohort tutorial](../tutorials/cohort-genotype.md).
+
+| Run | First result | All 500 |
+|---|---|---|
+| Lambda, cold functions and a cold endpoint process | 18.8 s | 136.9 s |
+| Lambda, warm functions | 4.8 s | 123.5 s |
+| Lambda, cold functions, warm endpoint process | 7.1 s | 130.8 s |
+| Spot EC2 from zero | 38.5 s | 137.9 s |
+| Spot EC2 from zero, again | 35.6 s | 135.2 s |
+
+Cost per run (`aegc cost`): Lambda **$0.041** (three runs, $0.124), Spot **$0.040** (two runs,
+$0.079 and 1.9 instance-hours, boot and idle included).
+
+With every slot busy for two minutes, both finish together and cost the same: Spot's boot and
+5 idle minutes per worker use up its lower price. Lambda's results start about 30 s sooner. A
+smaller or sparser burst favours Lambda (nothing idles between bursts); longer or steadier work
+favours Spot, about 4–5 times cheaper per vCPU-hour once its boot and idle time are spread thin.
+

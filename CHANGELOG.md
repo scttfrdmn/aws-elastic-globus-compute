@@ -75,6 +75,14 @@ live; see the [performance page](docs/reference/performance.md#v07-live-run-2026
   images, troubleshooting and reference pages, with the
   [v0.7 live run](docs/reference/performance.md#v07-live-run-2026-11-23).
 
+- **Tutorial: [Genotype a gene across 1000 Genomes](docs/tutorials/cohort-genotype.md)** (#82): a
+  Globus flow that genotypes APOL1 in all 2,504 high-coverage samples (44 TB of CRAMs) on a Lambda
+  pool, 100 at a time, then merges on a Spot pool. Measured live: 3 min 24 s end to end, 25.8 GB
+  read, $0.17 a run, and APOL1 G1/G2 at 26%/13% in African-ancestry samples. Code in
+  [examples/cohort-genotype/](examples/cohort-genotype/). The synthetic Lambda-vs-Spot burst
+  (#79) is in [Performance](docs/reference/performance.md), code in
+  [examples/lambda-burst/](examples/lambda-burst/).
+
 ### Changed
 - `aegc image build` pushes with `--provenance=false --sbom=false`, so an image's digest is a
   single manifest, not an index with attestations; Lambda pools run the same digest.
