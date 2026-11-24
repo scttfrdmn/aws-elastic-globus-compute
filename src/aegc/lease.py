@@ -9,6 +9,8 @@ freeze it:
 - ``lease-<pool>`` sets each group's minimum to 0 through ``autoscaling:updateAutoScalingGroup``,
   so ``min>0`` workers can leave too. For a Lambda pool (#21) it disables the pool's event source
   mapping through ``lambda:updateEventSourceMapping`` instead.
+- ``lease-trigger-<name>`` disables an S3-event trigger's rule (#83) through
+  ``eventbridge:disableRule``.
 
 Engines push the lease forward every hour (:func:`renew`). ``--ttl`` adds ``ttl-*`` schedules
 that nothing renews: a hard end date. Everything lives in a tagged schedule group ``aegc-<d>``
@@ -44,6 +46,9 @@ ASG_TARGET = "arn:aws:scheduler:::aws-sdk:autoscaling:updateAutoScalingGroup"
 #: SDKs' members are serialized: ``{"Uuid": ..., "Enabled": false}`` (found live: "UUID" is
 #: refused with "Request payload is missing the following field(s): Uuid").
 LAMBDA_TARGET = "arn:aws:scheduler:::aws-sdk:lambda:updateEventSourceMapping"
+#: The service is named as the SDKs name it (EventBridge, as Step Functions' ``aws-sdk:eventbridge``
+#: integrations do), the action camelCase; the input is DisableRule's ``{"Name": ...}``.
+EVENTS_TARGET = "arn:aws:scheduler:::aws-sdk:eventbridge:disableRule"
 POLICY = "aegc-lease"
 
 
@@ -91,6 +96,8 @@ class LeaseSpec:
     groups: dict[str, str]  # pool name -> Auto Scaling group name
     #: Lambda pools (#21): pool name -> event source mapping UUID (disabled when the lease ends).
     mappings: dict[str, str] = field(default_factory=dict)
+    #: S3-event triggers (#83): trigger name -> EventBridge rule name (disabled likewise).
+    rules: dict[str, str] = field(default_factory=dict)
     lease_s: int = DEFAULT_LEASE_S
     ttl_at: float = 0.0  # absolute UTC time; 0: no TTL
 
@@ -147,6 +154,12 @@ def schedules(spec: LeaseSpec, role_arn: str, *, now: float) -> dict[str, dict[s
                 when,
                 {"Arn": LAMBDA_TARGET, "Input": json.dumps({"Uuid": uuid, "Enabled": False})},
             )
+        for trigger, rule in sorted(spec.rules.items()):
+            add(
+                f"{prefix}-{naming.TRIGGER}-{trigger}",
+                when,
+                {"Arn": EVENTS_TARGET, "Input": json.dumps({"Name": rule})},
+            )
 
     if spec.lease_s:
         kind(
@@ -201,6 +214,13 @@ def _role_documents(spec: LeaseSpec) -> tuple[dict[str, Any], dict[str, Any]]:
                     "StringEquals": {f"aws:ResourceTag/{naming.TAG_DEPLOYMENT}": d},
                     "ArnLike": {"lambda:FunctionArn": functions},
                 },
+            },
+            {
+                # S3-event triggers (#83): their rules, tagged as this deployment's.
+                "Effect": "Allow",
+                "Action": "events:DisableRule",
+                "Resource": f"arn:aws:events:{r}:{a}:rule/{naming.trigger_prefix(d)}*",
+                "Condition": {"StringEquals": {f"aws:ResourceTag/{naming.TAG_DEPLOYMENT}": d}},
             },
         ],
     }
@@ -432,6 +452,8 @@ def fire(
     prefix: str = "lease",
     lam: Any = None,
     mappings: dict[str, str] | None = None,
+    events: Any = None,
+    rules: dict[str, str] | None = None,
 ) -> None:
     """Do exactly what the ``<prefix>-*`` schedules do when they fire."""
     write_state(
@@ -443,3 +465,23 @@ def fire(
         autoscaling.update_auto_scaling_group(AutoScalingGroupName=group, MinSize=0)
     for uuid in (mappings or {}).values():
         lam.update_event_source_mapping(UUID=uuid, Enabled=False)
+    for rule in (rules or {}).values():
+        events.disable_rule(Name=rule)
+
+
+def spec_from_manifest(m: dict[str, Any], rules: dict[str, str]) -> LeaseSpec:
+    """The lease of a deployed manifest, with the given trigger rules (``aegc trigger``)."""
+    pools = dict(m.get("pools") or {})
+    lease = dict(m.get("lease") or {})
+    return LeaseSpec(
+        deployment=str(m["deployment"]),
+        region=str(m["region"]),
+        account=str(m["account"]),
+        groups={n: str(p["auto_scaling_group"]) for n, p in pools.items()
+                if p.get("auto_scaling_group")},
+        mappings={n: str(p["event_source_mapping"]) for n, p in pools.items()
+                  if p.get("event_source_mapping")},
+        rules=rules,
+        lease_s=int(lease.get("lease_s") or 0),
+        ttl_at=float(lease.get("ttl_at") or 0.0),
+    )  # fmt: skip

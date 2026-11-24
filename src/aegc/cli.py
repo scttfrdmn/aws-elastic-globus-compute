@@ -349,8 +349,10 @@ def _evaluate(args: argparse.Namespace) -> int:
     sess, region, _ = _ctx(args)
     clients = {
         s: awsutil.client(sess, s)  # type: ignore[arg-type]
-        for s in ("ssm", "s3", "autoscaling", "scheduler", "sqs", "ec2", "cloudwatch", "lambda")
-    }
+        for s in (
+            "ssm", "s3", "autoscaling", "scheduler", "sqs", "ec2", "cloudwatch", "lambda", "events",
+        )
+    }  # fmt: skip
     clients["pricing"] = awsutil.client(  # the Price List API is in us-east-1
         awsutil.session(args.profile, "us-east-1"), "pricing"
     )
@@ -361,6 +363,73 @@ def _evaluate(args: argparse.Namespace) -> int:
     )  # fmt: skip
     print(ev.render(), file=sys.stderr)
     return 1 if ev.errors else 0
+
+
+def _trigger(args: argparse.Namespace) -> int:
+    import os
+
+    from aegc.infra import Report, triggers
+    from aegc.trigger import TemplateError
+
+    sess, region, account = _ctx(args)
+    c = _clients(sess).triggers()  # type: ignore[attr-defined]
+    cmd = args.trigger_command
+    if cmd == "login":
+        client_id = args.client_id or os.environ.get("AEGC_GLOBUS_CLIENT_ID", "")
+        if not client_id:
+            raise SystemExit(
+                "aegc: --client-id: the client id of your own Globus native app (register one "
+                "at https://app.globus.org/settings/developers: 'thick client or script'), or "
+                "set AEGC_GLOBUS_CLIENT_ID"
+            )
+        report = Report()
+        if args.dry_run:
+            report.add("secret", f"aegc-{args.deployment}-trigger-{args.name}", "would-update",
+                       f"after a Globus login for flow {args.flow}")  # fmt: skip
+        else:
+            login = triggers.globus_login(args.flow, client_id)
+            triggers.put_login(
+                c.secretsmanager, args.deployment, args.name, region, account, login, report,
+                dry_run=False,
+            )  # fmt: skip
+        print(report)
+        return 0
+    if cmd == "create":
+        try:
+            spec = triggers.TriggerSpec(
+                deployment=args.deployment, region=region, account=account, name=args.name,
+                flow_id=args.flow, bucket=args.bucket, prefix=args.prefix, suffix=args.suffix,
+                input_template=json.loads(args.input),
+            )  # fmt: skip
+        except (ValueError, TemplateError) as e:
+            raise SystemExit(f"aegc: {e}") from None
+        package = None
+        if args.package:
+            with open(args.package, "rb") as f:
+                package = f.read()
+        elif not args.dry_run:
+            print("building the trigger's package (globus-sdk for arm64)...", file=sys.stderr)
+            package = triggers.build_package()
+        try:
+            report = triggers.create(c, spec, package=package, dry_run=args.dry_run)
+        except ValueError as e:
+            raise SystemExit(f"aegc: {e}") from None
+        print(report)
+        if args.dry_run:
+            print("dry run; nothing changed")
+        return 0
+    if cmd == "list":
+        rows = triggers.list_triggers(c, args.deployment)
+        for row in rows:
+            print(row)
+        if not rows:
+            print(f"no triggers in {args.deployment}")
+        return 0
+    report = triggers.delete(c, args.deployment, args.name, region, dry_run=not args.yes)
+    print(report)
+    if not args.yes:
+        print("dry run; pass --yes to delete")
+    return 0
 
 
 def _ctx(args: argparse.Namespace) -> tuple[object, str, str]:
@@ -392,7 +461,7 @@ def _clients(sess: object) -> object:
 
     services = (
         "iam", "ec2", "autoscaling", "sqs", "logs", "ssm", "ecr", "scheduler", "secretsmanager",
-        "cloudwatch", "sns",
+        "cloudwatch", "sns", "events", "s3",
     )  # fmt: skip
     clients = {s: awsutil.client(sess, s) for s in (*services, "lambda")}  # type: ignore[arg-type]
     clients["lambda_"] = clients.pop("lambda")
@@ -863,6 +932,7 @@ def _stop(args: argparse.Namespace) -> int:
             deployment=args.deployment,
             hard=args.hard,
             lam=awsutil.client(sess, "lambda"),  # type: ignore[arg-type]
+            events=awsutil.client(sess, "events"),  # type: ignore[arg-type]
         )
     )
     return 0
@@ -879,6 +949,7 @@ def _resume(args: argparse.Namespace) -> int:
             deployment=args.deployment,
             scheduler=awsutil.client(sess, "scheduler"),  # type: ignore[arg-type]
             lam=awsutil.client(sess, "lambda"),  # type: ignore[arg-type]
+            events=awsutil.client(sess, "events"),  # type: ignore[arg-type]
         )
     )
     return 0
@@ -916,6 +987,7 @@ def _limits(args: argparse.Namespace) -> int:
             spend=spend if args.resume else None,
             scheduler=awsutil.client(sess, "scheduler"),  # type: ignore[arg-type]
             lam=awsutil.client(sess, "lambda"),  # type: ignore[arg-type]
+            events=awsutil.client(sess, "events"),  # type: ignore[arg-type]
             max_usd_day=args.max_usd_day,
             max_usd_month=args.max_usd_month,
             max_instance_hours_day=args.max_instance_hours_day,
@@ -1043,6 +1115,14 @@ def _footprint(args: argparse.Namespace) -> int:
         if error_code(e) not in deployment.ACCESS_DENIED:
             raise
         print(f"note: Lambda pools {deployment.LAMBDA_DENIED}", file=sys.stderr)
+    from aegc.infra import triggers
+
+    try:  # S3-event triggers (#83): rules and stored logins, with look-alikes
+        triggers.footprint(_clients(sess).triggers(), fp, args.deployment)  # type: ignore[attr-defined]
+    except Exception as e:
+        if error_code(e) not in deployment.ACCESS_DENIED:
+            raise
+        print(f"note: {deployment.TRIGGERS_DENIED}", file=sys.stderr)
     print(fp.render())
     return 0
 
@@ -1236,6 +1316,42 @@ def build_parser() -> argparse.ArgumentParser:
     ls = img.add_parser("list", help="an environment's recorded images, one per Python minor")
     ls.add_argument("--env", required=True)
     ls.set_defaults(func=_image_list)
+
+    tr = sub.add_parser(
+        "trigger", help="S3-event triggers: start a Globus flow for each new object (#83)"
+    ).add_subparsers(dest="trigger_command", required=True)
+    tl = tr.add_parser(
+        "login",
+        help="log in to Globus and store your login for a trigger (readable by its function only)",
+    )
+    tc = tr.add_parser("create", help="create or update a trigger (needs `trigger login` first)")
+    for t in (tl, tc):
+        t.add_argument("deployment")
+        t.add_argument("--name", required=True, help="the trigger's name (1-15 of [a-z0-9-])")
+        t.add_argument("--flow", required=True, metavar="FLOW_ID", help="the Globus flow to run")
+        t.add_argument("--dry-run", action="store_true", help="change nothing; say what would")
+    tl.add_argument(
+        "--client-id", help="your Globus native app's client id (or AEGC_GLOBUS_CLIENT_ID)"
+    )
+    tl.set_defaults(func=_trigger)
+    tc.add_argument("--bucket", required=True, help="the bucket to watch (yours)")
+    tc.add_argument("--prefix", default="", help="only keys starting with this")
+    tc.add_argument("--suffix", default="", help="only keys ending with this")
+    tc.add_argument(
+        "--input", required=True, metavar="JSON",
+        help="the flow's input, a JSON object; string values may use {bucket}, {key}, {size}, "
+        "{etag} (\"{size}\" alone becomes a number)",
+    )  # fmt: skip
+    tc.add_argument("--package", metavar="ZIP", help="a prebuilt function package (default: build)")
+    tc.set_defaults(func=_trigger)
+    tls = tr.add_parser("list", help="a deployment's triggers, their rules and recent runs")
+    tls.add_argument("deployment")
+    tls.set_defaults(func=_trigger)
+    td = tr.add_parser("delete", help="delete a trigger (dry run by default)")
+    td.add_argument("deployment")
+    td.add_argument("--name", required=True)
+    td.add_argument("--yes", action="store_true", help="actually delete")
+    td.set_defaults(func=_trigger)
 
     bs = sub.add_parser("bootstrap", help="create the region-wide resources (once per region)")
     bs.add_argument("--dry-run", action="store_true")
