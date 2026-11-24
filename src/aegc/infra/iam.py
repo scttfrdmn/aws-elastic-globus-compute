@@ -22,22 +22,38 @@ _AEGC_BUCKET_RE = re.compile(rf"{naming.PREFIX}-\d{{12}}-[a-z0-9-]+")
 #: Characters IAM treats as wildcards or variables in resources and StringLike conditions.
 _WILDCARDS = ("*", "?", "${")
 
-Access = Literal["read", "write"]
+Access = Literal["read", "write", "omics"]
+#: A HealthOmics workflow id: a private one, or ``ready2run:<id>`` (#84).
+_OMICS_WORKFLOW_RE = re.compile(r"(ready2run:)?[0-9A-Za-z]{1,18}")
+_ROLE_ARN_RE = re.compile(r"arn:aws[a-z-]*:iam::\d{12}:role/[\w+=,.@/-]{1,512}")
 
 
 @dataclass(frozen=True)
 class Grant:
     """Worker access to ``s3://bucket/prefix``. aegc references the bucket; it never creates,
     changes or deletes it. The prefix is literal: ``out`` also covers ``outside/``, so end it with
-    ``/`` for a folder. An empty prefix is the whole bucket."""
+    ``/`` for a folder. An empty prefix is the whole bucket.
+
+    Or (``access="omics"``, #84) leave to start AWS HealthOmics runs of one ``workflow`` with one
+    service ``role``, and to read and cancel the runs the deployment started."""
 
     access: Access
-    bucket: str
+    bucket: str = ""
     prefix: str = ""
+    workflow: str = ""  # omics: the workflow id, or ready2run:<id>
+    role: str = ""  # omics: the service role HealthOmics runs it with
 
     def __post_init__(self) -> None:
+        if self.access == "omics":
+            if self.bucket or self.prefix:
+                raise ValueError("an omics grant names a workflow and a role, not a bucket")
+            if not _OMICS_WORKFLOW_RE.fullmatch(self.workflow):
+                raise ValueError(f"not a HealthOmics workflow id: {self.workflow!r}")
+            if not _ROLE_ARN_RE.fullmatch(self.role) or any(w in self.role for w in _WILDCARDS):
+                raise ValueError(f"an omics grant needs role=<IAM role ARN>, not {self.role!r}")
+            return
         if self.access not in ("read", "write"):
-            raise ValueError(f"grant access must be read or write, not {self.access!r}")
+            raise ValueError(f"grant access must be read, write or omics, not {self.access!r}")
         b = self.bucket
         if any(w in b for w in _WILDCARDS) or any(w in self.prefix for w in _WILDCARDS):
             raise ValueError(f"grants can't use wildcards: {self.uri}")
@@ -58,22 +74,35 @@ class Grant:
 
     @property
     def uri(self) -> str:
+        if self.access == "omics":
+            return f"omics:{self.workflow} as {self.role}"
         return f"s3://{self.bucket}/{self.prefix}"
 
     def covers(self, bucket: str, key: str) -> bool:
-        return bucket == self.bucket and key.startswith(self.prefix)
+        return self.access != "omics" and bucket == self.bucket and key.startswith(self.prefix)
 
     def to_dict(self) -> dict[str, str]:
+        if self.access == "omics":
+            return {"access": "omics", "workflow": self.workflow, "role": self.role}
         return {"access": self.access, "bucket": self.bucket, "prefix": self.prefix}
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Grant:
+        if d.get("access") == "omics":
+            return cls(access="omics", workflow=str(d["workflow"]), role=str(d["role"]))
         return cls(access=d["access"], bucket=str(d["bucket"]), prefix=str(d.get("prefix", "")))
 
     @classmethod
     def parse(cls, text: str) -> Grant:
         """``read=s3://bucket/prefix`` or ``write=s3://bucket/prefix``. ``s3://bucket/`` (with
-        the slash) grants the whole bucket; ``s3://bucket`` is refused as ambiguous."""
+        the slash) grants the whole bucket; ``s3://bucket`` is refused as ambiguous. Or
+        ``omics=WORKFLOW_ID,role=ROLE_ARN`` (``ready2run:ID`` for a Ready2Run workflow)."""
+        if text.startswith("omics="):
+            workflow, _, rest = text.removeprefix("omics=").partition(",")
+            key, _, role = rest.partition("=")
+            if key != "role" or not role:
+                raise ValueError(f"an omics grant is omics=WORKFLOW_ID,role=ROLE_ARN: {text!r}")
+            return cls(access="omics", workflow=workflow, role=role)
         access, sep, uri = text.partition("=")
         if not sep or access not in ("read", "write"):
             raise ValueError(f"a grant is read=s3://bucket/prefix or write=s3://...: {text!r}")
@@ -111,6 +140,7 @@ def grants_policy(
     deployment: str,
     budget: int = INLINE_POLICY_LIMIT,
     account: str = "",
+    region: str = "*",
 ) -> dict[str, Any]:
     """The inline policy ``aegc-grants``: worker access to the user's own S3 prefixes.
 
@@ -143,6 +173,7 @@ def grants_policy(
         )
     reads = [g for g in gs if g.access == "read"]
     writes = [g for g in gs if g.access == "write"]
+    omics = [g for g in gs if g.access == "omics"]
     statements: list[dict[str, Any]] = []
     if reads:
         statements.append(
@@ -182,6 +213,9 @@ def grants_policy(
                 ),
             }
         )
+    if omics:
+        statements += _omics_statements(omics, deployment=deployment, account=account,
+                                        region=region)  # fmt: skip
     doc = {"Version": "2012-10-17", "Statement": statements}
     if (size := policy_size(doc)) > budget:
         raise ValueError(
@@ -191,6 +225,37 @@ def grants_policy(
             "prefixes"
         )
     return doc
+
+
+def _omics_statements(
+    grants: list[Grant], *, deployment: str, account: str, region: str
+) -> list[dict[str, Any]]:
+    """#84: start runs of the granted workflows, tagged with the deployment, as the granted role;
+    read and cancel only runs tagged with it."""
+    acct = account or "*"
+    workflows = [
+        f"arn:aws:omics:{region}::workflow/{g.workflow.removeprefix('ready2run:')}"
+        if g.workflow.startswith("ready2run:")
+        else f"arn:aws:omics:{region}:{acct}:workflow/{g.workflow}"
+        for g in grants
+    ]
+    runs = f"arn:aws:omics:{region}:{acct}:run/*"
+    tagged = {f"aws:RequestTag/{naming.TAG_DEPLOYMENT}": deployment}
+    return [
+        {"Sid": "OmicsStartRuns", "Effect": "Allow", "Action": "omics:StartRun",
+         "Resource": [*workflows, runs], "Condition": {"StringEquals": tagged}},
+        {"Sid": "OmicsTagRuns", "Effect": "Allow", "Action": "omics:TagResource",
+         "Resource": runs, "Condition": {"StringEquals": tagged}},
+        {"Sid": "OmicsReadWorkflows", "Effect": "Allow", "Action": "omics:GetWorkflow",
+         "Resource": workflows},
+        {"Sid": "OmicsOwnRuns", "Effect": "Allow",
+         "Action": ["omics:GetRun", "omics:CancelRun", "omics:ListRunTasks"], "Resource": runs,
+         "Condition": {"StringEquals": {
+             f"aws:ResourceTag/{naming.TAG_DEPLOYMENT}": deployment}}},
+        {"Sid": "OmicsPassRole", "Effect": "Allow", "Action": "iam:PassRole",
+         "Resource": sorted({g.role for g in grants}),
+         "Condition": {"StringEquals": {"iam:PassedToService": "omics.amazonaws.com"}}},
+    ]  # fmt: skip
 
 
 #: The vCPU quota preflight in `aegc deploy` and `aegc status` (none of these take resources).

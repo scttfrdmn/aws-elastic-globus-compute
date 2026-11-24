@@ -820,7 +820,9 @@ def deploy_grants(
                 bucket=naming.bucket_name(account, region),
             )
             room = iam.INLINE_POLICY_LIMIT - iam.policy_size(worker)
-            iam.grants_policy(grants, deployment=deployment, budget=room, account=account)
+            iam.grants_policy(
+                grants, deployment=deployment, budget=room, account=account, region=region
+            )
     except ValueError as e:
         raise SystemExit(f"aegc: {e}") from None
     return grants
@@ -1292,10 +1294,12 @@ def build_parser() -> argparse.ArgumentParser:
     )  # fmt: skip
     _limit_args(dp)
     dp.add_argument(
-        "--grant", action="append", metavar="read|write=s3://BUCKET/PREFIX|none",
+        "--grant", action="append",
+        metavar="read|write=s3://BUCKET/PREFIX|omics=WORKFLOW,role=ARN|none",
         help="let every task in the deployment read or write under an S3 prefix of yours "
-        "(repeatable; s3://BUCKET/ is the whole bucket). Replaces the previous grants; without "
-        "--grant a redeploy keeps them, and --grant none removes them.",
+        "(repeatable; s3://BUCKET/ is the whole bucket), or start AWS HealthOmics runs of a "
+        "workflow with a service role (omics=ID or ready2run:ID). Replaces the previous grants; "
+        "without --grant a redeploy keeps them, and --grant none removes them.",
     )  # fmt: skip
     dp.add_argument(
         "--lease", metavar="DURATION",

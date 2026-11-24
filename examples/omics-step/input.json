@@ -1,0 +1,11 @@
+{
+  "endpoint": "AEGC_ENDPOINT_ID",
+  "pool": "genomics-py314-lambda",
+  "python": "3.14",
+  "start_function": "START_FUNCTION_ID",
+  "status_function": "STATUS_FUNCTION_ID",
+  "workflow_id": "WORKFLOW_ID",
+  "role_arn": "arn:aws:iam::ACCOUNT:role/OMICS_SERVICE_ROLE",
+  "output_uri": "s3://BUCKET/omics/runs/",
+  "parameters": {"region": "chr22:36253000-36268000"}
+}

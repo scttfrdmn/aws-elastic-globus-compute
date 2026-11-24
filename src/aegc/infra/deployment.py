@@ -290,8 +290,9 @@ class DeploymentSpec:
             *(iam.policy_size(self.function_policy(p)) for p in self.pools if p.is_lambda),
         )
         return iam.grants_policy(
-            self.grants, deployment=self.deployment, budget=room, account=self.account
-        )
+            self.grants, deployment=self.deployment, budget=room, account=self.account,
+            region=self.region,
+        )  # fmt: skip
 
 
 @dataclass

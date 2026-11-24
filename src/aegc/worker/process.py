@@ -194,7 +194,8 @@ class Processor:
                 task_deserializers=msg.call.task_deserializers,
                 result_serializers=msg.call.result_serializers,
                 task_uid=task_uid,
-                task_env=task_env or None,
+                # Tasks know their deployment (aegc.omics tags runs with it, #84).
+                task_env={"AEGC_DEPLOYMENT": self.deployment, **(task_env or {})},
             )
         except Exception as e:
             log.exception("runner failed for %s", msg.executor_task_id)

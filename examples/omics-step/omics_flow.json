@@ -1,0 +1,66 @@
+{
+  "Comment": "aegc: start an AWS HealthOmics run, wait for it, then go on",
+  "StartAt": "StartRun",
+  "States": {
+    "StartRun": {
+      "Type": "Action",
+      "ActionUrl": "https://compute.actions.globus.org/v3",
+      "Parameters": {
+        "endpoint_id.$": "$.endpoint",
+        "user_endpoint_config": {"pool.$": "$.pool", "python.$": "$.python"},
+        "tasks": [
+          {
+            "function_id.$": "$.start_function",
+            "kwargs": {
+              "workflow_id.$": "$.workflow_id",
+              "role_arn.$": "$.role_arn",
+              "output_uri.$": "$.output_uri",
+              "parameters.$": "$.parameters"
+            }
+          }
+        ]
+      },
+      "ResultPath": "$.Started",
+      "WaitTime": 300,
+      "Next": "Wait"
+    },
+    "Wait": {"Type": "Wait", "Seconds": 300, "Next": "Status"},
+    "Status": {
+      "Type": "Action",
+      "ActionUrl": "https://compute.actions.globus.org/v3",
+      "Parameters": {
+        "endpoint_id.$": "$.endpoint",
+        "user_endpoint_config": {"pool.$": "$.pool", "python.$": "$.python"},
+        "tasks": [
+          {
+            "function_id.$": "$.status_function",
+            "kwargs": {"run_id.$": "$.Started.details.result[0].run_id"}
+          }
+        ]
+      },
+      "ResultPath": "$.Run",
+      "WaitTime": 300,
+      "Next": "Done?"
+    },
+    "Done?": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.Run.details.result[0].done", "BooleanEquals": true},
+            {"Variable": "$.Run.details.result[0].failed", "BooleanEquals": false}
+          ],
+          "Next": "Completed"
+        },
+        {"Variable": "$.Run.details.result[0].done", "BooleanEquals": true, "Next": "RunFailed"}
+      ],
+      "Default": "Wait"
+    },
+    "RunFailed": {
+      "Type": "Fail",
+      "Error": "HealthOmicsRunFailed",
+      "Cause": "The HealthOmics run didn't complete; see $.Run for its status and message"
+    },
+    "Completed": {"Type": "Pass", "End": true}
+  }
+}
