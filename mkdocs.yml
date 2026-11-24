@@ -71,6 +71,7 @@ nav:
       - Run the endpoint in the cloud: how-to/cloud-endpoint.md
       - "Watch tasks: logs, metrics, provenance": how-to/observability.md
       - Use Globus Flows and Timers: how-to/flows.md
+      - Start a flow when a file lands in S3: how-to/triggers.md
       - Troubleshooting: how-to/troubleshooting.md
   - Reference:
       - CLI: reference/cli.md

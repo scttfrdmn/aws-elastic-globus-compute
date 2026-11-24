@@ -154,6 +154,21 @@ Execution environments are reused between invocations, one task at a time: `/tmp
 task scratch (`/tmp/aegc`) and `HOME` live, persists from one task to the next in the same
 environment.
 
+## Triggers
+
+A [trigger](../how-to/triggers.md) starts flows with **your Globus identity**: its function holds
+a refresh token for the flow's scope (from `aegc trigger login`, with your own native app's client
+id). Anyone who can change the function's code or configuration could use that token, so treat
+the lambda-deployer policy as able to act as you in that flow. The token is in the secret
+`aegc-<d>-trigger-<name>`, whose resource policy denies `GetSecretValue` to every principal but the
+function's role; aegc's policies never read it, and the function never logs it. The role has no
+S3 access and nothing of the deployment but its log streams and its own dead-letter queue. Revoke
+the consent in Globus (or delete the trigger) to end it.
+
+What can start a run: any object created under the bucket and prefix, so anyone who may write
+there may start the flow (as you) with an input that names their object. Keep the prefix to
+writers you trust, and let the flow check its input.
+
 ## Data access
 
 Without grants, task code has no S3 access at all in isolated pools, and the worker role reaches

@@ -6,6 +6,24 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **S3-event triggers** (#83): `aegc trigger login / create / list / delete` start a Globus flow
+  for each object created under a bucket prefix (and suffix), as you: `trigger login` stores your
+  Globus login (a globus-sdk `UserApp` with your own native app's `--client-id`, refresh tokens
+  for the flow's scope) in the secret `aegc-<d>-trigger-<name>`, readable by the trigger's
+  function role only. `trigger create --flow --bucket [--prefix] [--suffix] --input JSON` makes an
+  EventBridge rule (S3 `Object Created`), a zip function (python3.13, arm64, reserved concurrency
+  2, globus-sdk vendored as manylinux aarch64 wheels) whose input template may use `{bucket}`,
+  `{key}`, `{size}`, `{etag}`, its role (its secret, logs and DLQ only; no S3), a dead-letter
+  queue, the invoke permission for that rule, and the spec in `/aegc/<d>/triggers/<name>`; it
+  turns on the bucket's EventBridge delivery with a read-merge that keeps its other
+  notifications, and delete and destroy leave it on (`kept`). Stop, caps, the lease and TTL
+  (`lease-trigger-<name>` schedules, target `aws-sdk:eventbridge:disableRule`) disable the rules;
+  resume and the evaluator enable them. `destroy`, verification and `footprint` cover them.
+  Pool names `trigger` and `trigger-*` are reserved. The lambda-deployer policy covers triggers;
+  the operator and endpoint policies may enable and disable the deployment's tagged trigger
+  rules. See [Start a flow when a file lands in S3](docs/how-to/triggers.md).
+
 ## [0.7.0] - 2026-11-24
 
 Lambda pools: a pool can run its env's worker image as an AWS Lambda function, fed by its SQS
