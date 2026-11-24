@@ -231,7 +231,8 @@ def _omics_statements(
     grants: list[Grant], *, deployment: str, account: str, region: str
 ) -> list[dict[str, Any]]:
     """#84: start runs of the granted workflows, tagged with the deployment, as the granted role;
-    read and cancel only runs tagged with it."""
+    read and cancel only runs tagged with it. No ``omics:TagResource`` (review): with it a task
+    could tag any run with the deployment and then read or cancel it."""
     acct = account or "*"
     workflows = [
         f"arn:aws:omics:{region}::workflow/{g.workflow.removeprefix('ready2run:')}"
@@ -244,8 +245,6 @@ def _omics_statements(
     return [
         {"Sid": "OmicsStartRuns", "Effect": "Allow", "Action": "omics:StartRun",
          "Resource": [*workflows, runs], "Condition": {"StringEquals": tagged}},
-        {"Sid": "OmicsTagRuns", "Effect": "Allow", "Action": "omics:TagResource",
-         "Resource": runs, "Condition": {"StringEquals": tagged}},
         {"Sid": "OmicsReadWorkflows", "Effect": "Allow", "Action": "omics:GetWorkflow",
          "Resource": workflows},
         {"Sid": "OmicsOwnRuns", "Effect": "Allow",
@@ -1059,7 +1058,7 @@ def lambda_deployer_policy(*, region: str, account: str) -> dict[str, Any]:
 def _trigger_deployer_statements(r: str, a: str) -> list[dict[str, Any]]:
     """S3-event triggers (#83, ``aegc trigger``): their rules, the functions' invoke permission
     and settings, the stored logins, dead-letter queues, and EventBridge delivery on the user's
-    buckets (read-merge; any bucket, so the user's own bucket policy decides)."""
+    buckets (read-merge; this account's buckets)."""
     p = naming.PREFIX
     rules = f"arn:aws:events:{r}:{a}:rule/{p}-*-{naming.TRIGGER}-*"
     functions = f"arn:aws:lambda:{r}:{a}:function:{p}-*-{naming.TRIGGER}-*"
@@ -1098,9 +1097,12 @@ def _trigger_deployer_statements(r: str, a: str) -> list[dict[str, Any]]:
          "Action": ["sqs:CreateQueue", "sqs:TagQueue", "sqs:ListQueueTags", "sqs:GetQueueUrl",
                     "sqs:GetQueueAttributes", "sqs:SetQueueAttributes", "sqs:DeleteQueue"],
          "Resource": f"arn:aws:sqs:{r}:{a}:{p}-*-{naming.TRIGGER}-*-dlq"},
+        # The user's buckets: this account's only (review: not any bucket it can reach).
         {"Sid": "BucketEventBridgeDelivery", "Effect": "Allow",
-         "Action": ["s3:GetBucketNotification", "s3:PutBucketNotification"],
-         "Resource": "arn:aws:s3:::*"},
+         "Action": ["s3:GetBucketNotification", "s3:PutBucketNotification",
+                    "s3:GetBucketLocation"],
+         "Resource": "arn:aws:s3:::*",
+         "Condition": {"StringEquals": {"s3:ResourceAccount": a}}},
         {"Sid": "TriggerActivity", "Effect": "Allow", "Action": "cloudwatch:GetMetricData",
          "Resource": "*"},
     ]  # fmt: skip

@@ -92,7 +92,12 @@ def test_build_refusals() -> None:
 
 
 def test_local_users_and_table() -> None:
-    assert MU.local_users() == {"alice": 2001, "bob": 2002, "gc": 1000, "robot": 2003}
+    uids = MU.local_users()
+    assert uids["gc"] == 1000 and sorted(uids) == ["alice", "bob", "gc", "robot"]
+    assert all(2001 <= u < 65534 for n, u in uids.items() if n != "gc")
+    # Review: a uid depends on its name only, so adding or removing a user changes no one else's.
+    fewer = multiuser.build(["bob@uni.edu=bob:labb"], contact_email="a@b.org").local_users()
+    assert fewer["bob"] == uids["bob"]
     assert SPEC.users() == {
         "alice": {"deployment": "laba", "region": "us-west-2", "aws_profile": "aws"},
         "bob": {"deployment": "labb", "region": "us-west-2", "aws_profile": "labb-profile"},
@@ -291,7 +296,7 @@ def test_configure_script_multi_user() -> None:
     for f in ("identity_mapping_config.json", "aegc_local_users", "aegc_multi_user.json",
               "user_config_template.yaml.j2", "user_environment.yaml"):  # fmt: skip
         assert f"cat > {root}/{f} <<'AEGC_EOF'" in script
-    assert "bob 2002\n" in script and "gc 1000\n" in script
+    assert f"bob {MU.local_users()['bob']}\n" in script and "gc 1000\n" in script
     assert f"chmod 600 {root}/identity_mapping_config.json" in script
     assert "is a single-user endpoint" in script and "/aegc/single/storage.db" in script
     assert fid in script and "identity_mapping_config_path" in script

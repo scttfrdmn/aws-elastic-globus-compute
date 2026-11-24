@@ -778,7 +778,11 @@ def test_lambda_deployer_covers_triggers(aws: Callable[[str], Any]) -> None:
     fn = f"arn:aws:lambda:{REGION}:{ACCOUNT}:function:{RES}"
     assert decide(c, arn, "lambda:AddPermission", fn, **res) == "allowed"
     assert decide(c, arn, "lambda:PutFunctionConcurrency", fn, **res) == "allowed"
-    assert decide(c, arn, "s3:PutBucketNotification", f"arn:aws:s3:::{BUCKET}") == "allowed"
+    mine = {"s3:ResourceAccount": ACCOUNT}
+    assert decide(c, arn, "s3:PutBucketNotification", f"arn:aws:s3:::{BUCKET}", **mine) == "allowed"
+    # Review: this account's buckets only.
+    theirs = {"s3:ResourceAccount": "999999999999"}
+    assert decide(c, arn, "s3:PutBucketNotification", "arn:aws:s3:::x", **theirs) != "allowed"
     secret = f"{SECRETS}:{RES}-AbCdEf"
     assert decide(c, arn, "secretsmanager:CreateSecret", secret, **req) == "allowed"
     assert decide(c, arn, "secretsmanager:GetSecretValue", secret, **res) != "allowed"
@@ -796,3 +800,47 @@ def test_policies_stay_under_the_managed_policy_limit() -> None:
         iam.trigger_policy(deployment=d, name="b" * 15, **kw),
     ):
         assert iam.policy_size(doc) < 6_144
+
+
+# --- review fixes ----------------------------------------------------------------------------
+
+
+def test_a_flow_writing_into_the_watched_prefix_is_refused(
+    env: tuple[Clients, dict[str, Any]],
+) -> None:
+    c, _ = env
+    loop = spec(input_template={"src": "s3://{bucket}/{key}", "out": f"s3://{BUCKET}/in/results/"})
+    assert infra.watched_outputs(loop) == [f"s3://{BUCKET}/in/results/"]
+    with pytest.raises(ValueError, match="starts it again"):
+        create(c, loop)
+    assert (
+        outcomes(create(c, loop, allow_self_trigger=True))[("eventbridge rule", RES)] == "created"
+    )
+    assert infra.watched_outputs(spec(input_template={"out": f"s3://{BUCKET}/out/"})) == []
+
+
+def test_a_bucket_in_another_region_is_refused(
+    env: tuple[Clients, dict[str, Any]], aws: Callable[[str], Any]
+) -> None:
+    import boto3
+
+    c, _ = env
+    east = boto3.client("s3", region_name="us-east-1")
+    east.create_bucket(Bucket="lab-east")
+    with pytest.raises(ValueError, match="is in us-east-1"):
+        create(c, spec(bucket="lab-east"))
+
+
+def test_rules_of_a_look_alike_deployment_are_left_alone(
+    env: tuple[Clients, dict[str, Any]],
+) -> None:
+    # Review: deployment "dev-trigger"'s rule "aegc-dev-trigger-trigger-x" shares dev's prefix.
+    from aegc import triggers
+
+    c, _ = env
+    create(c)
+    other = "aegc-dev-trigger-trigger-x"
+    tags = naming.tags("dev-trigger", "trigger-rule")
+    c.events.put_rule(Name=other, EventPattern='{"source": ["aws.s3"]}', State="ENABLED",
+                      Tags=[{"Key": k, "Value": v} for k, v in tags.items()])  # fmt: skip
+    assert set(triggers.rules(c.events, "dev")) == {RES}

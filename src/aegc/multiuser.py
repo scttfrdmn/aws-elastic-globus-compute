@@ -33,6 +33,8 @@ IMAGE_USER = "gc"
 IMAGE_UID = 1000
 #: Other mapped users get uids from here, in name order.
 FIRST_UID = 2001
+#: Mapped users' uids: FIRST_UID + crc32(name) % UID_SPAN, stable and below 65,534 (nobody).
+UID_SPAN = 60_000
 _AWS_PROFILE = re.compile(r"^[A-Za-z0-9_.+@-]{1,64}$")
 _REGION = re.compile(r"^[a-z]{2}(-[a-z]+)+-[0-9]$")
 #: Characters that make a username pattern a (reduced) regular expression for Globus' mapper.
@@ -112,16 +114,18 @@ class MultiUser:
         }]  # fmt: skip
 
     def local_users(self) -> dict[str, int]:
-        """Local user name -> uid: ``gc`` keeps 1000, the others from 2001 in name order."""
-        names = sorted({m.local_user for m in self.maps})
+        """Local user name -> uid: ``gc`` keeps 1000; every other name gets a uid derived from
+        the name alone (review: uids from a counter shifted when a user was added or removed,
+        and a user inherited another's home), so it never changes."""
+        import zlib
+
         out: dict[str, int] = {}
-        next_uid = FIRST_UID
-        for n in names:
-            if n == IMAGE_USER:
-                out[n] = IMAGE_UID
-            else:
-                out[n] = next_uid
-                next_uid += 1
+        for n in sorted({m.local_user for m in self.maps}):
+            uid = IMAGE_UID if n == IMAGE_USER else FIRST_UID + zlib.crc32(n.encode()) % UID_SPAN
+            if uid in out.values():
+                other = next(k for k, v in out.items() if v == uid)
+                raise MappingError(f"local users {n} and {other} would share a uid; rename one")
+            out[n] = uid
         return out
 
     def users(self, *, deployment: str, region: str, aws_profile: str) -> dict[str, dict[str, str]]:

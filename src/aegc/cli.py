@@ -499,7 +499,8 @@ def _trigger(args: argparse.Namespace) -> int:
             print("building the trigger's package (globus-sdk for arm64)...", file=sys.stderr)
             package = triggers.build_package()
         try:
-            report = triggers.create(c, spec, package=package, dry_run=args.dry_run)
+            report = triggers.create(c, spec, package=package, dry_run=args.dry_run,
+                                     allow_self_trigger=args.allow_self_trigger)  # fmt: skip
         except ValueError as e:
             raise SystemExit(f"aegc: {e}") from None
         print(report)
@@ -914,10 +915,10 @@ def _deploy(args: argparse.Namespace) -> int:
         )
     if lam := [p.name for p in pools if p.is_lambda]:
         print(
-            f"note: {', '.join(lam)}: Lambda pools aren't isolated. Their tasks run with the "
-            "function role, which can read this deployment's task payloads and post results for "
-            "any of its tasks; run untrusted functions on isolated EC2 pools in a deployment "
-            "without Lambda pools",
+            f"note: {', '.join(lam)}: Lambda pools' tasks run with their pool's function role "
+            "and share it (no per-task isolation within a pool); it reaches only that pool's "
+            "queue, payloads and the deployment's grants. Keep untrusted functions in a pool of "
+            "their own, or on isolated EC2 pools",
             file=sys.stderr,
         )
     # vCPU quotas are for EC2 pools; Lambda pools are bounded by their mappings' concurrency.
@@ -1140,16 +1141,14 @@ def _lambda_preflight(sess: object, pools: list[Any]) -> list[str]:
     total = int(limit.get("ConcurrentExecutions") or 0)
     unreserved = int(limit.get("UnreservedConcurrentExecutions") or total)
     want = sum(lambda_pools.concurrency({"max_concurrency": p.max_concurrency}) for p in pools)
-    if total and want > total:
-        return [
-            f"Lambda pools ask for {want} concurrent executions; the account allows {total} in "
-            "this region. Lower concurrency=, or request more (Service Quotas, L-B99A9384)"
-        ]
+    # A pool's concurrency is a ceiling, not a reservation (review): several pools may each run
+    # up to it, sharing the account's. Warn; never refuse.
     if unreserved and want > unreserved:
         print(
-            f"warning: Lambda pools ask for {want} concurrent executions; {unreserved} of the "
-            "account's are unreserved, and other functions share them. Tasks beyond that are "
-            "throttled, and after 10 min fail with AEGC_LAMBDA_STALLED",
+            f"warning: Lambda pools may run {want} at once; {unreserved} of the account's "
+            f"{total} concurrent executions are unreserved, shared with other functions. Tasks "
+            "beyond that wait (throttled); a pool that runs none for 10 min fails them with "
+            "AEGC_LAMBDA_STALLED. Request more with Service Quotas (L-B99A9384)",
             file=sys.stderr,
         )
     return []
@@ -1461,6 +1460,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--input", required=True, metavar="JSON",
         help="the flow's input, a JSON object; string values may use {bucket}, {key}, {size}, "
         "{etag} (\"{size}\" alone becomes a number)",
+    )  # fmt: skip
+    tc.add_argument(
+        "--allow-self-trigger", action="store_true",
+        help="allow a flow input that names the watched bucket and prefix (each object the flow "
+        "writes there starts it again)",
     )  # fmt: skip
     tc.add_argument("--package", metavar="ZIP", help="a prebuilt function package (default: build)")
     tc.set_defaults(func=_trigger)

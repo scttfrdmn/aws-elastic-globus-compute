@@ -51,7 +51,13 @@ if [ -n "${GC_MULTI_USER:-}" ]; then
         fi
         g=$(id -g "$name")
         install -d -m 700 -o "$name" -g "$g" "/home/$name" "/home/$name/.globus_compute"
+        chown -R "$name:$g" "/home/$name"  # its own files, whatever owned them before
     done < "$users"
+    # Homes of users no longer mapped: root's alone, so no new user can read them.
+    for h in /home/*; do
+        [ -d "$h" ] || continue
+        grep -q "^$(basename "$h") " "$users" || { chown -R root:root "$h"; chmod 700 "$h"; }
+    done
     # ~/.aws (read-only) for each mapped user: a copy each can read, refreshed when it changes on
     # the host (e.g. `aws sso login`). The template's row picks each user's profile.
     sync_aws() {

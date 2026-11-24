@@ -495,9 +495,16 @@ def ensure_function(
                 _wait(lam, name)
             report.add("lambda function", name, "updated", ", ".join(changes))
     if not dry_run:
-        lam.put_function_concurrency(
-            FunctionName=name, ReservedConcurrentExecutions=RESERVED_CONCURRENCY
-        )
+        try:
+            lam.put_function_concurrency(
+                FunctionName=name, ReservedConcurrentExecutions=RESERVED_CONCURRENCY
+            )
+        except Exception as e:
+            # Review: Lambda keeps 100 unreserved, so a low-limit account refuses any reservation.
+            if error_code(e) not in ("InvalidParameterValueException", "LimitExceededException"):
+                raise
+            why = f"not reserved ({error_code(e)}): the account's limit is too low"
+            report.add("lambda concurrency", name, "kept", why)
         lam.put_function_event_invoke_config(
             FunctionName=name, MaximumRetryAttempts=MAX_RETRIES,
             MaximumEventAgeInSeconds=MAX_EVENT_AGE_S,
@@ -645,9 +652,64 @@ def update_lease(
                        dry_run=dry_run)  # fmt: skip
 
 
-def create(c: TriggerClients, spec: TriggerSpec, *, package: bytes | None, dry_run: bool) -> Report:
+def watched_outputs(spec: TriggerSpec) -> list[str]:
+    """S3 URIs in the flow's input that fall under the watched bucket and prefix: a flow writing
+    there would start itself again for each object it writes, for ever (review)."""
+    watched = f"s3://{spec.bucket}/{spec.prefix}"
+    found: list[str] = []
+
+    def walk(v: Any) -> None:
+        if isinstance(v, str):
+            if v.startswith(watched):
+                found.append(v)
+        elif isinstance(v, dict):
+            for x in v.values():
+                walk(x)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x)
+
+    walk(spec.input_template)
+    return found
+
+
+def check_bucket(s3: Any, spec: TriggerSpec) -> None:
+    """S3 sends a bucket's events to its own region's EventBridge: elsewhere the trigger would
+    never fire (review)."""
+    try:
+        loc = s3.get_bucket_location(Bucket=spec.bucket).get("LocationConstraint") or "us-east-1"
+    except Exception as e:
+        raise ValueError(
+            f"can't read bucket {spec.bucket}'s region: {error_code(e) or e}"
+        ) from None
+    if loc == "EU":
+        loc = "eu-west-1"
+    if loc != spec.region:
+        raise ValueError(
+            f"bucket {spec.bucket} is in {loc}: a trigger needs a bucket in its deployment's "
+            f"region, {spec.region}"
+        )
+
+
+def create(
+    c: TriggerClients,
+    spec: TriggerSpec,
+    *,
+    package: bytes | None,
+    dry_run: bool,
+    allow_self_trigger: bool = False,
+) -> Report:
     """Create or update a trigger. Needs the deployment (its manifest) and the stored login
     (``aegc trigger login``) first. Safe to run again."""
+    if (loop := watched_outputs(spec)) and not allow_self_trigger:
+        raise ValueError(
+            f"the flow's input names {', '.join(loop)}, under the watched "
+            f"s3://{spec.bucket}/{spec.prefix}: if the flow writes there, each object it writes "
+            "starts it again. Write elsewhere, narrow --prefix/--suffix, or pass "
+            "--allow-self-trigger"
+        )
+    if c.s3 is not None:
+        check_bucket(c.s3, spec)
     from aegc import state
     from aegc.infra.deployment import read_manifest
 
@@ -791,6 +853,7 @@ def delete(c: TriggerClients, deployment: str, name: str, region: str, *, dry_ru
             c.ssm.delete_parameter(Name=param)
         report.add("ssm parameter", param, "would-delete" if dry_run else "deleted")
         _keep_bucket(report, spec.bucket)
+    if spec is not None or got is not None:  # review: also when only the rule was left
         rest = {n: r for n, r in rule_names(c.ssm, d).items() if n != name}
         update_lease(c, d, report, dry_run=dry_run, rules=rest)
     return report

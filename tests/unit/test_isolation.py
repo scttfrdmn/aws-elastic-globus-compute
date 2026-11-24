@@ -369,3 +369,26 @@ def test_result_keys_are_per_pool_with_the_old_layout_for_ec2(env: Env) -> None:
         assert f.result(timeout=15) == b"ok"
     finally:
         e.shutdown()
+
+
+@pytest.mark.timeout(60)
+def test_an_engine_on_a_0_7_manifest_keeps_the_old_layout(env: Env) -> None:
+    # Review: a 0.8 endpoint before `aegc deploy` from 0.8: 0.7 roles read only the old task
+    # keys and 0.7 workers write the old result keys, so the engine must keep using them.
+    from aegc.infra import deployment
+
+    m = deployment.read_manifest(env.ssm, "dev")
+    m.pop("worker_role_id")
+    deployment.update_manifest(env.ssm, "dev", m)
+    e = env.engine()
+    try:
+        assert e._key_pool("geo-py314") == "" and e._poster_ids() == {}
+        f = submit(e, triple, 4)
+        tid = str(f.gc_task_id)
+        (msg,) = queued(env)
+        assert msg.result_key == protocol.result_payload_key("dev", tid, 1)
+        assert protocol.result_payload_key("dev", tid, 1) in e._result_keys(
+            tid, 1, "geo-py314", None
+        )
+    finally:
+        e.shutdown()

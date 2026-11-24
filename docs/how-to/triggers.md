@@ -111,8 +111,21 @@ follow the state every 5 minutes. A frozen rule drops events: objects uploaded w
 don't start flows later.
 
 A trigger costs very little by itself: a 256 MB function for about a second per object, and
-EventBridge doesn't charge for AWS service events on the default event bus. The flows it starts run on your pools, under your
-deployment's limits.
+EventBridge doesn't charge for AWS service events on the default event bus. The flows it starts
+run on your pools, under your deployment's limits.
+
+!!! warning "Don't let a flow write where its trigger watches"
+    Each object created under the watched prefix starts the flow, including objects the flow
+    writes itself, which starts it again, for ever. `trigger create` refuses a flow input that
+    names an `s3://` URI under the watched bucket and prefix (`--allow-self-trigger` overrides
+    it), but it can't see where the flow writes otherwise. Write outputs to another prefix,
+    narrow `--prefix`/`--suffix` to the inputs, and keep a spend limit on the deployment: a
+    tripped cap freezes the triggers too.
+
+Only the trigger's function role can read its stored login. But anyone with the
+[lambda-deployer](../reference/iam.md#lambda-deployer) policy can change what that function
+runs, and so use the login: give that policy only to people you'd trust with your Globus login
+for the flow.
 
 ## Delete a trigger
 

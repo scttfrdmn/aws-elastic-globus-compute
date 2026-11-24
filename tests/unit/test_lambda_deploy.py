@@ -734,7 +734,7 @@ def test_lambda_preflight_checks_account_concurrency(
     monkeypatch.setattr(awsutil, "client", lambda sess, name: Lam())
     pools = [SimpleNamespace(max_concurrency=30), SimpleNamespace(max_concurrency=20)]
     assert cli._lambda_preflight(None, pools) == []
-    assert "50 concurrent executions; 40 of the account's are unreserved" in capsys.readouterr().err
+    assert "may run 50 at once; 40 of the account's 100" in capsys.readouterr().err
+    # Review: a pool's concurrency is a ceiling, not a reservation: never refused.
     pools.append(SimpleNamespace(max_concurrency=60))
-    (err,) = cli._lambda_preflight(None, pools)
-    assert "the account allows 100" in err
+    assert cli._lambda_preflight(None, pools) == []

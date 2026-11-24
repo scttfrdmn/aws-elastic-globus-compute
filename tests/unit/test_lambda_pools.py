@@ -612,6 +612,9 @@ def test_a_started_task_keeps_the_stall_breaker_off(env: Env) -> None:
         e._pool_progress[GEO_LAM] = t0 + 300
         e.scale_once(now=t0 + 601)
         assert not f2.done()  # the pool is running tasks: just busy
+        # Review: still busy long after, while a started task runs (up to 30 min, silent).
+        e.scale_once(now=t0 + 1700)
+        assert not f2.done()
     finally:
         e.shutdown()
 

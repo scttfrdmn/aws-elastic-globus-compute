@@ -369,7 +369,9 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
                 packed_task,
                 s3=self._clients["s3"],
                 bucket=self._manifest_value("bucket"),
-                key=protocol.task_payload_key(self.deployment, task_uuid, attempt, pool),
+                key=protocol.task_payload_key(
+                    self.deployment, task_uuid, attempt, self._key_pool(pool)
+                ),
                 inline_limit=self.inline_limit_bytes,
             )
             entry.task_payload = task
@@ -390,7 +392,9 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
                 resource_spec=dict(resource_specification or {}),
                 walltime_s=walltime,
                 engine_versions={"aegc": __version__},
-                result_key=protocol.result_payload_key(self.deployment, task_uuid, attempt, pool),
+                result_key=protocol.result_payload_key(
+                    self.deployment, task_uuid, attempt, self._key_pool(pool)
+                ),
             )
             self._clients["sqs"].send_message(
                 QueueUrl=self._pool(pool)["task_queue_url"], MessageBody=msg.encode()
@@ -672,6 +676,17 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
 
     # --- who may post results (#80) --------------------------------------------------------
 
+    def _key_pool(self, pool: str) -> str:
+        """The pool segment of a task's payload keys (#80): its name once ``aegc deploy`` from
+        0.8 has scoped its role to it, else empty (the layout before 0.8, which the role a 0.7
+        deploy left can read). A manifest from 0.7 has no role ids; a Lambda pool deployed by 0.7
+        has no ``function_role_id``."""
+        m = self._manifest or {}
+        entry = (m.get("pools") or {}).get(pool) or {}
+        if lambda_pools.is_lambda(entry):
+            return pool if entry.get("function_role_id") else ""
+        return pool if m.get("worker_role_id") else ""
+
     def _poster_ids(self) -> dict[str, str]:
         """Pool name -> the unique id (``AROA...``) of the role that posts its results: its
         function role for a Lambda pool, the worker role for an EC2 pool. Empty for manifests
@@ -702,9 +717,10 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
 
     def _result_keys(self, task_uuid: str, attempt: int, pool: str | None, sender: str | None
                      ) -> set[str]:  # fmt: skip
-        """Keys a result for this task may point at: its pool's (0.8 and later) and, for EC2
-        pools, the layout before 0.8, whose workers don't know the pool (one release). For a task
-        this process doesn't know, the pools whose role sent it."""
+        """Keys a result for this task may point at: the one the engine named (its pool's from
+        0.8, else the layout before 0.8) and, for EC2 pools, the layout before 0.8 too: 0.7
+        workers don't know the pool (one release). For a task this process doesn't know, the
+        pools whose role sent it."""
         ids = self._poster_ids()
         pools = (self._manifest or {}).get("pools", {})
         if pool is not None:
@@ -713,7 +729,10 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
             candidates = [n for n in pools if not ids or self._matches(ids.get(n, ""), sender)]
         keys: set[str] = set()
         for name in candidates:
-            keys.add(protocol.result_payload_key(self.deployment, task_uuid, attempt, name))
+            keys.add(
+                protocol.result_payload_key(self.deployment, task_uuid, attempt,
+                                            self._key_pool(name))
+            )  # fmt: skip
             if not lambda_pools.is_lambda(pools.get(name) or {}):
                 keys.add(protocol.result_payload_key(self.deployment, task_uuid, attempt))
         return keys
@@ -1265,9 +1284,15 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         if not self._state.running:
             return
         with self._lock:
-            waiting = [e.submitted for e in self._inflight.values()
-                       if e.pool == name and not e.started]  # fmt: skip
+            mine = [e for e in self._inflight.values() if e.pool == name]
+        waiting = [e.submitted for e in mine if not e.started]
         if not waiting:
+            return
+        if any(e.started for e in mine):
+            # Running tasks of up to 30 min send nothing until they finish: the pool is busy
+            # (at its concurrency), not stalled.
+            self._pool_progress[name] = now
+            m.stalled = False
             return
         since = max(min(waiting), self._pool_progress.get(name, 0.0))
         m.stalled = now - since >= self.lambda_stall_s / 2
@@ -1280,7 +1305,8 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         self.fail_owned(
             "AEGC_LAMBDA_STALLED",
             f"Lambda pool {name!r} ran none of these tasks for {self.lambda_stall_s / 60:.0f} "
-            f"min ({why}). Send them to an EC2 pool, or fix the cause and resubmit.",
+            f"min ({why}). Send them to an EC2 pool, or fix the cause and resubmit. (Tasks "
+            "Lambda already holds may still run later; their results are discarded.)",
             pool=name,
         )
         self._pool_progress[name] = now

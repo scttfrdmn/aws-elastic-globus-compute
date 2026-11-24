@@ -61,6 +61,8 @@ def test_omics_grant_policy(aws: Callable[[str], Any]) -> None:
         != "allowed"
     )
     assert decide(c, arn, "s3:GetObject", "arn:aws:s3:::lab-data/in/x") == "allowed"
+    # Review: no TagResource, or a task could tag any run with the deployment and then cancel it.
+    assert decide(c, arn, "omics:TagResource", run, **tagged) != "allowed"
 
 
 class Omics:

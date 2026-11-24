@@ -24,13 +24,24 @@ ENABLED_STATES = frozenset({"ENABLED", "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_E
 
 
 def rules(events: Any, deployment: str) -> dict[str, str]:
-    """Rule name -> ``State`` for the deployment's trigger rules (by name prefix)."""
+    """Rule name -> ``State`` for the deployment's trigger rules: by name prefix, then by tag
+    (review: deployment ``d-trigger``'s rules share ``d``'s prefix)."""
     out: dict[str, str] = {}
     kw: dict[str, Any] = {"NamePrefix": naming.trigger_prefix(deployment)}
     while True:
         r = events.list_rules(**kw)
         for rule in r.get("Rules", []):
-            out[str(rule["Name"])] = str(rule.get("State") or "")
+            name = str(rule["Name"])
+            try:
+                tags = naming.tag_dict(
+                    events.list_tags_for_resource(ResourceARN=rule["Arn"]).get("Tags")
+                )
+            except Exception as e:
+                if is_not_found(e):
+                    continue
+                raise
+            if naming.is_owned(name, tags, deployment):
+                out[name] = str(rule.get("State") or "")
         if not r.get("NextToken"):
             return out
         kw["NextToken"] = r["NextToken"]

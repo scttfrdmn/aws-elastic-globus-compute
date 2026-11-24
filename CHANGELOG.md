@@ -7,6 +7,24 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Per-pool payloads and checked senders** (#80): payloads live under
+  `payloads/<d>/<pool>/{tasks,results}/`, and a Lambda pool's function role reaches only its own
+  pool's. The engine accepts `started`, results and failures for a task only from the role that
+  serves the task's pool, by SQS's `SenderId`, which AWS sets (the manifest records each pool's
+  role id), so a Lambda pool's tasks can't read, finish or fail another pool's tasks. The task
+  message names the result key (`TaskMessage.result_key`). **Upgrade order:** endpoints and the
+  CLI first, then `aegc image build` for Lambda pools' envs (Lambda pools need 0.8 images), then
+  `aegc deploy`. Until that deploy, a 0.8 engine keeps the old layout; EC2 pools on 0.7 images keep
+  working for one release.
+- **Lambda stall breaker** (#81): a Lambda pool that runs none of an engine's queued tasks for
+  10 minutes, with none of them running, fails them with `AEGC_LAMBDA_STALLED` and the likely
+  reason (a disabled mapping, throttles, errors). Deploy warns when Lambda pools may run more at
+  once than the account's unreserved concurrency.
+- **AWS HealthOmics from a flow** (#84): `--grant omics=WORKFLOW_ID,role=ROLE_ARN` (or
+  `ready2run:ID`) lets tasks start runs of that workflow, tagged with the deployment, with that
+  service role, and read or cancel only runs so tagged. `aegc.omics.start_run` and
+  `aegc.omics.run_status` are the steps; [examples/omics-step/](examples/omics-step/) has a flow
+  that waits for the run (Wait, Status, Choice). Tasks now get `AEGC_DEPLOYMENT`.
 - **S3-event triggers** (#83): `aegc trigger login / create / list / delete` start a Globus flow
   for each object created under a bucket prefix (and suffix), as you: `trigger login` stores your
   Globus login (a globus-sdk `UserApp` with your own native app's `--client-id`, refresh tokens
