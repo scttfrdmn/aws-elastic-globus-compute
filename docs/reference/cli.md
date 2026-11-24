@@ -464,11 +464,14 @@ With both `--region` and `--account` given, it makes no AWS calls.
 ## aegc endpoint
 
 ```
-aegc endpoint {build,login,configure,start,stop,logs,test,id,deploy,undeploy,status}
+aegc endpoint {build,login,configure,start,stop,logs,test,id,deploy,undeploy,status,render}
               [--name NAME] [--deployment DEPLOYMENT] [--env ENV] [-n N]
               [--allow-function ID ...] [--project-dir PROJECT_DIR] [--python PYTHON]
               [--instance-type TYPE] [--alarm-email ADDRESS] [--image IMAGE]
               [--stop-local] [--session-manager] [--dry-run] [--yes]
+              [--multi-user] [--map IDENTITY=USER[:DEPLOYMENT[:PROFILE[:REGION]]] ...]
+              [--contact-email ADDRESS] [--owner-username NAME ...]
+              [--allow-unmapped-owner] [--as USER] [--options JSON]
 ```
 
 Run a Globus Compute endpoint with `AWSEngine` in Docker, or deploy it to EC2 (`deploy`,
@@ -486,7 +489,8 @@ Run a Globus Compute endpoint with `AWSEngine` in Docker, or deploy it to EC2 (`
 | `id` | Print the endpoint id |
 | `deploy` | Run the endpoint `--name` on an EC2 instance for `--deployment`, with the same endpoint id, as your Globus login; needs `--env`. Builds and pushes the endpoint image (`aegc/endpoint`, `linux/arm64`) unless `--image`, stores the login in the secret `aegc-<d>-endpoint`, and creates or updates the host's role, launch template, Auto Scaling group of one and offline alarm. Refuses while the local endpoint runs, unless `--stop-local` |
 | `undeploy` | Remove the deployment's cloud endpoint: its group, launch template, alarm and topic, the image's `inuse-` tag, role and instance profile, and secret (dry run unless `--yes`) |
-| `status` | The cloud endpoint's instance and its state, the endpoint's name and id, and the offline alarm's state |
+| `status` | The local endpoint, if it's running (and on a multi-user endpoint, each local user's processes), then the cloud endpoint's instance and its state, the endpoint's name and id, and the offline alarm's state |
+| `render` | Multi-user: render the running endpoint's template as local user `--as` gets it, with `user_endpoint_config` `--options`, by running `globus-compute-endpoint render-user-config` as that user in the container |
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -504,6 +508,13 @@ Run a Globus Compute endpoint with `AWSEngine` in Docker, or deploy it to EC2 (`
 | `--session-manager` | off | Allow Session Manager shells on the host; whoever may `ssm:StartSession` there gets root, and with it your stored Globus login (deploy) |
 | `--dry-run` | off | Report what would change; stop, build and write nothing (deploy) |
 | `--yes` | off | Actually remove the cloud endpoint (undeploy; default: dry run) |
+| `--multi-user` | off | A [multi-user endpoint](../how-to/multi-user.md) (configure, login). Other commands find the mode from the endpoint's stored configuration |
+| `--map RULE` | | configure `--multi-user`: `IDENTITY=USER[:DEPLOYMENT[:PROFILE[:REGION]]]`. `IDENTITY` is an identity id, a username, or a pattern in Globus' match language; empty fields mean `--deployment`, `--profile` and `--region`. Repeatable; first match wins. See [the mapping syntax](../how-to/multi-user.md#the-mapping-syntax) |
+| `--contact-email` | | configure `--multi-user`: the administrator's email, which Globus requires |
+| `--owner-username NAME` | | configure `--multi-user`: your username, to check that a username rule admits you (your identity id comes from your login) |
+| `--allow-unmapped-owner` | off | configure `--multi-user`: allow rules that don't admit you |
+| `--as USER` | | render: the local user |
+| `--options JSON` | `{}` | render: `user_endpoint_config` |
 
 The container mounts `~/.aws` read-only and gets `AWS_PROFILE` (from `--profile` or the
 environment), `AWS_REGION` and `AWS_DEFAULT_REGION`.
@@ -512,6 +523,27 @@ environment), `AWS_REGION` and `AWS_DEFAULT_REGION`.
 and prints `allowed functions: <ids>; restart the endpoint (stop, start) for Globus to enforce it`.
 A value that isn't a UUID fails with
 `aegc: --allow-function takes function ids (UUIDs), or none to allow any`.
+
+A multi-user endpoint runs the same image as root, with `--security-opt no-new-privileges`,
+`--cap-drop ALL` and six capabilities (`SETUID`, `SETGID`, `KILL`, `CHOWN`, `DAC_OVERRIDE`,
+`FOWNER`), from the volumes `aegc-endpoint-mu` (root's `~/.globus_compute`) and
+`aegc-endpoint-mu-home` (`/home`), with `~/.aws` read-only at `/etc/aegc/aws`. `configure
+--multi-user` refuses with:
+
+- `--multi-user needs --contact-email ADDRESS ...` or `--multi-user needs at least one --map ...`;
+- `--map '...': ...` for a malformed rule, a system account, a bad deployment, profile or region,
+  a pattern Globus' mapper would refuse, or one that matches every identity;
+- `local user <u> is mapped with two different deployments or profiles; a local user is one trust
+  domain ...`;
+- `no Globus login found ...; run `aegc endpoint login` first`;
+- `no --map rule admits the endpoint's owner (<id>). Map your own identity too ...`;
+- `<name> is a single-user endpoint (in volume aegc-endpoint-home); use another --name ...` (from
+  the container), and a plain `configure` of a multi-user name with `endpoint <name> is
+  multi-user; configure it with --multi-user and its --map rules, or use another --name`.
+
+`deploy` of a multi-user endpoint refuses rules that name another deployment, another region or
+an AWS profile: `the cloud endpoint's mapped users all use deployment <d> in <region> with the
+host's role ...`.
 
 `deploy` needs the deployer and [endpoint-deployer](iam.md#endpoint-deployer) policies, and the
 builder policy to push the image; `undeploy` and `status` need the first two. Its errors:

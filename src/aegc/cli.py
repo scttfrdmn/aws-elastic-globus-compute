@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import subprocess
 import sys
@@ -167,6 +168,37 @@ def _endpoint(args: argparse.Namespace) -> int:
         allowed_functions=allowed,
     )
     cmd = args.endpoint_command
+    given = {
+        "--map": args.map,
+        "--contact-email": args.contact_email,
+        "--owner-username": args.owner_username,
+        "--allow-unmapped-owner": args.allow_unmapped_owner,
+    }
+    mu_only = [f for f, v in given.items() if v]
+    if mu_only and not (cmd == "configure" and args.multi_user):
+        raise SystemExit(f"aegc: {', '.join(mu_only)} go with configure --multi-user")
+    if args.multi_user and cmd not in ("configure", "login"):
+        raise SystemExit(
+            "aegc: --multi-user goes with configure and login; other commands find the mode "
+            "from the endpoint's configuration"
+        )
+    if cmd == "configure" and args.multi_user:
+        spec = _multi_user_spec(args, spec)
+    elif cmd == "login" and args.multi_user:
+        from aegc.multiuser import MultiUser
+
+        spec = dataclasses.replace(spec, multi_user=MultiUser(contact_email="", maps=()))
+    elif cmd not in ("build", "login", "stop", "logs", "undeploy"):
+        found = ep.detect_multi_user(spec)
+        if found is not None:
+            if cmd == "configure":
+                raise SystemExit(
+                    f"aegc: endpoint {spec.name} is multi-user; configure it with --multi-user "
+                    "and its --map rules, or use another --name"
+                )
+            spec = dataclasses.replace(spec, multi_user=found)
+    if cmd == "status" and ep.is_running(spec):
+        print(ep.local_status(spec))
     if cmd in ("deploy", "undeploy", "status"):
         return _endpoint_cloud(args, spec)
     if cmd == "build":
@@ -181,6 +213,16 @@ def _endpoint(args: argparse.Namespace) -> int:
         print(
             f"configured {spec.name}: deployment {spec.deployment}, region {region}, env {args.env}"
         )
+        if spec.multi_user:
+            users = spec.users()
+            print(f"multi-user: {len(spec.multi_user.maps)} rule(s), {len(users)} local user(s)")
+            for u, row in sorted(users.items()):
+                rules = [m.match for m in spec.multi_user.maps if m.local_user == u]
+                prof = f", profile {row['aws_profile']}" if row["aws_profile"] else ""
+                print(f"  {u}: deployment {row['deployment']} ({row['region']}{prof}) <- "
+                      + ", ".join(rules))  # fmt: skip
+            print("restart the endpoint (stop, start) to add new local users; mapping changes "
+                  "alone apply within seconds")  # fmt: skip
         if allowed is not None:
             print(
                 f"allowed functions: {', '.join(allowed) if allowed else 'any'}; restart the "
@@ -197,7 +239,41 @@ def _endpoint(args: argparse.Namespace) -> int:
         ep.smoke(spec, args.n, args.env)
     elif cmd == "id":
         print(ep.endpoint_id(spec))
+    elif cmd == "render":
+        if not spec.multi_user:
+            raise SystemExit(f"aegc: endpoint {spec.name} isn't multi-user (render --as checks a "
+                             "multi-user endpoint's template per local user)")  # fmt: skip
+        if not args.as_user:
+            raise SystemExit("aegc: render needs --as LOCAL_USER")
+        if not ep.is_running(spec):
+            raise SystemExit(f"aegc: start the endpoint first ({spec.container} isn't running)")
+        return ep.render_as(spec, args.as_user, args.options or "{}").returncode
     return 0
+
+
+def _multi_user_spec(args: argparse.Namespace, spec: Any) -> Any:
+    """``configure --multi-user``: the --map rules, checked; the owner must be mapped (#62)."""
+    from aegc import endpoint as ep
+    from aegc import multiuser
+
+    try:
+        mu = multiuser.build(
+            args.map or [], contact_email=args.contact_email or "",
+            allow_unmapped_owner=args.allow_unmapped_owner,
+        )  # fmt: skip
+        spec = dataclasses.replace(spec, multi_user=mu)
+        spec.users()
+        ids = ep.owner_identities(spec)
+        if not ids and not args.allow_unmapped_owner:
+            raise multiuser.MappingError(
+                "no Globus login found (in either endpoint volume); run `aegc endpoint login` "
+                "first, so the endpoint's owner is known"
+            )
+        multiuser.check_owner(mu, identity_ids=ids, usernames=tuple(args.owner_username or ()))
+    except ValueError as e:  # MappingError, NameError_
+        raise SystemExit(f"aegc: {e}") from None
+    mu = dataclasses.replace(mu, owner_identity_id=ids[0] if ids else "")
+    return dataclasses.replace(spec, multi_user=mu)
 
 
 def _endpoint_cloud(args: argparse.Namespace, spec: Any) -> int:
@@ -275,15 +351,27 @@ def _endpoint_cloud_cmd(
             ecr=awsutil.client(sess, "ecr"),
             python=args.python,
         )
+    cloud_mu = None
+    if spec.multi_user:  # every mapped user shares the host's role: one deployment (#62)
+        from aegc.infra import userdata
+        from aegc.multiuser import MappingError
+
+        try:
+            cloud_mu = spec.multi_user.for_cloud(
+                deployment=d, region=region, identity_mapping_file=userdata.MU_IDENTITY_MAPPING
+            )
+        except MappingError as e:
+            raise SystemExit(f"aegc: {e}") from None
     cloud = ep.EndpointSpec(
         name=spec.name, deployment=d, region=region, default_env=spec.default_env,
-        allowed_functions=allowed,
+        allowed_functions=allowed, multi_user=cloud_mu,
     )  # fmt: skip
     host = endpoint_host.EndpointHostSpec(
         deployment=d, account=account, region=region, name=spec.name,
         endpoint_id=login.endpoint_id, image=image, configure_script=ep.configure_script(cloud),
         instance_type=args.instance_type, alarm_email=args.alarm_email or "",
         metric_token=token, session_manager=args.session_manager,
+        multi_user=cloud_mu is not None,
     )  # fmt: skip
     report = Report()
     role_arn = f"arn:aws:iam::{account}:role{naming.IAM_PATH}{naming.endpoint_role(d, region)}"
@@ -1537,8 +1625,9 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument(
         "endpoint_command",
         choices=["build", "login", "configure", "start", "stop", "logs", "test", "id", "deploy",
-                 "undeploy", "status"],
-        help="deploy/undeploy/status: the cloud-hosted endpoint (EC2), running as your login",
+                 "undeploy", "status", "render"],
+        help="deploy/undeploy/status: the cloud-hosted endpoint (EC2), running as your login. "
+        "render: a multi-user endpoint's template as one local user gets it",
     )  # fmt: skip
     e.add_argument("--name", default="aegc", help="Globus Compute endpoint name")
     e.add_argument("--deployment", default="default", help="aegc deployment the engine uses")
@@ -1567,6 +1656,32 @@ def build_parser() -> argparse.ArgumentParser:
     )  # fmt: skip
     e.add_argument("--dry-run", action="store_true", help="deploy: show what would change")
     e.add_argument("--yes", action="store_true", help="undeploy: actually remove it")
+    mu = e.add_argument_group("multi-user endpoints (#62)")
+    mu.add_argument(
+        "--multi-user", action="store_true",
+        help="configure, login: a root core endpoint that admits the --map identities, each as "
+        "its local user (other commands find the mode themselves)",
+    )  # fmt: skip
+    mu.add_argument(
+        "--map", action="append", metavar="IDENTITY=USER[:DEPLOYMENT[:PROFILE[:REGION]]]",
+        help="configure --multi-user: Globus identities matching IDENTITY (an identity id, a "
+        "username, or a pattern like '.*@lab.uni.edu') run as local USER, on DEPLOYMENT with AWS "
+        "PROFILE (defaults: --deployment, --profile, --region). Repeatable; first match wins",
+    )  # fmt: skip
+    mu.add_argument("--contact-email", help="configure --multi-user: the administrator's email "
+                    "(Globus requires one)")  # fmt: skip
+    mu.add_argument(
+        "--owner-username", action="append", metavar="NAME",
+        help="configure --multi-user: your Globus username, to check a username --map rule "
+        "admits you (your identity id comes from your login)",
+    )  # fmt: skip
+    mu.add_argument(
+        "--allow-unmapped-owner", action="store_true",
+        help="configure --multi-user: allow a mapping that doesn't admit you",
+    )  # fmt: skip
+    mu.add_argument("--as", dest="as_user", metavar="USER", help="render: the local user")
+    mu.add_argument("--options", metavar="JSON",
+                    help="render: user_endpoint_config, as JSON (default {})")  # fmt: skip
     e.set_defaults(func=_endpoint)
 
     ev = sub.add_parser(

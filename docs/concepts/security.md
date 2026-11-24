@@ -90,9 +90,10 @@ Separate tasks per uid, per-task session policies and a separate task container 
 implemented yet ([#32](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/32)).
 
 **Treat a deployment as one trust domain.** Anyone who can submit to an endpoint can run code with
-that deployment's task role, and with its grants. Use separate deployments, and separate
-endpoints, for groups that shouldn't see each other's work. Globus Compute's own controls decide
-who may submit to an endpoint, and
+that deployment's task role, and with its grants. Use separate deployments for groups that
+shouldn't see each other's work: separate endpoints, or one
+[multi-user endpoint](#multi-user-endpoints) that maps each group to its own deployment. Globus
+Compute's own controls decide who may submit to an endpoint, and
 [`aegc endpoint configure --allow-function`](../how-to/flows.md#allow-only-your-functions) limits
 which registered functions it runs.
 
@@ -214,7 +215,8 @@ removes only inline policies). Use grants instead.
 - **Queues:** SQS-managed server-side encryption. Messages are kept for 14 days.
 - **Worker volumes:** encrypted gp3, deleted with the instance.
 - **Endpoint state:** the Globus login and endpoint configuration live in the Docker volume
-  `aegc-endpoint-home` on your machine. A cloud endpoint's copy is in Secrets Manager (encrypted
+  `aegc-endpoint-home` on your machine (a multi-user endpoint's in `aegc-endpoint-mu`, readable
+  only by root in the container). A cloud endpoint's copy is in Secrets Manager (encrypted
   with the account's default key for Secrets Manager) and on the host's encrypted volume.
 - `AWSEngine` refuses to run on a high-assurance endpoint: task data leaves Globus's control.
 
@@ -253,6 +255,37 @@ reported as `kept`. Region-wide resources carry `aegc:deployment=_bootstrap`.
 `--yes`. `bootstrap` and `deploy` accept `--dry-run`. `destroy` checks afterwards that nothing it
 owns remains, and `aegc footprint` lists what exists, including look-alikes aegc won't touch. See [Resources and tags](../reference/resources.md).
 
+## Multi-user endpoints
+
+A single-user endpoint accepts tasks only from its owner's identities. A
+[multi-user endpoint](../how-to/multi-user.md) (`aegc endpoint configure --multi-user`) admits the
+identities you `--map`, each as a local user:
+
+- **A root core endpoint, with little else.** The container runs with `--user 0`,
+  `no-new-privileges` and all capabilities dropped except `SETUID`, `SETGID`, `KILL`, `CHOWN`,
+  `DAC_OVERRIDE` and `FOWNER`. No `--privileged`, and Docker's seccomp profile stays on. It holds
+  your Globus login and the identity mapping, mode 600, as root.
+- **Globus Compute does the mapping.** An `expression_identity_mapping#1.0.0` document, in
+  `--map` order, maps the submitter's identity set (linked identities included) to a local user.
+  An unmapped identity is refused before any process starts. aegc refuses a mapping that doesn't
+  admit the owner, mapping to `root` or a system account, and patterns that match every identity.
+- **Each user endpoint process runs as its local user.** Without PAM, Compute forks, changes to
+  the user's uid and gid, drops every capability and sets `PR_SET_NO_NEW_PRIVS` before it runs
+  the process. That process (Globus Compute and AWSEngine, never task code) can't regain root,
+  read the login, or read another user's home. The Docker spike checked each of these.
+- **Each local user is one trust domain.** The template takes the user's deployment, region and
+  AWS profile from its own row. The schema doesn't accept those keys in `user_endpoint_config`,
+  and a user without a row gets no process.
+- **Not separated:** the container or host, the root core endpoint, and AWS credentials. On your
+  machine every local user gets a copy of all of `~/.aws`, and the template picks the profile. On
+  the cloud host every user shares the host's role, so `deploy` refuses rules for other
+  deployments or profiles. Per-lab accounts are
+  [#63](https://github.com/scttfrdmn/aws-elastic-globus-compute/issues/63).
+- **Who may reach it.** Authentication policies (domains, recent login, high assurance) are
+  Globus' controls. aegc doesn't create them; see the
+  [how-to](../how-to/multi-user.md#allowed-functions-and-authentication-policies).
+  `allowed_functions` applies to every submitter.
+
 ## The cloud endpoint
 
 [`aegc endpoint deploy`](../how-to/cloud-endpoint.md) runs your endpoint on an EC2 instance in
@@ -278,6 +311,9 @@ boot. That makes the login the thing to protect.
   `globus-compute-endpoint logout` (run in the `aegc-endpoint` image with your volume; see
   [Security](../how-to/cloud-endpoint.md#security)) revokes them with Globus, which also stops the
   cloud endpoint until you log in and deploy again.
+- **A multi-user endpoint's identity mapping** goes in the same secret, not in the launch
+  template's user data, and the host writes it to a root-only file. Its container runs as root
+  with the capabilities listed in [Multi-user endpoints](#multi-user-endpoints).
 - **One endpoint id, one place.** `deploy` refuses while the local endpoint runs (unless
   `--stop-local`) and refuses an id that's another deployment's cloud endpoint, and the host's
   group never runs two instances at once.

@@ -11,7 +11,8 @@ COPY dist/ /tmp/aegc-dist/
 RUN pip install --no-cache-dir "globus-compute-endpoint==${GCE_VERSION}" /tmp/aegc-dist/*.whl \
  && rm -rf /tmp/aegc-dist \
  && python -c "import globus_compute_endpoint.engines as e; print('registered:', e.AWSEngine.__name__)"
-# A root endpoint is a multi-user endpoint; this is a single-user one.
+# Single-user by default (uid 1000). A multi-user endpoint (#62) runs this image as root with a
+# few capabilities (`aegc endpoint start` passes --user 0); its entrypoint adds the mapped users.
 RUN useradd --create-home --uid 1000 gc && install -d -o gc -g gc /home/gc/.globus_compute
 USER gc
 WORKDIR /home/gc

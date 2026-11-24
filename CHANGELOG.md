@@ -23,6 +23,34 @@ All notable changes to this project are documented here. The format follows
   Pool names `trigger` and `trigger-*` are reserved. The lambda-deployer policy covers triggers;
   the operator and endpoint policies may enable and disable the deployment's tagged trigger
   rules. See [Start a flow when a file lands in S3](docs/how-to/triggers.md).
+- **Multi-user endpoints** (#62): `aegc endpoint configure --multi-user --contact-email ADDRESS
+  --map IDENTITY=USER[:DEPLOYMENT[:PROFILE[:REGION]]] ...` makes a root Globus Compute Core
+  Endpoint that admits the mapped identities, each as its own local user, with its own deployment,
+  region and AWS profile chosen by the template from `_GC.mapped_identity.local.uname` (one trust
+  domain per local user). `IDENTITY` is an identity id, a username (including a client's
+  `<id>@clients.auth.globus.org`, for flows with `"RunAs": "Flow"` and services), or a pattern in
+  Globus' match language. aegc writes an `expression_identity_mapping#1.0.0` document, the
+  template's per-user table, `email`, `identity_mapping_config_path`, `amqp_port: 5671` and
+  `public: false`, and keeps `allowed_functions`. It refuses a mapping that doesn't admit the
+  owner (read from the login; `--owner-username`, `--allow-unmapped-owner`), system accounts,
+  patterns that match everyone, and two rows for one local user. `start` runs the image as root
+  with `--security-opt no-new-privileges --cap-drop ALL` and `SETUID`, `SETGID`, `KILL`, `CHOWN`,
+  `DAC_OVERRIDE`, `FOWNER`, from the volumes `aegc-endpoint-mu` and `aegc-endpoint-mu-home`. The
+  entrypoint creates the local users and copies `~/.aws` into each home (again after it changes).
+  `status` shows each local user's processes, `logs` tags UEP lines `[uep <user>]`, and the new
+  `aegc endpoint render --as USER [--options JSON]` renders the template as that user. The
+  cloud endpoint supports it: the identity mapping travels in the login secret, the host runs the
+  root container, and every mapped user shares the host's role and deployment (rules naming
+  another deployment, region or profile are refused; per-lab accounts are #63). A name is
+  single-user or multi-user, never both. Needs an endpoint image from 0.8. See
+  [Share an endpoint](docs/how-to/multi-user.md).
+  Checked in Docker (OrbStack, arm64) without Globus: `configure --multi-user` succeeds and
+  `start` stops only at the Globus login; Globus' own mapper maps owner, colleague (by a linked
+  identity), client and pattern rules and refuses others; each user's forked process (Compute's
+  no-PAM path) has no capabilities, `NoNewPrivs: 1`, can't regain root, can't read the login or
+  another user's home, and renders its own deployment and profile with `render-user-config`; an
+  unmapped local user's template doesn't render. Live checks with real Globus logins remain (see
+  the how-to's [Verify it live](docs/how-to/multi-user.md#verify-it-live)).
 
 ## [0.7.0] - 2026-11-24
 

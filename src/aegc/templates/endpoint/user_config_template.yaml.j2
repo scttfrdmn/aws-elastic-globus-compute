@@ -1,6 +1,9 @@
 {#-
   Globus Compute user endpoint template: AWSEngine (aws-elastic-globus-compute).
   Rendered by `aegc endpoint configure`, which fills in the deployment, region and default env.
+  On a multi-user endpoint (#62) the deployment, region and AWS profile come from the mapped local
+  user's row in aegc_users instead (`_GC.mapped_identity.local.uname`; a plain string, unlike the
+  JSON-quoted user_endpoint_config values).
 
   One user endpoint process runs per submitter runtime and per user_endpoint_config (spike #4).
   The submitter's Python minor version selects the worker image; `env` (from
@@ -9,6 +12,7 @@
   resource_specification: the web service keeps only its MPI fields there.
   Template values from _GC.user_runtime and user_endpoint_config arrive already JSON-quoted.
 -#}
+@@MULTI_USER@@
 {%- set py = _GC.user_runtime.python.version_tuple if _GC.user_runtime is defined and _GC.user_runtime.python is defined else [] %}
 
 {#- Keep user endpoint processes running. The interchange's idle check counts results replayed
@@ -25,6 +29,7 @@ engine:
   type: AWSEngine
   deployment: @@DEPLOYMENT@@
   region: @@REGION@@
+@@AWS_PROFILE@@
   env: {{ env | default('"@@DEFAULT_ENV@@"') }}
 {#- The SDK sends the submitter's Python; Globus Flows doesn't, so `python` can say it. #}
 {%- if py %}
