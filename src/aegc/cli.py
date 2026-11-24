@@ -765,6 +765,8 @@ def _deploy(args: argparse.Namespace) -> int:
         )
     # vCPU quotas are for EC2 pools; Lambda pools are bounded by their mappings' concurrency.
     errors = _quota_preflight(sess, [asdict(p) for p in pools if not p.is_lambda])
+    if lam_pools := [p for p in pools if p.is_lambda]:
+        errors += _lambda_preflight(sess, lam_pools)
     if errors and not args.dry_run:
         raise SystemExit("aegc: " + "\naegc: ".join(errors))
     if not limits.any:
@@ -961,6 +963,34 @@ def _cost(args: argparse.Namespace) -> int:
         )
     print(report.render())
     return 0
+
+
+def _lambda_preflight(sess: object, pools: list[Any]) -> list[str]:
+    """#81: Lambda pools' concurrency against the account's. Lambda throttles past it, and a
+    throttled pool runs nothing; returns errors for what can never run."""
+    from aegc import awsutil, lambda_pools
+
+    try:
+        limit = awsutil.client(sess, "lambda").get_account_settings()["AccountLimit"]  # type: ignore[arg-type]
+    except Exception as e:
+        print(f"warning: couldn't read the account's Lambda concurrency: {e}", file=sys.stderr)
+        return []
+    total = int(limit.get("ConcurrentExecutions") or 0)
+    unreserved = int(limit.get("UnreservedConcurrentExecutions") or total)
+    want = sum(lambda_pools.concurrency({"max_concurrency": p.max_concurrency}) for p in pools)
+    if total and want > total:
+        return [
+            f"Lambda pools ask for {want} concurrent executions; the account allows {total} in "
+            "this region. Lower concurrency=, or request more (Service Quotas, L-B99A9384)"
+        ]
+    if unreserved and want > unreserved:
+        print(
+            f"warning: Lambda pools ask for {want} concurrent executions; {unreserved} of the "
+            "account's are unreserved, and other functions share them. Tasks beyond that are "
+            "throttled, and after 10 min fail with AEGC_LAMBDA_STALLED",
+            file=sys.stderr,
+        )
+    return []
 
 
 def _quota_preflight(sess: object, pools: list[dict[str, Any]]) -> list[str]:

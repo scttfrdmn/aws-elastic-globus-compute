@@ -570,3 +570,73 @@ def test_reconcile_undoes_an_enable_that_raced_a_stop_and_reports_unread_mapping
     assert lam.updates == [("u-a", True), ("u-a", False)]
     assert changes["a"] == "disabled" and states["a"] == "Disabling"
     assert changes["b"].startswith("unknown")  # a mapping it couldn't read is reported
+
+
+# --- #81: the stall breaker ---------------------------------------------------------------------
+
+
+@pytest.mark.timeout(60)
+def test_a_lambda_pool_that_runs_nothing_fails_its_tasks_clearly(env: Env) -> None:
+    add_lambda_pool(env.aws, GEO_LAM)
+    e = env.engine(lambda_stall_s=600)
+    try:
+        f = submit(e, triple, 1, spec={"pool": GEO_LAM})
+        t0 = time.time()
+        assert e.scale_once(now=t0 + 299).pools[GEO_LAM].stalled is False
+        assert e.scale_once(now=t0 + 301).pools[GEO_LAM].stalled is True  # shown at half time
+        assert not f.done()
+        e.scale_once(now=t0 + 601)
+        assert code_of(f) == "AEGC_LAMBDA_STALLED"
+    finally:
+        e.shutdown()
+
+
+@pytest.mark.timeout(60)
+def test_a_started_task_keeps_the_stall_breaker_off(env: Env) -> None:
+    from aegc.protocol import ResultMessage
+    from tests.unit.test_engine import EID, _post
+
+    add_lambda_pool(env.aws, GEO_LAM)
+    e = env.engine(lambda_stall_s=600)
+    try:
+        f1 = submit(e, triple, 1, spec={"pool": GEO_LAM})
+        f2 = submit(e, triple, 2, spec={"pool": GEO_LAM})
+        t0 = time.time()
+        msg = next(m for m in queued_lambda(env) if m.task_uuid == str(f1.gc_task_id))
+        _post(env, e, ResultMessage(kind="started", task_uuid=msg.task_uuid, attempt=1,
+                                    endpoint_id=str(EID), worker={"pool": GEO_LAM}))  # fmt: skip
+        deadline = time.time() + 10
+        while GEO_LAM not in e._pool_progress and time.time() < deadline:
+            time.sleep(0.1)
+        # Progress 0 s in; 601 s after the tasks were submitted but well within 600 s of it.
+        e._pool_progress[GEO_LAM] = t0 + 300
+        e.scale_once(now=t0 + 601)
+        assert not f2.done()  # the pool is running tasks: just busy
+    finally:
+        e.shutdown()
+
+
+def queued_lambda(env: Env) -> list[Any]:
+    from aegc import protocol as p
+
+    sqs = env.sqs
+    url = sqs.get_queue_url(QueueName=f"aegc-dev-{GEO_LAM}-tasks")["QueueUrl"]
+    r = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10, WaitTimeSeconds=0,
+                            VisibilityTimeout=0)  # fmt: skip
+    return [p.TaskMessage.decode(m["Body"]) for m in r.get("Messages", [])]
+
+
+def test_diagnose_names_throttling_and_a_disabled_mapping() -> None:
+    class Lam:
+        def get_event_source_mapping(self, UUID: str) -> dict[str, Any]:
+            return {"State": "Disabled", "LastProcessingResult": "PROBLEM: Function call failed"}
+
+    class Cw:
+        def get_metric_data(self, **kw: Any) -> dict[str, Any]:
+            vals = {"throttles": [3, 4], "errors": [], "invocations": []}
+            return {"MetricDataResults": [{"Id": q["Id"], "Values": vals[q["Id"]]}
+                                          for q in kw["MetricDataQueries"]]}  # fmt: skip
+
+    why = lambda_pools.diagnose(Lam(), Cw(), {"event_source_mapping": "u",
+                                              "function_name": "f"}, NOON)  # fmt: skip
+    assert "mapping is Disabled" in why and "PROBLEM" in why and "7 throttled" in why

@@ -140,6 +140,7 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         label: str = "AWSEngine",
         max_retries_on_system_failure: int = 1,
         stall_fail_s: float = 3600.0,
+        lambda_stall_s: float = lambda_pools.STALL_FAIL_S,
         pool: str = "",
         size: str = "",
         cpus: float = 0,
@@ -158,6 +159,7 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         self.inline_limit_bytes = inline_limit_bytes
         self.label = label
         self.stall_fail_s = stall_fail_s
+        self.lambda_stall_s = lambda_stall_s
         # Task defaults from user_endpoint_config: the web service drops these keys from a
         # task's resource_specification (it keeps only num_nodes and the MPI fields).
         self.pool = pool
@@ -184,6 +186,9 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         self._result_queue_url = ""
         self._result_queue_touched = 0.0
         self._stalled_since: dict[str, float] = {}
+        #: Pool -> when a worker last said anything (started, result, failure) for one of this
+        #: process's tasks there: a Lambda pool's stall breaker counts from it (#81).
+        self._pool_progress: dict[str, float] = {}
         self._paused_until: dict[str, float] = {}
         self._starved_since: dict[str, float] = {}
         self._blocked_since: dict[str, float] = {}
@@ -601,6 +606,8 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
             )  # fmt: skip
             self._forged += 1
             return
+        if pool is not None:
+            self._pool_progress[pool] = time.time()
         if msg.kind == "started":
             with self._lock:
                 started = self._inflight.get(etid)
@@ -1002,6 +1009,7 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         for name, pool in pools.items():
             m = snap.pools[name]
             if m.kind == lambda_pools.KIND:
+                self._lambda_stall(name, pool, m, now)
                 continue
             demand = max(outstanding.get(name, 0), m.visible + m.inflight)
             target = min(max(_capacity_for(pool, demand), m.min), m.max)
@@ -1225,6 +1233,34 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
             ),
             pool=name,
         )
+
+    def _lambda_stall(self, name: str, pool: dict[str, Any], m: _PoolMetrics, now: float) -> None:
+        """#81: a Lambda pool that ran none of this process's queued tasks (nothing started or
+        finished) for ``lambda_stall_s`` fails them, saying why if it can tell. Lambda scales by
+        itself, so there's nothing to pause; throttling, a failing image or a disabled mapping
+        would otherwise leave them queued until they're delivered too often."""
+        if not self._state.running:
+            return
+        with self._lock:
+            waiting = [e.submitted for e in self._inflight.values()
+                       if e.pool == name and not e.started]  # fmt: skip
+        if not waiting:
+            return
+        since = max(min(waiting), self._pool_progress.get(name, 0.0))
+        m.stalled = now - since >= self.lambda_stall_s / 2
+        if now - since < self.lambda_stall_s:
+            return
+        why = lambda_pools.diagnose(
+            self._clients.get("lambda"), self._clients.get("cloudwatch"), pool, now
+        )
+        m.last_scaling_error = why
+        self.fail_owned(
+            "AEGC_LAMBDA_STALLED",
+            f"Lambda pool {name!r} ran none of these tasks for {self.lambda_stall_s / 60:.0f} "
+            f"min ({why}). Send them to an EC2 pool, or fix the cause and resubmit.",
+            pool=name,
+        )
+        self._pool_progress[name] = now
 
     def _last_failure(self, group: dict[str, Any]) -> str:
         try:

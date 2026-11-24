@@ -274,3 +274,58 @@ def accrue_metrics(
         kind = f"lambda-{memory_mib(entry)}MB"
         by_type[kind] = by_type.get(kind, 0.0) + cost
     return pricing.Accrued(usd, 0.0, by_pool, by_type, frozenset({"static"} if usd else set()))
+
+
+# --- stalls (#81) -------------------------------------------------------------------------------
+
+#: A Lambda pool that runs none of this process's queued tasks for this long fails them.
+STALL_FAIL_S = 600.0
+
+
+def diagnose(lam: Any, cloudwatch: Any, entry: dict[str, Any], now: float) -> str:
+    """Why a Lambda pool might not be running its tasks: the mapping's last processing result
+    and the function's throttles and errors over the last 15 minutes. Best effort."""
+    from datetime import UTC, datetime
+
+    why: list[str] = []
+    if lam is not None and entry.get("event_source_mapping"):
+        try:
+            r = lam.get_event_source_mapping(UUID=str(entry["event_source_mapping"]))
+            state, last = str(r.get("State") or ""), str(r.get("LastProcessingResult") or "")
+            if state and state not in ENABLED_STATES:
+                why.append(f"its event source mapping is {state}")
+            if last and last.upper() not in ("OK", "NO RECORDS PROCESSED"):
+                why.append(f"the mapping's last processing result: {last}")
+        except Exception as e:
+            why.append(f"couldn't read its mapping ({error_code(e) or e})")
+    if cloudwatch is not None and entry.get("function_name"):
+        dims = [{"Name": "FunctionName", "Value": str(entry["function_name"])}]
+        queries = [
+            {"Id": m.lower(), "ReturnData": True,
+             "MetricStat": {"Metric": {"Namespace": "AWS/Lambda", "MetricName": m,
+                                       "Dimensions": dims},
+                            "Period": 60, "Stat": "Sum"}}
+            for m in ("Throttles", "Errors", "Invocations")
+        ]  # fmt: skip
+        try:
+            r = cloudwatch.get_metric_data(
+                MetricDataQueries=queries,
+                StartTime=datetime.fromtimestamp(now - 900, UTC),
+                EndTime=datetime.fromtimestamp(now, UTC),
+            )
+            sums = {x["Id"]: sum(x.get("Values", [])) for x in r.get("MetricDataResults", [])}
+            if sums.get("throttles"):
+                why.append(
+                    f"{sums['throttles']:.0f} throttled invocations in 15 min (the account's "
+                    "Lambda concurrency is used up: aws lambda get-account-settings)"
+                )
+            if sums.get("errors"):
+                why.append(
+                    f"{sums['errors']:.0f} failed invocations in 15 min (the image may not start:"
+                    " see the function's log stream in /aegc/<deployment>)"
+                )
+            if not sums.get("invocations") and not why:
+                why.append("no invocations in 15 min")
+        except Exception as e:
+            why.append(f"couldn't read its metrics ({error_code(e) or e})")
+    return "; ".join(why) or "no reason found"

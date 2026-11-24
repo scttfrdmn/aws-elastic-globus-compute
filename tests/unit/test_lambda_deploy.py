@@ -715,3 +715,26 @@ def test_function_policy_fits_next_to_the_grants() -> None:
     for kind in ("deployer", "lambda-deployer", "operator", "endpoint"):
         doc = iam.policy(kind, deployment=d, region=region, account=ACCOUNT)
         assert iam.policy_size(doc) < 6_144, kind
+
+
+def test_lambda_preflight_checks_account_concurrency(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # #81: a throttled pool runs nothing; say so at deploy.
+    from types import SimpleNamespace
+
+    from aegc import awsutil, cli
+
+    limit = {"ConcurrentExecutions": 100, "UnreservedConcurrentExecutions": 40}
+
+    class Lam:
+        def get_account_settings(self) -> dict[str, Any]:
+            return {"AccountLimit": limit}
+
+    monkeypatch.setattr(awsutil, "client", lambda sess, name: Lam())
+    pools = [SimpleNamespace(max_concurrency=30), SimpleNamespace(max_concurrency=20)]
+    assert cli._lambda_preflight(None, pools) == []
+    assert "50 concurrent executions; 40 of the account's are unreserved" in capsys.readouterr().err
+    pools.append(SimpleNamespace(max_concurrency=60))
+    (err,) = cli._lambda_preflight(None, pools)
+    assert "the account allows 100" in err
