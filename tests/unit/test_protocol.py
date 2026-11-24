@@ -122,6 +122,12 @@ def test_oversized_inline_message_is_refused() -> None:
 
 
 def test_payload_keys() -> None:
+    assert protocol.task_payload_key("dev", TID, 2, "p") == f"payloads/dev/p/tasks/{TID}/2.task"
+    assert (
+        protocol.result_payload_key("dev", TID, 2, "p")
+        == f"payloads/dev/p/results/{TID}/{TID}:2.result"
+    )
+    # Without a pool: the layout before 0.8, which 0.7 workers still write (#80).
     assert protocol.task_payload_key("dev", TID, 2) == f"payloads/dev/tasks/{TID}/2.task"
     assert (
         protocol.result_payload_key("dev", TID, 2) == f"payloads/dev/results/{TID}/{TID}:2.result"

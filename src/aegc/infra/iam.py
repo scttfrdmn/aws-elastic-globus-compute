@@ -290,13 +290,20 @@ def worker_policy(*, deployment: str, region: str, account: str, bucket: str) ->
                 "Sid": "ReadTaskPayloads",
                 "Effect": "Allow",
                 "Action": "s3:GetObject",
-                "Resource": f"arn:aws:s3:::{bucket}/payloads/{d}/tasks/*",
+                # Every pool's (payloads/<d>/<pool>/tasks/, #80) and the layout before 0.8.
+                "Resource": [
+                    f"arn:aws:s3:::{bucket}/payloads/{d}/*/tasks/*",
+                    f"arn:aws:s3:::{bucket}/payloads/{d}/tasks/*",
+                ],
             },
             {
                 "Sid": "WriteResultPayloads",
                 "Effect": "Allow",
                 "Action": "s3:PutObject",
-                "Resource": f"arn:aws:s3:::{bucket}/payloads/{d}/results/*",
+                "Resource": [
+                    f"arn:aws:s3:::{bucket}/payloads/{d}/*/results/*",
+                    f"arn:aws:s3:::{bucket}/payloads/{d}/results/*",
+                ],
             },
             {
                 # vCPU-weighted groups refuse a decrement larger than desired: the worker lowers
@@ -435,16 +442,17 @@ def function_policy(
                 "Resource": f"{sqs}:{naming.PREFIX}-{d}-res-*",
             },
             {
+                # Only this pool's payloads (#80): its tasks run with this role.
                 "Sid": "ReadTaskPayloads",
                 "Effect": "Allow",
                 "Action": "s3:GetObject",
-                "Resource": f"arn:aws:s3:::{bucket}/payloads/{d}/tasks/*",
+                "Resource": f"arn:aws:s3:::{bucket}/payloads/{d}/{pool}/tasks/*",
             },
             {
                 "Sid": "WriteResultPayloads",
                 "Effect": "Allow",
                 "Action": "s3:PutObject",
-                "Resource": f"arn:aws:s3:::{bucket}/payloads/{d}/results/*",
+                "Resource": f"arn:aws:s3:::{bucket}/payloads/{d}/{pool}/results/*",
             },
             {
                 "Sid": "ReadDeploymentState",
@@ -514,14 +522,10 @@ def operator_policy(*, deployment: str, region: str, account: str, bucket: str) 
             {
                 "Sid": "TaskPayloads",
                 "Effect": "Allow",
-                "Action": ["s3:PutObject", "s3:DeleteObject"],
-                "Resource": f"arn:aws:s3:::{bucket}/payloads/{d}/tasks/*",
-            },
-            {
-                "Sid": "ResultPayloads",
-                "Effect": "Allow",
-                "Action": ["s3:GetObject", "s3:DeleteObject"],
-                "Resource": f"arn:aws:s3:::{bucket}/payloads/{d}/results/*",
+                # Writes tasks and reads results, in every pool's prefix (#80) and the layout
+                # before 0.8; deletes both once a task is done.
+                "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
+                "Resource": f"arn:aws:s3:::{bucket}/payloads/{d}/*",
             },
             {
                 "Sid": "ScaleOut",

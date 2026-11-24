@@ -141,6 +141,10 @@ class TaskMessage:
     resource_spec: dict[str, Any] = field(default_factory=dict)
     walltime_s: int = DEFAULT_WALLTIME_S
     engine_versions: dict[str, str] = field(default_factory=dict)
+    #: Where the worker writes a result too large to send inline (#80): the engine chooses it, so
+    #: the key layout can change without a protocol version. Empty from engines before 0.8: the
+    #: worker uses :func:`result_payload_key` without a pool.
+    result_key: str = ""
 
     @property
     def executor_task_id(self) -> str:
@@ -181,6 +185,7 @@ class TaskMessage:
                 resource_spec=dict(d.get("resource_spec") or {}),
                 walltime_s=int(d.get("walltime_s", DEFAULT_WALLTIME_S)),
                 engine_versions=dict(d.get("engine_versions") or {}),
+                result_key=str(d.get("result_key") or ""),
             )
         except (KeyError, TypeError, ValueError) as e:
             raise ProtocolError(f"bad task message: {e}") from e
@@ -271,11 +276,13 @@ def _loads(body: str, expect_kind: str | None = None) -> dict[str, Any]:
     return d
 
 
-def task_payload_key(deployment: str, task_uuid: str, attempt: int) -> str:
-    return f"payloads/{deployment}/tasks/{task_uuid}/{attempt}.task"
+def task_payload_key(deployment: str, task_uuid: str, attempt: int, pool: str = "") -> str:
+    """``payloads/<d>/<pool>/tasks/...`` (#80: each Lambda pool's role reaches only its own
+    pool's payloads); without ``pool``, the layout before 0.8."""
+    base = f"payloads/{deployment}/{pool}/" if pool else f"payloads/{deployment}/"
+    return f"{base}tasks/{task_uuid}/{attempt}.task"
 
 
-def result_payload_key(deployment: str, task_uuid: str, attempt: int) -> str:
-    return (
-        f"payloads/{deployment}/results/{task_uuid}/{executor_task_id(task_uuid, attempt)}.result"
-    )
+def result_payload_key(deployment: str, task_uuid: str, attempt: int, pool: str = "") -> str:
+    base = f"payloads/{deployment}/{pool}/" if pool else f"payloads/{deployment}/"
+    return f"{base}results/{task_uuid}/{executor_task_id(task_uuid, attempt)}.result"

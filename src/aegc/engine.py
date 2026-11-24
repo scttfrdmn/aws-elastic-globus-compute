@@ -172,6 +172,7 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         self._inflight: dict[str, _Inflight] = {}  # executor_task_id -> attempt
         self._attempts: collections.Counter[str] = collections.Counter()
         self._completed: collections.OrderedDict[str, None] = collections.OrderedDict()
+        self._forged = 0  # result-queue messages dropped for their sender (#80)
         self._stop = threading.Event()
         self._scale_now = threading.Event()
         self.first_scale_pass = threading.Event()  # set after the scaler's first pass
@@ -362,7 +363,7 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
                 packed_task,
                 s3=self._clients["s3"],
                 bucket=self._manifest_value("bucket"),
-                key=protocol.task_payload_key(self.deployment, task_uuid, attempt),
+                key=protocol.task_payload_key(self.deployment, task_uuid, attempt, pool),
                 inline_limit=self.inline_limit_bytes,
             )
             entry.task_payload = task
@@ -383,6 +384,7 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
                 resource_spec=dict(resource_specification or {}),
                 walltime_s=walltime,
                 engine_versions={"aegc": __version__},
+                result_key=protocol.result_payload_key(self.deployment, task_uuid, attempt, pool),
             )
             self._clients["sqs"].send_message(
                 QueueUrl=self._pool(pool)["task_queue_url"], MessageBody=msg.encode()
@@ -542,6 +544,7 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
                     QueueUrl=self._result_queue_url,
                     MaxNumberOfMessages=10,
                     WaitTimeSeconds=self.result_wait_s,
+                    MessageSystemAttributeNames=["SenderId"],  # who posted it (#80)
                 )
             except Exception as e:
                 if awsutil.is_not_found(e):
@@ -553,7 +556,9 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
                 continue
             for m in resp.get("Messages", []):
                 try:
-                    self.handle_result(m["Body"])
+                    self.handle_result(
+                        m["Body"], sender=(m.get("Attributes") or {}).get("SenderId")
+                    )
                 except Exception:
                     log.exception("couldn't handle a result message; leaving it for redelivery")
                     continue
@@ -572,14 +577,30 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
             self._fatal = e2
             log.error("result queue is gone (%s) and couldn't be recreated: %s", e, e2)
 
-    def handle_result(self, body: str) -> None:
-        """Route one result-queue message. Never call future callbacks while holding the lock."""
+    def handle_result(self, body: str, sender: str | None = None) -> None:
+        """Route one result-queue message. Never call future callbacks while holding the lock.
+
+        ``sender`` is the message's SQS ``SenderId``, which AWS sets (#80): a message for a task
+        counts only if it came from the role that serves the task's pool, so a Lambda pool's
+        tasks, which run with their pool's role, can't finish another pool's tasks."""
         try:
             msg = ResultMessage.decode(body)
         except ProtocolError as e:
             log.error("dropping an undecodable result message: %s", e)
             return
         etid = msg.executor_task_id
+        with self._lock:
+            known = self._inflight.get(etid) or next(
+                (e for e in self._inflight.values() if e.task_uuid == msg.task_uuid), None
+            )
+        pool = known.pool if known is not None else None
+        if not self._from_poster(pool, sender):
+            log.warning(
+                "ignoring a %s message for %s from %s, which doesn't serve pool %s",
+                msg.kind, msg.task_uuid, sender or "an unknown sender", pool or "(any)",
+            )  # fmt: skip
+            self._forged += 1
+            return
         if msg.kind == "started":
             with self._lock:
                 started = self._inflight.get(etid)
@@ -593,7 +614,7 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         # input, #32) must neither be returned nor make the engine delete that object.
         ref = msg.result.s3 if msg.result is not None else None
         if ref is not None and (
-            ref.key != protocol.result_payload_key(self.deployment, msg.task_uuid, msg.attempt)
+            ref.key not in self._result_keys(msg.task_uuid, msg.attempt, pool, sender)
             or ref.bucket != self._manifest_value("bucket")
         ):
             log.warning(
@@ -640,6 +661,54 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
             entry.future.set_result(data)
         self._discard_payload(msg)
         self._discard_task_payload(entry)
+
+    # --- who may post results (#80) --------------------------------------------------------
+
+    def _poster_ids(self) -> dict[str, str]:
+        """Pool name -> the unique id (``AROA...``) of the role that posts its results: its
+        function role for a Lambda pool, the worker role for an EC2 pool. Empty for manifests
+        written before 0.8 (no check until the next deploy)."""
+        m = self._manifest or {}
+        worker = str(m.get("worker_role_id") or "")
+        out: dict[str, str] = {}
+        for name, p in (m.get("pools") or {}).items():
+            rid = str(p.get("function_role_id") or "") if lambda_pools.is_lambda(p) else worker
+            if rid:
+                out[name] = rid
+        return out
+
+    def _matches(self, rid: str, sender: str | None) -> bool:
+        # A role session's SenderId is "<role id>:<session name>".
+        return bool(sender) and (sender == rid or str(sender).startswith(rid + ":"))
+
+    def _from_poster(self, pool: str | None, sender: str | None) -> bool:
+        """Whether ``sender`` may post for a task of ``pool`` (None: a task this process doesn't
+        know, e.g. from an earlier endpoint process: any pool's role)."""
+        ids = self._poster_ids()
+        if not ids:
+            return True  # a manifest from before 0.8: nothing to check against
+        if pool is not None:
+            rid = ids.get(pool)
+            return True if not rid else self._matches(rid, sender)  # no rid: deployed by 0.7
+        return any(self._matches(rid, sender) for rid in ids.values())
+
+    def _result_keys(self, task_uuid: str, attempt: int, pool: str | None, sender: str | None
+                     ) -> set[str]:  # fmt: skip
+        """Keys a result for this task may point at: its pool's (0.8 and later) and, for EC2
+        pools, the layout before 0.8, whose workers don't know the pool (one release). For a task
+        this process doesn't know, the pools whose role sent it."""
+        ids = self._poster_ids()
+        pools = (self._manifest or {}).get("pools", {})
+        if pool is not None:
+            candidates = [pool]
+        else:
+            candidates = [n for n in pools if not ids or self._matches(ids.get(n, ""), sender)]
+        keys: set[str] = set()
+        for name in candidates:
+            keys.add(protocol.result_payload_key(self.deployment, task_uuid, attempt, name))
+            if not lambda_pools.is_lambda(pools.get(name) or {}):
+                keys.add(protocol.result_payload_key(self.deployment, task_uuid, attempt))
+        return keys
 
     def _remember(self, task_uuid: str) -> None:
         self._completed[task_uuid] = None

@@ -253,7 +253,7 @@ class Processor:
                 packed,
                 s3=self.s3,
                 bucket=self.bucket,
-                key=protocol.result_payload_key(self.deployment, msg.task_uuid, msg.attempt),
+                key=result_key(self.deployment, msg),
             )
             if not self.post(
                 ResultMessage(
@@ -315,7 +315,7 @@ class Processor:
             failed_result(msg.task_uuid, code, text),
             s3=self.s3,
             bucket=self.bucket,
-            key=protocol.result_payload_key(self.deployment, msg.task_uuid, msg.attempt),
+            key=result_key(self.deployment, msg),
         )
         posted = self.post(
             ResultMessage(
@@ -331,6 +331,12 @@ class Processor:
         if posted:
             self.emitter.emit({"TasksFailed": 1}, outcome="refused")
         return posted
+
+
+def result_key(deployment: str, msg: TaskMessage) -> str:
+    """Where a result too large to send inline goes: the key the engine chose (0.8 and later),
+    else the layout before 0.8."""
+    return msg.result_key or protocol.result_payload_key(deployment, msg.task_uuid, msg.attempt)
 
 
 def task_fields(msg: TaskMessage, receive_count: int) -> dict[str, Any]:

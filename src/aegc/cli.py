@@ -558,8 +558,9 @@ def _pool_spec(
         raise SystemExit(f"aegc: {e}{hint}") from None
 
 
-#: Lambda pools run ``aegc-worker lambda``, which images built before aegc 0.7 lack.
-LAMBDA_IMAGE_VERSION = (0, 7)
+#: Lambda pools run ``aegc-worker lambda`` (aegc 0.7) and write results where the engine says
+#: (``TaskMessage.result_key``, 0.8, #80: their role reaches only their own pool's payloads).
+LAMBDA_IMAGE_VERSION = (0, 8)
 
 
 def _lambda_pool_spec(
@@ -577,9 +578,10 @@ def _lambda_pool_spec(
 
     if _version(rec.aegc_version) < LAMBDA_IMAGE_VERSION and not args.allow_old_image:
         raise SystemExit(
-            f"aegc: a Lambda pool needs a worker image built with aegc 0.7 or later (the {env!r} "
-            f"Python {rec.python_minor} image has {rec.aegc_version}, which has no "
-            "`aegc-worker lambda`); rebuild it with `aegc image build`"
+            f"aegc: a Lambda pool needs a worker image built with aegc 0.8 or later (the {env!r} "
+            f"Python {rec.python_minor} image has {rec.aegc_version}: 0.7 writes results where "
+            "this engine no longer reads them, and older ones have no `aegc-worker lambda`); "
+            "rebuild it with `aegc image build`"
         )
     name = f"{env}-py{rec.python_minor.replace('.', '')}-{lambda_pools.KIND}"
     base: dict[str, Any] = {}
@@ -670,7 +672,7 @@ def _deploy(args: argparse.Namespace) -> int:
             if old and len(old) < len(records):
                 print(
                     f"warning: no Lambda pool for {env} Python {', '.join(old)}: built with "
-                    "aegc < 0.7, which has no `aegc-worker lambda` (rebuild it)",
+                    "aegc < 0.8, which Lambda pools need (rebuild it)",
                     file=sys.stderr,
                 )
                 records = {m: r for m, r in records.items() if m not in old}

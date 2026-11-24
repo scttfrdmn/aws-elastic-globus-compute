@@ -224,6 +224,7 @@ def test_deploy_creates_role_function_and_mapping(
     assert entry["function_arn"] == got["Configuration"]["FunctionArn"]
     assert entry["event_source_mapping"] == m["UUID"]
     assert entry["function_role_arn"] == role["Arn"]
+    assert entry["function_role_id"] == role["RoleId"]  # the sender the engine accepts (#80)
     assert entry["task_queue_url"] == url and entry["dlq_url"].endswith("-dlq")
     assert (entry["memory_mib"], entry["timeout_s"], entry["max_concurrency"]) == (4096, 900, 20)
     for k in ("auto_scaling_group", "launch_template", "capacity_type"):
@@ -566,10 +567,11 @@ def test_cli_deploys_and_redeploys_a_lambda_pool(
     monkeypatch.setattr(cli, "_clients", lambda sess: c)
     monkeypatch.setattr(cli, "_quota_preflight", lambda sess, pools: checked.append(pools) or [])
     argv = ["--region", REGION, "deploy", "dev", "--max-usd-day", "5"]
-    record("0.6.0")  # no `aegc-worker lambda` yet
-    with pytest.raises(SystemExit, match=r"aegc 0\.7"):
-        cli.main([*argv, "--pool", "geospatial:lambda"])
-    record("0.7.0")
+    for old in ("0.6.0", "0.7.0"):  # no `aegc-worker lambda`; results at the old keys (#80)
+        record(old)
+        with pytest.raises(SystemExit, match=r"aegc 0\.8"):
+            cli.main([*argv, "--pool", "geospatial:lambda"])
+    record("0.8.0")
     assert cli.main([*argv, "--pool", "geospatial:lambda,memory=4096,timeout=600",
                      "--pool", "geospatial"]) == 0  # fmt: skip
     pools = deployment.read_manifest(c.ssm, "dev")["pools"]
@@ -611,8 +613,8 @@ def test_function_role_is_scoped_to_its_pool(aws: Callable[[str], Any]) -> None:
         ("sqs:ChangeMessageVisibility", f"{SQS}:aegc-dev-{NAME}-tasks"),
         ("sqs:GetQueueAttributes", f"{SQS}:aegc-dev-{NAME}-tasks"),
         ("sqs:SendMessage", f"{SQS}:aegc-dev-res-1234567890ab"),
-        ("s3:GetObject", f"arn:aws:s3:::{BUCKET}/payloads/dev/tasks/u/1.task"),
-        ("s3:PutObject", f"arn:aws:s3:::{BUCKET}/payloads/dev/results/u/u:1.result"),
+        ("s3:GetObject", f"arn:aws:s3:::{BUCKET}/payloads/dev/{NAME}/tasks/u/1.task"),
+        ("s3:PutObject", f"arn:aws:s3:::{BUCKET}/payloads/dev/{NAME}/results/u/u:1.result"),
         ("ssm:GetParameter", f"arn:aws:ssm:{REGION}:{ACCOUNT}:parameter/aegc/dev/state"),
         ("logs:PutLogEvents", f"arn:aws:logs:{REGION}:{ACCOUNT}:log-group:/aegc/dev:log-stream:x"),
         ("ecr:BatchGetImage", f"{ecr}/aegc/geospatial"),
@@ -627,6 +629,12 @@ def test_function_role_is_scoped_to_its_pool(aws: Callable[[str], Any]) -> None:
         ("sqs:DeleteQueue", f"{SQS}:aegc-dev-{NAME}-tasks"),
         ("s3:GetObject", f"arn:aws:s3:::{BUCKET}/payloads/prod/tasks/u/1.task"),
         ("s3:PutObject", f"arn:aws:s3:::{BUCKET}/payloads/dev/tasks/u/1.task"),
+        # #80: not another pool's payloads (nor a pool whose name starts with this one's), nor
+        # the layout before 0.8.
+        ("s3:GetObject", f"arn:aws:s3:::{BUCKET}/payloads/dev/sci-py314/tasks/u/1.task"),
+        ("s3:GetObject", f"arn:aws:s3:::{BUCKET}/payloads/dev/{NAME}-x/tasks/u/1.task"),
+        ("s3:GetObject", f"arn:aws:s3:::{BUCKET}/payloads/dev/tasks/u/1.task"),
+        ("s3:PutObject", f"arn:aws:s3:::{BUCKET}/payloads/dev/sci-py314/results/u/u:1.result"),
         ("ssm:PutParameter", f"arn:aws:ssm:{REGION}:{ACCOUNT}:parameter/aegc/dev/state"),
         ("autoscaling:SetDesiredCapacity", "*"),
         ("sts:AssumeRole", f"arn:aws:iam::{ACCOUNT}:role/aegc/aegc-dev-task-{REGION}"),

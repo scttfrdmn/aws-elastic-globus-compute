@@ -16,7 +16,7 @@ from aegc.infra import userdata
 from aegc.protocol import ResultMessage
 from aegc.worker import credentials, runner
 from aegc.worker.testing import pack_task, unpack_result
-from tests.unit.test_engine import BUCKET, EID, Env, _post, submit, triple
+from tests.unit.test_engine import BUCKET, EID, Env, _post, queued, submit, triple
 from tests.unit.test_engine import env as env  # the fixture
 
 
@@ -296,3 +296,76 @@ def test_a_child_that_wont_exit_keeps_its_result(tmp_path: Path) -> None:
     )  # fmt: skip
     assert out.outcome == "result" and unpack_result(out.result or b"") == (False, 7)
     assert time.monotonic() - t0 < 60
+
+
+# --- #80: results count only from the role that serves the task's pool -------------------------
+
+
+@pytest.mark.timeout(60)
+def test_results_from_another_role_are_dropped(env: Env) -> None:
+    # #80: a Lambda pool's tasks run with its function role, which may post to every result
+    # queue. A result (inline or not) or a system failure for a task of another pool must come
+    # from that pool's role: SQS's SenderId says who sent it, and nobody can forge that.
+    e = env.engine()
+    try:
+        assert e._poster_ids() == {"geo-py314": env.sender}  # the worker role
+        f = submit(e, triple, 2)
+        tid = str(f.gc_task_id)
+        worker = env.sender
+        env.sender = "AROAOTHERPOOLFUNCTION"  # say, a Lambda pool's function role
+        _post(
+            env,
+            e,
+            ResultMessage(
+                kind="system_failure",
+                task_uuid=tid,
+                attempt=1,
+                endpoint_id=str(EID),
+                error=protocol.ErrorInfo(code="CHILD_CRASHED", message="forged"),
+            ),
+        )
+        _post(env, e, ResultMessage(kind="result", task_uuid=tid, attempt=1, endpoint_id=str(EID),
+                                    result=payloads.make_payload(b"forged", s3=None, bucket="",
+                                                                 key="")))  # fmt: skip
+        time.sleep(3)
+        assert not f.done() and e._forged == 2
+        env.sender = worker
+        _post(env, e, ResultMessage(kind="result", task_uuid=tid, attempt=1, endpoint_id=str(EID),
+                                    result=payloads.make_payload(b"real", s3=None, bucket="",
+                                                                 key="")))  # fmt: skip
+        assert f.result(timeout=15) == b"real"
+    finally:
+        e.shutdown()
+
+
+@pytest.mark.timeout(60)
+def test_result_keys_are_per_pool_with_the_old_layout_for_ec2(env: Env) -> None:
+    e = env.engine()
+    try:
+        f = submit(e, triple, 3)
+        tid = str(f.gc_task_id)
+        (msg,) = queued(env)
+        assert msg.result_key == protocol.result_payload_key("dev", tid, 1, "geo-py314")
+        assert msg.task.s3 is None or "/geo-py314/tasks/" in msg.task.s3.key
+        keys = e._result_keys(tid, 1, "geo-py314", env.sender)
+        assert keys == {protocol.result_payload_key("dev", tid, 1, "geo-py314"),
+                        protocol.result_payload_key("dev", tid, 1)}  # fmt: skip
+        other = protocol.result_payload_key("dev", tid, 1, "sci-py314")
+        env.s3.put_object(Bucket=BUCKET, Key=other, Body=b"x")
+        theirs = payloads.make_payload(b"x", s3=env.s3, bucket=BUCKET, key=other, inline_limit=0)
+        _post(env, e, ResultMessage(kind="result", task_uuid=tid, attempt=1, endpoint_id=str(EID),
+                                    result=theirs))  # fmt: skip
+        time.sleep(3)
+        assert not f.done()  # another pool's key
+        legacy = payloads.make_payload(b"ok", s3=env.s3, bucket=BUCKET, inline_limit=0,
+                                       key=protocol.result_payload_key("dev", tid, 1))  # fmt: skip
+        _post(
+            env,
+            e,
+            ResultMessage(
+                kind="result", task_uuid=tid, attempt=1, endpoint_id=str(EID), result=legacy
+            ),
+        )  # an 0.7 EC2 worker: still accepted
+        assert f.result(timeout=15) == b"ok"
+    finally:
+        e.shutdown()

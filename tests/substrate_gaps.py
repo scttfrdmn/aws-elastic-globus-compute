@@ -188,3 +188,35 @@ def lambda_echoes(lam: Any) -> dict[str, list[dict[str, Any]]]:
     ev.register("after-call.lambda.ListEventSourceMappings", list_mappings)
     ev.register("before-call.lambda.ListTags", mapping_tags)
     return sent
+
+
+def sender_ids(sqs: Any, who: Any) -> Any:
+    """substrate#1676: SQS's ``SenderId`` is always the account id; AWS gives the role's unique
+    id and session (``AROA...:<session>``) for an assumed role, which the engine checks (#80).
+
+    On this client, each ``SendMessage`` carries ``who()`` (the id the test says sent it) in a
+    message attribute, and ``ReceiveMessage`` reports it as ``SenderId``."""
+    attr = "aegc-test-sender"
+
+    def tag(params: dict[str, Any], **_: Any) -> None:
+        sender = who()
+        if sender:
+            params.setdefault("MessageAttributes", {})[attr] = {
+                "DataType": "String", "StringValue": f"{sender}:test"
+            }  # fmt: skip
+
+    def ask(params: dict[str, Any], **_: Any) -> None:
+        names = list(params.get("MessageAttributeNames") or [])
+        if "All" not in names and attr not in names:
+            params["MessageAttributeNames"] = [*names, attr]
+
+    def report(parsed: Any, **_: Any) -> None:
+        for m in parsed.get("Messages", []) or []:
+            a = (m.get("MessageAttributes") or {}).pop(attr, None)
+            if a is not None:
+                m.setdefault("Attributes", {})["SenderId"] = a["StringValue"]
+
+    sqs.meta.events.register("provide-client-params.sqs.SendMessage", tag)
+    sqs.meta.events.register("provide-client-params.sqs.ReceiveMessage", ask)
+    sqs.meta.events.register("after-call.sqs.ReceiveMessage", report)
+    return sqs

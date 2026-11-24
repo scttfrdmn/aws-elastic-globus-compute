@@ -1511,7 +1511,22 @@ def ensure_lambda_pool(
         "function_arn": fn_arn,
         "event_source_mapping": uuid,
         "function_role_arn": role_arn,
+        # The engine accepts this pool's results only from this role (SQS SenderId, #80).
+        "function_role_id": role_id(
+            c, lambda_pools.function_role(spec.deployment, pool.name, spec.region)
+        ),
     }
+
+
+def role_id(c: Clients, name: str) -> str:
+    """A role's unique id (``AROA...``), which SQS reports as a message's sender; empty if the
+    role isn't there (a dry run)."""
+    try:
+        return str(c.iam.get_role(RoleName=name)["Role"]["RoleId"])
+    except Exception as e:
+        if is_not_found(e) or error_code(e) == "NoSuchEntity":
+            return ""
+        raise
 
 
 def _owned_functions(lam: Any, d: str) -> list[dict[str, Any]]:
@@ -1680,6 +1695,7 @@ def manifest(
     profile_arn: str,
     sg: str,
     subnets: list[str],
+    worker_role_id: str = "",
 ) -> dict[str, Any]:
     body: dict[str, Any] = {
         "version": 1,
@@ -1689,6 +1705,8 @@ def manifest(
         "account": spec.account,
         "bucket": spec.bucket,
         "instance_profile_arn": profile_arn,
+        # EC2 pools' results come from the worker role (SQS SenderId, #80).
+        "worker_role_id": worker_role_id,
         "security_group": sg,
         "subnets": subnets,
         "pools": {
@@ -1911,7 +1929,14 @@ def deploy(c: Clients, spec: DeploymentSpec, *, dry_run: bool = False) -> Report
     write_manifest(
         c,
         spec,
-        manifest(spec, pools, profile_arn=profile_arn, sg=sg, subnets=subnets),
+        manifest(
+            spec,
+            pools,
+            profile_arn=profile_arn,
+            sg=sg,
+            subnets=subnets,
+            worker_role_id=role_id(c, naming.worker_role(spec.deployment, spec.region)),
+        ),
         report,
         dry_run=dry_run,
     )

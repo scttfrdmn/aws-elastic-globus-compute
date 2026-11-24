@@ -134,7 +134,9 @@ class Rig:
             config=self.cfg, sqs=self.sqs, s3=self.s3, autoscaling=self.asg, wait_s=1, **kw
         )
 
-    def submit(self, fn: Callable[..., Any], *args: Any, walltime_s: int = 60) -> str:
+    def submit(
+        self, fn: Callable[..., Any], *args: Any, walltime_s: int = 60, result_key: str = ""
+    ) -> str:
         tid = str(uuid.uuid4())
         body = pack_task(fn, *args, task_uuid=tid)
         task = payloads.make_payload(
@@ -150,6 +152,7 @@ class Rig:
             submitted_at=time.time(),
             task=task,
             walltime_s=walltime_s,
+            result_key=result_key,
         )
         self.sqs.send_message(QueueUrl=self.tasks, MessageBody=msg.encode())
         return tid
@@ -581,3 +584,19 @@ def test_a_task_finishing_after_stop_posts_its_result(rig: Rig) -> None:
     a.wait_idle()
     assert value_of(rig.final(1)[tid], rig.s3) == (False, 32)
     assert rig.task_queue_empty()
+
+
+@pytest.mark.timeout(120)
+def test_large_results_go_where_the_engine_says(rig: Rig) -> None:
+    # #80: the engine picks the result key (its pool's prefix); without one (engines before 0.8)
+    # the worker uses the layout before 0.8.
+    a = rig.agent()
+    key = "payloads/dev/p/results/x/chosen.result"
+    t1, t2 = rig.submit(big, result_key=key), rig.submit(big)
+    while a.stats.claimed < 2:
+        a.claim_once()
+    a.wait_idle()
+    res = rig.final(2)
+    assert res[t1].result is not None and res[t1].result.s3 is not None
+    assert res[t1].result.s3.key == key
+    assert res[t2].result.s3.key == protocol.result_payload_key("dev", t2, 1)  # type: ignore[union-attr]

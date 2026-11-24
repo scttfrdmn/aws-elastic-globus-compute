@@ -22,6 +22,7 @@ from aegc.worker.agent import Agent
 from aegc.worker.config import WorkerConfig
 from aegc.worker.testing import pack_task, unpack_result
 from tests.conftest import ACCOUNT, REGION
+from tests.substrate_gaps import sender_ids
 
 BUCKET = naming.bucket_name(ACCOUNT, REGION)
 IMAGE = f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/aegc/geospatial@sha256:" + "d" * 64
@@ -74,6 +75,11 @@ class Env:
             self.spec,
         )
         self.task_queue = self.sqs.get_queue_url(QueueName="aegc-dev-geo-py314-tasks")["QueueUrl"]
+        # Who posts results (substrate#1676): the worker role, unless a test says otherwise.
+        self.sender = deployment.role_id(Clients(iam=aws("iam"), ec2=None, autoscaling=None,
+                                                 sqs=None, logs=None, ssm=None),
+                                         naming.worker_role("dev", REGION))  # fmt: skip
+        sender_ids(self.sqs, lambda: self.sender)
 
     def engine(self, *, python_minor: str = "3.14", cloudwatch: Any = None, **kw: Any) -> AWSEngine:
         e = AWSEngine(
