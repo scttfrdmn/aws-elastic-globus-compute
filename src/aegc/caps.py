@@ -6,7 +6,7 @@ import logging
 import time
 from typing import Any
 
-from aegc import lambda_pools
+from aegc import lambda_pools, triggers
 from aegc.spend import Trip
 from aegc.state import Limits, State, write_state
 
@@ -25,8 +25,10 @@ def trip(
     now: float | None = None,
     lam: Any = None,
     mappings: dict[str, str] | None = None,
+    events: Any = None,
 ) -> tuple[State, Exception | None]:
-    """Set the deployment ``capped``, drop group minimums to 0 and disable Lambda pools.
+    """Set the deployment ``capped``, drop group minimums to 0 and disable Lambda pools and
+    (given an EventBridge client) S3-event triggers (#83).
 
     ``groups`` maps Auto Scaling group names to their current MinSize, ``mappings`` Lambda pools
     to their event source mapping UUIDs (:func:`aegc.lambda_pools.mappings`). Returns the state
@@ -60,4 +62,11 @@ def trip(
         else:
             for pool, err in lambda_pools.set_all(lam, mappings, False).items():
                 log.warning("pool %s: couldn't disable its event source mapping: %s", pool, err)
+    if events is not None:
+        try:
+            _, errors = triggers.freeze(events, deployment, False)
+            for rule, err in errors.items():
+                log.warning("trigger %s: couldn't disable its rule: %s", rule, err)
+        except Exception as e:
+            log.warning("couldn't list the trigger rules (they stay enabled): %s", e)
     return st, error

@@ -29,6 +29,9 @@ MAX_DEPLOYMENT = 20
 #: Pool names are ``<env>-py<NNN>``. The longest name built from one is the dead-letter queue,
 #: ``aegc-<deployment>-<pool>-dlq``, and SQS allows 80 characters.
 MAX_POOL = 40
+#: Trigger names (#83): the longest name built from one is the trigger role,
+#: ``aegc-<deployment>-trigger-<name>-<region>``, and IAM allows 64 characters.
+MAX_TRIGGER = 15
 _NAME = re.compile(r"^[a-z][a-z0-9-]*$")
 IAM_PATH = "/aegc/"
 
@@ -39,12 +42,15 @@ class NameError_(ValueError):
 
 def validate_name(kind: str, value: str) -> str:
     """Deployment (up to 20 chars) and pool (up to 40) names: lowercase [a-z0-9-], from a letter."""
-    limit = MAX_POOL if kind == "pool" else MAX_DEPLOYMENT
+    limit = {"pool": MAX_POOL, "trigger": MAX_TRIGGER}.get(kind, MAX_DEPLOYMENT)
     if len(value) > limit or not _NAME.match(value) or value.endswith("-") or "--" in value:
         raise NameError_(
             f"{kind} name {value!r} must be 1-{limit} chars of [a-z0-9-], start with a letter, "
             "and not end with '-' or contain '--'"
         )
+    if kind == "pool" and (value == TRIGGER or value.startswith(f"{TRIGGER}-")):
+        # A pool's function, role and lease schedule would collide with a trigger's (#83).
+        raise NameError_(f"pool names can't be {TRIGGER!r} or start with '{TRIGGER}-' (reserved)")
     return value
 
 
@@ -215,3 +221,31 @@ def endpoint_topic(deployment: str) -> str:
 
 def endpoint_repository() -> str:
     return f"{PREFIX}/{ENDPOINT}"
+
+
+# --- S3-event triggers (#83): aegc-<d>-trigger-<name> for the rule, function, secret ----------
+
+#: Reserved: pools can't be named ``trigger`` or ``trigger-*``.
+TRIGGER = "trigger"
+
+
+def trigger_resource(deployment: str, name: str) -> str:
+    """A trigger's EventBridge rule, Lambda function and Secrets Manager secret."""
+    return f"{PREFIX}-{deployment}-{TRIGGER}-{name}"
+
+
+def trigger_prefix(deployment: str) -> str:
+    return f"{PREFIX}-{deployment}-{TRIGGER}-"
+
+
+def trigger_dlq(deployment: str, name: str) -> str:
+    return f"{trigger_resource(deployment, name)}-dlq"
+
+
+def trigger_role(deployment: str, name: str, region: str) -> str:
+    return f"{trigger_resource(deployment, name)}-{region}"
+
+
+def trigger_parameter(deployment: str, name: str = "") -> str:
+    """The trigger's spec (``/aegc/<d>/triggers/<name>``); without a name, their path."""
+    return f"/{PREFIX}/{deployment}/triggers" + (f"/{name}" if name else "")

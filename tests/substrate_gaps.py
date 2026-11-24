@@ -220,3 +220,49 @@ def sender_ids(sqs: Any, who: Any) -> Any:
     sqs.meta.events.register("provide-client-params.sqs.ReceiveMessage", ask)
     sqs.meta.events.register("after-call.sqs.ReceiveMessage", report)
     return sqs
+
+
+def rule_states(events: Any) -> list[dict[str, Any]]:
+    """substrate#TBD-eventbridge-enable-disable-rule: EnableRule and DisableRule are
+    UnknownOperationException ("The action DisableRule is not recognized"); PutRule, DescribeRule,
+    ListRules (with State), PutTargets and tags work.
+
+    On this client, both are answered by re-putting the rule with its own pattern and the new
+    State (PutRule updates a rule in place, as AWS does). Returns the requests, in order."""
+    calls: list[dict[str, Any]] = []
+
+    def toggle(state: str) -> Any:
+        def respond(p: dict[str, Any]) -> dict[str, Any]:
+            calls.append({**p, "State": state})
+            rule = events.describe_rule(Name=p["Name"])
+            kw = {k: rule[k] for k in ("EventPattern", "Description") if rule.get(k)}
+            events.put_rule(Name=p["Name"], State=state, **kw)
+            return {}
+
+        return respond
+
+    _stub(events, "eventbridge", "EnableRule", toggle("ENABLED"))
+    _stub(events, "eventbridge", "DisableRule", toggle("DISABLED"))
+    return calls
+
+
+def function_concurrency(lam: Any) -> dict[str, int]:
+    """substrate#TBD-lambda-function-concurrency: PutFunctionConcurrency and
+    GetFunctionConcurrency are UnknownOperationException. Also without code here:
+    GetFunctionEventInvokeConfig is UnknownOperationException (PutFunctionEventInvokeConfig
+    answers, without echoing DestinationConfig).
+
+    Records reserved concurrency by function on this client and answers both."""
+    reserved: dict[str, int] = {}
+
+    def put(p: dict[str, Any]) -> dict[str, Any]:
+        reserved[str(p["FunctionName"])] = int(p["ReservedConcurrentExecutions"])
+        return {"ReservedConcurrentExecutions": p["ReservedConcurrentExecutions"]}
+
+    def get(p: dict[str, Any]) -> dict[str, Any]:
+        n = reserved.get(str(p["FunctionName"]))
+        return {} if n is None else {"ReservedConcurrentExecutions": n}
+
+    _stub(lam, "lambda", "PutFunctionConcurrency", put)
+    _stub(lam, "lambda", "GetFunctionConcurrency", get)
+    return reserved

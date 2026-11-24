@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from aegc import lambda_pools, ledger, pricing
+from aegc import lambda_pools, ledger, pricing, triggers
 from aegc.infra.deployment import manifest_generation, read_manifest, update_manifest
 from aegc.state import Limits, State, period_start, read_state, write_state
 
@@ -53,6 +53,23 @@ def _set_mappings(
             report.add(f"  pool {name} ({what}): event source mapping {verb}")
 
 
+def _set_rules(report: ControlReport, events: Any, deployment: str, enabled: bool) -> None:
+    """Enable or disable the deployment's S3-event trigger rules (#83), reporting each."""
+    if events is None:
+        return
+    verb = "enabled" if enabled else "disabled"
+    try:
+        names, errors = triggers.freeze(events, deployment, enabled)
+    except Exception as e:
+        report.add(f"  triggers: couldn't list their rules (NOT {verb}): {e}")
+        return
+    for name in names:
+        if name in errors:
+            report.add(f"  trigger {name}: couldn't {verb[:-1]} its rule: {errors[name]}")
+        else:
+            report.add(f"  trigger {name}: rule {verb}")
+
+
 def stop(
     *,
     ssm: Any,
@@ -62,9 +79,10 @@ def stop(
     grace_s: float = HARD_STOP_GRACE_S,
     sleep: Any = time.sleep,
     lam: Any = None,
+    events: Any = None,
 ) -> ControlReport:
     """Stop spending: state ``stopped``; every group's minimum to 0 so workers can leave; every
-    Lambda pool's event source mapping disabled.
+    Lambda pool's event source mapping and S3-event trigger's rule disabled.
 
     Workers see the state within a minute, fail anything still queued with AEGC_STOPPED, finish
     their tasks (or, with ``hard``, fail them now), then leave their groups. With ``hard``, any
@@ -85,6 +103,7 @@ def stop(
     report.add(f"deployment {deployment}: state stopped{' (hard)' if hard else ''}")
     pools = m.get("pools", {})
     _set_mappings(report, lam, pools, False)
+    _set_rules(report, events, deployment, False)
     groups = {n: p["auto_scaling_group"] for n, p in pools.items() if not lambda_pools.is_lambda(p)}
     for name, group in sorted(groups.items()):
         autoscaling.update_auto_scaling_group(AutoScalingGroupName=group, MinSize=0)
@@ -125,10 +144,11 @@ def resume(
     deployment: str,
     scheduler: Any | None = None,
     lam: Any = None,
+    events: Any = None,
 ) -> ControlReport:
     """Back to running: clear the state, restore each group's minimum from the manifest, enable
-    the Lambda pools' event source mappings, and (given a scheduler client) push the lease
-    forward."""
+    the Lambda pools' event source mappings and the trigger rules, and (given a scheduler client)
+    push the lease forward."""
     report = ControlReport()
     m = read_manifest(ssm, deployment)
     before = read_state(ssm, deployment)
@@ -144,6 +164,7 @@ def resume(
         )
         report.add(f"  pool {name}: minimum {minimum} {unit}")
     _set_mappings(report, lam, pools, True)
+    _set_rules(report, events, deployment, True)
     lease_s = int((m.get("lease") or {}).get("lease_s") or 0)
     if scheduler is not None and lease_s:
         from aegc import lease
@@ -162,6 +183,7 @@ def set_limits(
     spend: Any | None = None,
     scheduler: Any | None = None,
     lam: Any = None,
+    events: Any = None,
     **changes: Any,
 ) -> ControlReport:
     """Change a deployment's spend limits (``"none"`` removes one). Running engines pick the
@@ -184,7 +206,7 @@ def set_limits(
                 )
             report.lines += resume(
                 ssm=ssm, autoscaling=autoscaling, deployment=deployment, scheduler=scheduler,
-                lam=lam,
+                lam=lam, events=events,
             ).lines  # fmt: skip
         else:
             report.add(f"  state is {st.mode}; nothing to resume")

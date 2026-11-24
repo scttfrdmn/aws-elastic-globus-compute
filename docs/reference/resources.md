@@ -133,6 +133,25 @@ Sid `AegcLambdaPull` in the `aegc/<env>` repository policy: the Lambda service
 `arn:aws:lambda:<region>:<account>:function:aegc-*`. Other statements are left as they are. It's
 region-wide like the repository, so `destroy` leaves it, and no aegc command removes it.
 
+## Trigger: aegc trigger create
+
+Deleted by `aegc trigger delete --yes` and `aegc destroy` (with the
+[lambda-deployer](iam.md#lambda-deployer) policy). These also carry `aegc:trigger=<name>`. See
+[Start a flow when a file lands in S3](../how-to/triggers.md).
+
+| Resource | Name | `aegc:role` |
+|---|---|---|
+| EventBridge rule (S3 `Object Created` on the bucket, key prefix/suffix), target the function | `aegc-<d>-trigger-<name>` | `trigger-rule` |
+| Lambda function (zip, python3.13, arm64, reserved concurrency 2, on-failure destination the DLQ, logs to `/aegc/<d>`), invoke permission for the rule | `aegc-<d>-trigger-<name>` | `trigger-function` |
+| IAM role, path `/aegc/`, inline policy `aegc-trigger` (see [Trigger role](iam.md#trigger-role)) | `aegc-<d>-trigger-<name>-<region>` | `trigger-role` |
+| SQS dead-letter queue (14 days) | `aegc-<d>-trigger-<name>-dlq` | `trigger-dlq` |
+| Secrets Manager secret: your Globus login (`aegc trigger login`) | `aegc-<d>-trigger-<name>` | `trigger-login` |
+| SSM parameter: the trigger's spec | `/aegc/<d>/triggers/<name>` | `trigger` |
+| EventBridge Scheduler schedules (with the deployment's others) | `lease-trigger-<name>`, `ttl-trigger-<name>`: disable the rule | — |
+
+**Your bucket** isn't aegc's: `create` adds `EventBridgeConfiguration` to its notification
+configuration and keeps everything else; nothing aegc does removes it.
+
 ## Endpoint process: AWSEngine
 
 | Resource | Name | `aegc:role` | Deleted by |

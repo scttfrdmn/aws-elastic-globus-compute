@@ -311,6 +311,19 @@ class Clients:
     sns: Any = None
     # Lambda pools (#21); optional: without it, deploy refuses Lambda pools.
     lambda_: Any = None
+    # S3-event triggers (#83); optional: without them, destroy leaves triggers alone.
+    events: Any = None
+    s3: Any = None
+
+    def triggers(self) -> Any:
+        """The clients :mod:`aegc.infra.triggers` uses."""
+        from aegc.infra.triggers import TriggerClients
+
+        return TriggerClients(
+            iam=self.iam, ssm=self.ssm, sqs=self.sqs, lambda_=self.lambda_, events=self.events,
+            s3=self.s3, secretsmanager=self.secretsmanager, scheduler=self.scheduler,
+            cloudwatch=self.cloudwatch,
+        )  # fmt: skip
 
 
 ACCESS_DENIED = {
@@ -1536,8 +1549,8 @@ def _owned_functions(lam: Any, d: str) -> list[dict[str, Any]]:
     out = []
     for f in paginate(lam, "list_functions", "Functions"):
         name = str(f["FunctionName"])
-        if not name.startswith(prefix):
-            continue
+        if not name.startswith(prefix) or name.startswith(naming.trigger_prefix(d)):
+            continue  # triggers' functions are aegc.infra.triggers' (#83)
         try:
             tags = naming.tag_dict(lam.list_tags(Resource=f["FunctionArn"]).get("Tags"))
         except Exception as e:
@@ -1962,6 +1975,7 @@ def deploy(c: Clients, spec: DeploymentSpec, *, dry_run: bool = False) -> Report
                     for n, p in pools.items()
                     if "event_source_mapping" in p
                 },
+                rules=trigger_rules(c, spec.deployment),
                 lease_s=spec.lease_s,
                 ttl_at=spec.ttl_at,
             ),
@@ -1972,6 +1986,13 @@ def deploy(c: Clients, spec: DeploymentSpec, *, dry_run: bool = False) -> Report
         for env, keep in inuse.items():
             images.release(c.ecr, env, spec.deployment, keep, report=report)
     return report
+
+
+def trigger_rules(c: Clients, deployment: str) -> dict[str, str]:
+    """The deployment's S3-event triggers (#83) for its lease: trigger name -> rule name."""
+    from aegc.infra import triggers
+
+    return triggers.rule_names(c.ssm, deployment)
 
 
 def ensure_state(c: Clients, spec: DeploymentSpec, report: Report, *, dry_run: bool) -> None:
@@ -2132,6 +2153,19 @@ def destroy(
             )
         report.add("security group", sg_name, verb, g["GroupId"])
 
+    # S3-event triggers (#83): their rules first, so no new events arrive. They need the
+    # lambda-deployer policy; a deployer without it still destroys everything else.
+    if c.events is not None and c.lambda_ is not None:
+        from aegc.infra import triggers
+
+        had_triggers = bool(trigger_rules(c, d))
+        try:
+            triggers.destroy(c.triggers(), d, region, report, dry_run=dry_run, queues=False)
+        except Exception as e:
+            if error_code(e) not in ACCESS_DENIED:
+                raise
+            report.add("triggers", d, "remaining" if had_triggers else "kept", TRIGGERS_DENIED)
+
     # Lambda pools (#21): mappings before their queues. They need the lambda-deployer policy;
     # a deployer without it still destroys everything else.
     if c.lambda_ is not None:
@@ -2211,6 +2245,7 @@ def destroy(
 
 
 LAMBDA_DENIED = "not checked: needs the lambda-deployer policy (aegc iam-policy lambda-deployer)"
+TRIGGERS_DENIED = "triggers " + LAMBDA_DENIED
 
 
 def _owned_parameters(c: Clients, d: str) -> list[tuple[str, dict[str, str]]]:
@@ -2380,6 +2415,16 @@ def verify_destroyed(
             if error_code(e) not in ACCESS_DENIED:
                 raise
             report.add("lambda pools", d, "kept", LAMBDA_DENIED)  # shown, and named below
+    if c.events is not None and c.lambda_ is not None:  # S3-event triggers (#83)
+        from aegc.infra import triggers
+
+        try:
+            for kind, name in triggers.leftovers(c.triggers(), d, region, queues=False):
+                report.add(kind, name, "remaining")
+        except Exception as e:
+            if error_code(e) not in ACCESS_DENIED:
+                raise
+            report.add("triggers", d, "kept", TRIGGERS_DENIED)
     if c.scheduler is not None:
         from aegc import lease
 

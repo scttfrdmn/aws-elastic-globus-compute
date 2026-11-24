@@ -8,7 +8,8 @@ The cloud endpoint's host runs this every 5 minutes:
 2. **Caps (#51).** Check spend against the deployment's limits and trip it, as an engine would,
    even when no engine (user endpoint process) is running.
    Lambda pools (#21) then follow the state: their event source mappings are enabled while the
-   deployment runs (a cap whose period ended reads as running) and disabled otherwise.
+   deployment runs (a cap whose period ended reads as running) and disabled otherwise. So do
+   S3-event triggers' rules (#83), given an ``events`` client.
 3. **Lease.** Renew it, but only while the endpoint is online: the lease stays a dead-man switch
    for the endpoint, so a deployment whose endpoint is gone still freezes.
 4. **Reap.** Delete result queues of user endpoint processes long gone.
@@ -24,7 +25,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from aegc import caps, lambda_pools, lease, ops
+from aegc import caps, lambda_pools, lease, ops, triggers
 from aegc.infra.deployment import read_manifest
 from aegc.infra.iam import ENDPOINT_NAMESPACE
 from aegc.pricing import Prices
@@ -43,6 +44,7 @@ class Evaluation:
     lease_renewed: int = 0
     reaped: list[str] = field(default_factory=list)
     mappings: dict[str, str] = field(default_factory=dict)  # Lambda pool -> enabled/disabled/error
+    rules: dict[str, str] = field(default_factory=dict)  # trigger rule -> enabled/disabled/error
     errors: list[str] = field(default_factory=list)
     dry_run: bool = False
 
@@ -61,6 +63,10 @@ class Evaluation:
             if change in ("enabled", "disabled"):
                 done = f"would {change[:-1]}" if self.dry_run else change
                 lines.append(f"  {done} Lambda pool {pool}'s event source mapping")
+        for rule, change in sorted(self.rules.items()):
+            if change in ("enabled", "disabled"):
+                done = f"would {change[:-1]}" if self.dry_run else change
+                lines.append(f"  {done} trigger rule {rule}")
         for q in self.reaped:
             lines.append(f"  {verb}delete idle result queue {q}")
         for e in self.errors:
@@ -113,7 +119,8 @@ def evaluate(
     now: float | None = None,
 ) -> Evaluation:
     """One pass. ``clients`` needs ssm, s3, autoscaling, scheduler, sqs, and lambda for a
-    deployment with Lambda pools (ec2 and pricing are optional, for live prices)."""
+    deployment with Lambda pools (ec2 and pricing are optional, for live prices; events for
+    S3-event triggers)."""
     now = time.time() if now is None else now
     ev = Evaluation(deployment=deployment, dry_run=dry_run)
 
@@ -159,6 +166,7 @@ def evaluate(
                         deployment=deployment, cap=trip, limits=limits, groups=groups,
                         by="evaluator", now=now, lam=clients.get("lambda"),
                         mappings=lambda_pools.mappings(m.get("pools", {})),
+                        events=clients.get("events"),
                     )  # fmt: skip
                     if err is not None:
                         ev.errors.append(f"cap: {err}")
@@ -184,6 +192,18 @@ def evaluate(
                 ]
             except Exception as e:
                 ev.errors.append(f"Lambda pools: {e}")
+
+    if "events" in clients:
+        try:
+            _, ev.rules = triggers.reconcile(
+                clients["events"], deployment, ev.state == "running", dry_run=dry_run,
+                confirm=lambda: read_state(clients["ssm"], deployment, now=now).running,
+            )  # fmt: skip
+            ev.errors += [
+                f"trigger {n}: {c}" for n, c in ev.rules.items() if c not in ("enabled", "disabled")
+            ]
+        except Exception as e:
+            ev.errors.append(f"triggers: {e}")
 
     lease_s = int((m.get("lease") or {}).get("lease_s") or 0)
     if ev.online and lease_s and ev.state in ("running", "capped"):

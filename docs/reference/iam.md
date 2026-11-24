@@ -437,18 +437,10 @@ For [`aegc provenance`](cli.md#aegc-provenance), it may also search the deployme
       "Effect": "Allow",
       "Action": [
         "s3:PutObject",
-        "s3:DeleteObject"
-      ],
-      "Resource": "arn:aws:s3:::aegc-123456789012-us-west-2/payloads/e2e/tasks/*"
-    },
-    {
-      "Sid": "ResultPayloads",
-      "Effect": "Allow",
-      "Action": [
         "s3:GetObject",
         "s3:DeleteObject"
       ],
-      "Resource": "arn:aws:s3:::aegc-123456789012-us-west-2/payloads/e2e/results/*"
+      "Resource": "arn:aws:s3:::aegc-123456789012-us-west-2/payloads/e2e/*"
     },
     {
       "Sid": "ScaleOut",
@@ -570,7 +562,8 @@ For [`aegc provenance`](cli.md#aegc-provenance), it may also search the deployme
       "Effect": "Allow",
       "Action": [
         "sqs:ListQueues",
-        "lambda:ListEventSourceMappings"
+        "lambda:ListEventSourceMappings",
+        "events:ListRules"
       ],
       "Resource": "*"
     },
@@ -599,6 +592,21 @@ For [`aegc provenance`](cli.md#aegc-provenance), it may also search the deployme
         "arn:aws:lambda:us-west-2:123456789012:function:aegc-e2e-*",
         "arn:aws:lambda:us-west-2:123456789012:event-source-mapping:*"
       ]
+    },
+    {
+      "Sid": "FreezeTriggers",
+      "Effect": "Allow",
+      "Action": [
+        "events:EnableRule",
+        "events:DisableRule",
+        "events:DescribeRule"
+      ],
+      "Resource": "arn:aws:events:us-west-2:123456789012:rule/aegc-e2e-trigger-*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/aegc:deployment": "e2e"
+        }
+      }
     },
     {
       "Sid": "VcpuQuotaPreflight",
@@ -1255,18 +1263,10 @@ policy starts with the whole [operator](#operator) policy, and adds:
       "Effect": "Allow",
       "Action": [
         "s3:PutObject",
-        "s3:DeleteObject"
-      ],
-      "Resource": "arn:aws:s3:::aegc-123456789012-us-west-2/payloads/e2e/tasks/*"
-    },
-    {
-      "Sid": "ResultPayloads",
-      "Effect": "Allow",
-      "Action": [
         "s3:GetObject",
         "s3:DeleteObject"
       ],
-      "Resource": "arn:aws:s3:::aegc-123456789012-us-west-2/payloads/e2e/results/*"
+      "Resource": "arn:aws:s3:::aegc-123456789012-us-west-2/payloads/e2e/*"
     },
     {
       "Sid": "ScaleOut",
@@ -1388,7 +1388,8 @@ policy starts with the whole [operator](#operator) policy, and adds:
       "Effect": "Allow",
       "Action": [
         "sqs:ListQueues",
-        "lambda:ListEventSourceMappings"
+        "lambda:ListEventSourceMappings",
+        "events:ListRules"
       ],
       "Resource": "*"
     },
@@ -1417,6 +1418,21 @@ policy starts with the whole [operator](#operator) policy, and adds:
         "arn:aws:lambda:us-west-2:123456789012:function:aegc-e2e-*",
         "arn:aws:lambda:us-west-2:123456789012:event-source-mapping:*"
       ]
+    },
+    {
+      "Sid": "FreezeTriggers",
+      "Effect": "Allow",
+      "Action": [
+        "events:EnableRule",
+        "events:DisableRule",
+        "events:DescribeRule"
+      ],
+      "Resource": "arn:aws:events:us-west-2:123456789012:rule/aegc-e2e-trigger-*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/aegc:deployment": "e2e"
+        }
+      }
     },
     {
       "Sid": "VcpuQuotaPreflight",
@@ -1736,6 +1752,134 @@ deployer policy, to whoever deploys Lambda pools.
         "ecr:DescribeImages"
       ],
       "Resource": "arn:aws:ecr:us-west-2:123456789012:repository/aegc/*"
+    },
+    {
+      "Sid": "CreateTriggerRulesTagged",
+      "Effect": "Allow",
+      "Action": [
+        "events:PutRule",
+        "events:TagResource"
+      ],
+      "Resource": "arn:aws:events:us-west-2:123456789012:rule/aegc-*-trigger-*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/aegc:managed": "true"
+        }
+      }
+    },
+    {
+      "Sid": "ChangeOwnedTriggerRules",
+      "Effect": "Allow",
+      "Action": [
+        "events:PutRule",
+        "events:DeleteRule",
+        "events:PutTargets",
+        "events:RemoveTargets",
+        "events:EnableRule",
+        "events:DisableRule"
+      ],
+      "Resource": "arn:aws:events:us-west-2:123456789012:rule/aegc-*-trigger-*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/aegc:managed": "true"
+        }
+      }
+    },
+    {
+      "Sid": "ReadTriggerRules",
+      "Effect": "Allow",
+      "Action": [
+        "events:DescribeRule",
+        "events:ListTargetsByRule",
+        "events:ListTagsForResource"
+      ],
+      "Resource": "arn:aws:events:us-west-2:123456789012:rule/aegc-*-trigger-*"
+    },
+    {
+      "Sid": "ListTriggerRules",
+      "Effect": "Allow",
+      "Action": [
+        "events:ListRules",
+        "secretsmanager:ListSecrets",
+        "sqs:ListQueues"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "TriggerFunctions",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:AddPermission",
+        "lambda:RemovePermission",
+        "lambda:GetPolicy",
+        "lambda:PutFunctionConcurrency",
+        "lambda:PutFunctionEventInvokeConfig",
+        "lambda:GetFunctionEventInvokeConfig"
+      ],
+      "Resource": "arn:aws:lambda:us-west-2:123456789012:function:aegc-*-trigger-*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/aegc:managed": "true"
+        }
+      }
+    },
+    {
+      "Sid": "CreateTriggerLoginsTagged",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:CreateSecret",
+        "secretsmanager:TagResource"
+      ],
+      "Resource": "arn:aws:secretsmanager:us-west-2:123456789012:secret:aegc-*-trigger-*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/aegc:managed": "true"
+        }
+      }
+    },
+    {
+      "Sid": "ChangeOwnedTriggerLogins",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:PutSecretValue",
+        "secretsmanager:DeleteSecret",
+        "secretsmanager:PutResourcePolicy"
+      ],
+      "Resource": "arn:aws:secretsmanager:us-west-2:123456789012:secret:aegc-*-trigger-*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/aegc:managed": "true"
+        }
+      }
+    },
+    {
+      "Sid": "TriggerDeadLetters",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:CreateQueue",
+        "sqs:TagQueue",
+        "sqs:ListQueueTags",
+        "sqs:GetQueueUrl",
+        "sqs:GetQueueAttributes",
+        "sqs:SetQueueAttributes",
+        "sqs:DeleteQueue"
+      ],
+      "Resource": "arn:aws:sqs:us-west-2:123456789012:aegc-*-trigger-*-dlq"
+    },
+    {
+      "Sid": "BucketEventBridgeDelivery",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetBucketNotification",
+        "s3:PutBucketNotification"
+      ],
+      "Resource": "arn:aws:s3:::*"
+    },
+    {
+      "Sid": "TriggerActivity",
+      "Effect": "Allow",
+      "Action": "cloudwatch:GetMetricData",
+      "Resource": "*"
     }
   ]
 }
@@ -1755,6 +1899,56 @@ deployer policy, to whoever deploys Lambda pools.
   `ListLambda`.
 - `aegc destroy` works without this policy, but leaves the Lambda pools' mappings, functions and
   function roles in place; see [Destroy a deployment](../how-to/operations.md#destroy-a-deployment).
+- The statements from `CreateTriggerRulesTagged` on are for [triggers](../how-to/triggers.md):
+  rules `aegc-*-trigger-*` created with the tag and changed or deleted only when they carry it;
+  the functions' invoke permission, reserved concurrency and failure destination; the stored
+  logins (created, replaced and deleted, never read: only the trigger's function reads its login);
+  the dead-letter queues; and `s3:GetBucketNotification` / `s3:PutBucketNotification` on any
+  bucket, for the read-merge that turns on EventBridge delivery. Your bucket's own policy still
+  decides: grant those two on your bucket if it restricts them.
+- `stop` and `resume` also disable and enable the trigger rules (`ChangeOwnedTriggerRules`).
+- `aegc destroy` without this policy leaves triggers in place and reports them as remaining.
+
+## Trigger role
+
+`aegc trigger create` creates `/aegc/aegc-<d>-trigger-<name>-<region>` for each
+[trigger](../how-to/triggers.md); its function runs with it. It trusts `lambda.amazonaws.com` for
+functions in the account only (`aws:SourceAccount`), and its inline policy `aegc-trigger` reads
+the trigger's own stored login, writes the function's log streams, and sends failed events to
+its dead-letter queue. It has no S3 access: the flow does the work, as you. For trigger `uploads`
+of deployment `e2e`:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadOwnLogin",
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "arn:aws:secretsmanager:us-west-2:123456789012:secret:aegc-e2e-trigger-uploads-??????"
+    },
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:us-west-2:123456789012:log-group:/aegc/e2e:*"
+    },
+    {
+      "Sid": "DeadLetters",
+      "Effect": "Allow",
+      "Action": "sqs:SendMessage",
+      "Resource": "arn:aws:sqs:us-west-2:123456789012:aegc-e2e-trigger-uploads-dlq"
+    }
+  ]
+}
+```
+
+The login's secret also has a resource policy that denies `secretsmanager:GetSecretValue` to every
+principal except this role.
 
 ## Function role
 
@@ -1865,7 +2059,8 @@ Its trust policy:
 schedules, unless the deployment has neither. It may only write the deployment's state parameter,
 update Auto Scaling groups tagged with the deployment, and update event source mappings that are
 tagged with the deployment and feed its functions (the `lease-<pool>` schedules of Lambda pools
-disable them). Every deploy rewrites its policy. Its trust policy:
+disable them), and disable [trigger](../how-to/triggers.md) rules tagged with the deployment (the
+`lease-trigger-<name>` schedules). Every deploy and `aegc trigger create` rewrites its policy. Its trust policy:
 
 ```json
 {
@@ -1918,6 +2113,16 @@ Its inline policy, `aegc-lease`:
         },
         "ArnLike": {
           "lambda:FunctionArn": "arn:aws:lambda:us-west-2:123456789012:function:aegc-e2e-*"
+        }
+      }
+    },
+    {
+      "Effect": "Allow",
+      "Action": "events:DisableRule",
+      "Resource": "arn:aws:events:us-west-2:123456789012:rule/aegc-e2e-trigger-*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/aegc:deployment": "e2e"
         }
       }
     }

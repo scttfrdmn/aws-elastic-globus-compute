@@ -708,7 +708,7 @@ def operator_policy(*, deployment: str, region: str, account: str, bucket: str) 
                 # `aegc status` finds result queues by name prefix. ListQueues has no resource.
                 "Sid": "FindResultQueues",
                 "Effect": "Allow",
-                "Action": ["sqs:ListQueues", "lambda:ListEventSourceMappings"],
+                "Action": ["sqs:ListQueues", "lambda:ListEventSourceMappings", "events:ListRules"],
                 "Resource": "*",
             },
             {
@@ -736,7 +736,64 @@ def operator_policy(*, deployment: str, region: str, account: str, bucket: str) 
                     f"arn:aws:lambda:{region}:{account}:event-source-mapping:*",
                 ],
             },
+            {
+                # S3-event triggers (#83): caps, stop and resume disable and enable their rules.
+                "Sid": "FreezeTriggers",
+                "Effect": "Allow",
+                "Action": ["events:EnableRule", "events:DisableRule", "events:DescribeRule"],
+                "Resource": f"arn:aws:events:{region}:{account}:rule/{naming.trigger_prefix(d)}*",
+                "Condition": {"StringEquals": {f"aws:ResourceTag/{naming.TAG_DEPLOYMENT}": d}},
+            },
             VCPU_QUOTA_STATEMENT,
+        ],
+    }
+
+
+TRIGGER_POLICY = "aegc-trigger"
+
+
+def trigger_trust_policy(account: str) -> dict[str, Any]:
+    """Lambda, for functions in this account only (as the lease role trusts Scheduler)."""
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"Service": "lambda.amazonaws.com"},
+                "Action": "sts:AssumeRole",
+                "Condition": {"StringEquals": {"aws:SourceAccount": account}},
+            }
+        ],
+    }
+
+
+def trigger_policy(*, deployment: str, name: str, region: str, account: str) -> dict[str, Any]:
+    """An S3-event trigger's function role (#83): read its own stored Globus login, write its
+    log streams, and send failed events to its dead-letter queue. No S3 data access: the flow
+    does the work, with the user's Globus identity."""
+    d = deployment
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "ReadOwnLogin",
+                "Effect": "Allow",
+                "Action": "secretsmanager:GetSecretValue",
+                "Resource": f"arn:aws:secretsmanager:{region}:{account}:secret:"
+                f"{naming.trigger_resource(d, name)}-??????",
+            },
+            {
+                "Sid": "Logs",
+                "Effect": "Allow",
+                "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+                "Resource": f"arn:aws:logs:{region}:{account}:log-group:{naming.log_group(d)}:*",
+            },
+            {
+                "Sid": "DeadLetters",
+                "Effect": "Allow",
+                "Action": "sqs:SendMessage",
+                "Resource": f"arn:aws:sqs:{region}:{account}:{naming.trigger_dlq(d, name)}",
+            },
         ],
     }
 
@@ -994,8 +1051,59 @@ def lambda_deployer_policy(*, region: str, account: str) -> dict[str, Any]:
                         "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer",
                         "ecr:DescribeImages"],
              "Resource": f"arn:aws:ecr:{r}:{a}:repository/{p}/*"},
+            *_trigger_deployer_statements(r, a),
         ],
     }  # fmt: skip
+
+
+def _trigger_deployer_statements(r: str, a: str) -> list[dict[str, Any]]:
+    """S3-event triggers (#83, ``aegc trigger``): their rules, the functions' invoke permission
+    and settings, the stored logins, dead-letter queues, and EventBridge delivery on the user's
+    buckets (read-merge; any bucket, so the user's own bucket policy decides)."""
+    p = naming.PREFIX
+    rules = f"arn:aws:events:{r}:{a}:rule/{p}-*-{naming.TRIGGER}-*"
+    functions = f"arn:aws:lambda:{r}:{a}:function:{p}-*-{naming.TRIGGER}-*"
+    secrets = f"arn:aws:secretsmanager:{r}:{a}:secret:{p}-*-{naming.TRIGGER}-*"
+    managed_req = {"StringEquals": {f"aws:RequestTag/{naming.TAG_MANAGED}": "true"}}
+    managed_res = {"StringEquals": {f"aws:ResourceTag/{naming.TAG_MANAGED}": "true"}}
+    return [
+        {"Sid": "CreateTriggerRulesTagged", "Effect": "Allow",
+         "Action": ["events:PutRule", "events:TagResource"], "Resource": rules,
+         "Condition": managed_req},
+        {"Sid": "ChangeOwnedTriggerRules", "Effect": "Allow",
+         "Action": ["events:PutRule", "events:DeleteRule", "events:PutTargets",
+                    "events:RemoveTargets", "events:EnableRule", "events:DisableRule"],
+         "Resource": rules, "Condition": managed_res},
+        {"Sid": "ReadTriggerRules", "Effect": "Allow",
+         "Action": ["events:DescribeRule", "events:ListTargetsByRule",
+                    "events:ListTagsForResource"],
+         "Resource": rules},
+        {"Sid": "ListTriggerRules", "Effect": "Allow",
+         "Action": ["events:ListRules", "secretsmanager:ListSecrets", "sqs:ListQueues"],
+         "Resource": "*"},
+        {"Sid": "TriggerFunctions", "Effect": "Allow",
+         "Action": ["lambda:AddPermission", "lambda:RemovePermission", "lambda:GetPolicy",
+                    "lambda:PutFunctionConcurrency", "lambda:PutFunctionEventInvokeConfig",
+                    "lambda:GetFunctionEventInvokeConfig"],
+         "Resource": functions, "Condition": managed_res},
+        {"Sid": "CreateTriggerLoginsTagged", "Effect": "Allow",
+         "Action": ["secretsmanager:CreateSecret", "secretsmanager:TagResource"],
+         "Resource": secrets, "Condition": managed_req},
+        # Never GetSecretValue: only the trigger's function reads the login.
+        {"Sid": "ChangeOwnedTriggerLogins", "Effect": "Allow",
+         "Action": ["secretsmanager:PutSecretValue", "secretsmanager:DeleteSecret",
+                    "secretsmanager:PutResourcePolicy"],
+         "Resource": secrets, "Condition": managed_res},
+        {"Sid": "TriggerDeadLetters", "Effect": "Allow",
+         "Action": ["sqs:CreateQueue", "sqs:TagQueue", "sqs:ListQueueTags", "sqs:GetQueueUrl",
+                    "sqs:GetQueueAttributes", "sqs:SetQueueAttributes", "sqs:DeleteQueue"],
+         "Resource": f"arn:aws:sqs:{r}:{a}:{p}-*-{naming.TRIGGER}-*-dlq"},
+        {"Sid": "BucketEventBridgeDelivery", "Effect": "Allow",
+         "Action": ["s3:GetBucketNotification", "s3:PutBucketNotification"],
+         "Resource": "arn:aws:s3:::*"},
+        {"Sid": "TriggerActivity", "Effect": "Allow", "Action": "cloudwatch:GetMetricData",
+         "Resource": "*"},
+    ]  # fmt: skip
 
 
 def bootstrap_policy(*, region: str, account: str) -> dict[str, Any]:

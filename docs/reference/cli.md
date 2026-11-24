@@ -252,7 +252,8 @@ aegc stop DEPLOYMENT [--hard] [--yes]
 ```
 
 Stop a deployment's spending now: set its state to `stopped`, every group's minimum to 0, and
-disable every Lambda pool's event source mapping. Queued tasks fail with `AEGC_STOPPED`, running
+disable every Lambda pool's event source mapping and every [trigger](../how-to/triggers.md)'s
+rule. Queued tasks fail with `AEGC_STOPPED`, running
 tasks finish (Lambda invocations always do, even with `--hard`), and workers leave their groups.
 Lambda pools need the [lambda-deployer](iam.md#lambda-deployer) policy here. See
 [Operations](../how-to/operations.md#stop-and-resume).
@@ -269,7 +270,8 @@ aegc resume DEPLOYMENT
 ```
 
 Resume a stopped, capped or expired deployment: set its state to `running`, restore each group's
-minimum, enable each Lambda pool's event source mapping, and push the lease forward.
+minimum, enable each Lambda pool's event source mapping and each trigger's rule, and push the
+lease forward.
 
 ## aegc limits
 
@@ -407,6 +409,31 @@ Delete the deployment's result queues that are empty and haven't been modified f
 | Option | Meaning |
 |---|---|
 | `--yes` | Actually delete (default: dry run) |
+
+## aegc trigger
+
+```
+aegc trigger login  DEPLOYMENT --name NAME --flow FLOW_ID [--client-id ID] [--dry-run]
+aegc trigger create DEPLOYMENT --name NAME --flow FLOW_ID --bucket BUCKET [--prefix P] [--suffix S]
+                    --input JSON [--package ZIP] [--dry-run]
+aegc trigger list   DEPLOYMENT
+aegc trigger delete DEPLOYMENT --name NAME [--yes]
+```
+
+S3-event triggers: start a Globus flow, as you, for each object created in your bucket. Needs the
+[lambda-deployer](iam.md#lambda-deployer) policy. See
+[Start a flow when a file lands in S3](../how-to/triggers.md).
+
+| Option | Meaning |
+|---|---|
+| `--name` | The trigger's name: 1–15 of `[a-z0-9-]`, from a letter |
+| `--flow` | The flow's id |
+| `--client-id` | `login`: your Globus native app's client id (or `AEGC_GLOBUS_CLIENT_ID`) |
+| `--bucket`, `--prefix`, `--suffix` | `create`: objects created in the bucket whose keys start and end so |
+| `--input` | `create`: the flow's input, a JSON object; string values may use `{bucket}`, `{key}`, `{size}`, `{etag}` (`"{size}"` alone becomes a number) |
+| `--package` | `create`: a prebuilt function package (default: build one with pip or uv) |
+| `--dry-run` | `login`, `create`: change nothing; say what would |
+| `--yes` | `delete`: actually delete (a dry run otherwise) |
 
 ## aegc iam-policy
 

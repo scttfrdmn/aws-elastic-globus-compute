@@ -75,19 +75,102 @@ def _owned(sm: Any, name: str, deployment: str) -> bool | None:
 def resource_policy(*, endpoint_role_arn: str) -> dict[str, Any]:
     """Only the endpoint host's role may read the login, whatever else IAM allows in the account
     (account-wide GetSecretValue, the endpoint-deployer policy...)."""
+    return reader_policy(endpoint_role_arn, sid="OnlyTheEndpointHost")
+
+
+def reader_policy(role_arn: str, *, sid: str) -> dict[str, Any]:
+    """A secret's resource policy: no principal but ``role_arn`` may read its value."""
     return {
         "Version": "2012-10-17",
         "Statement": [
             {
-                "Sid": "OnlyTheEndpointHost",
+                "Sid": sid,
                 "Effect": "Deny",
                 "Principal": "*",
                 "Action": "secretsmanager:GetSecretValue",
                 "Resource": "*",
-                "Condition": {"StringNotEquals": {"aws:PrincipalArn": endpoint_role_arn}},
+                "Condition": {"StringNotEquals": {"aws:PrincipalArn": role_arn}},
             }
         ],
     }
+
+
+def put_owned_secret(
+    sm: Any, *, name: str, deployment: str, value: str, role: str, description: str,
+    reader_role_arn: str, sid: str, report: Report, dry_run: bool, detail: str = "",
+    extra_tags: dict[str, str] | None = None,
+) -> str:  # fmt: skip
+    """Create or update an aegc secret readable by ``reader_role_arn`` only (tagged, with a hash
+    tag so an unchanged value isn't rewritten). Refuses one that isn't aegc's. Returns its ARN
+    (or the name, in a dry run)."""
+    import hashlib
+
+    if len(value.encode()) > MAX_SECRET_BYTES:
+        raise ValueError(
+            f"secret {name} would be {len(value.encode())} bytes; Secrets Manager allows "
+            f"{MAX_SECRET_BYTES}"
+        )
+    current = _describe(sm, name)
+    if current is not None and not naming.is_owned(
+        name, naming.tag_dict(current.get("Tags")), deployment
+    ):
+        raise OwnershipError(f"secret {name} exists but isn't tagged as {deployment}'s")
+    digest = hashlib.sha256(value.encode()).hexdigest()
+    tags = {**naming.tags(deployment, role, extra=extra_tags), TAG_LOGIN_HASH: digest}
+    outcome: Outcome
+    arn = str(current["ARN"]) if current else name
+    if current is None:
+        outcome = "would-create" if dry_run else "created"
+        if not dry_run:
+            arn = str(
+                sm.create_secret(
+                    Name=name, Description=description, SecretString=value,
+                    Tags=naming.tag_list(tags),
+                )["ARN"]
+            )  # fmt: skip
+    elif naming.tag_dict(current.get("Tags")).get(TAG_LOGIN_HASH) == digest:
+        outcome = "exists"
+    else:
+        outcome = "would-update" if dry_run else "updated"
+        if not dry_run:
+            sm.put_secret_value(SecretId=name, SecretString=value)
+            sm.tag_resource(SecretId=name, Tags=naming.tag_list(tags))
+    if not dry_run:
+        sm.put_resource_policy(
+            SecretId=name, ResourcePolicy=json.dumps(reader_policy(reader_role_arn, sid=sid))
+        )
+    report.add("secret", name, outcome, detail)
+    return arn
+
+
+def delete_owned_secret(
+    sm: Any, name: str, deployment: str, report: Report, *, dry_run: bool
+) -> None:
+    """Delete an aegc secret (no recovery window, so the name can be reused); others are kept."""
+    owned = _owned(sm, name, deployment)
+    if owned is None:
+        return
+    if owned is False:
+        report.add("secret", name, "kept", "not tagged as aegc's")
+        return
+    if not dry_run:
+        sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+    report.add("secret", name, "would-delete" if dry_run else "deleted")
+
+
+def owned_secrets(sm: Any, prefix: str, deployment: str) -> list[tuple[dict[str, Any], bool]]:
+    """Secrets whose name starts with ``prefix``, each with whether it's ``deployment``'s."""
+    out = []
+    for page in sm.get_paginator("list_secrets").paginate(
+        Filters=[{"Key": "name", "Values": [prefix]}]
+    ):
+        for s in page.get("SecretList", []):
+            name = str(s.get("Name", ""))
+            if name.startswith(prefix) and not s.get("DeletedDate"):
+                out.append(
+                    (dict(s), naming.is_owned(name, naming.tag_dict(s.get("Tags")), deployment))
+                )
+    return out
 
 
 def metadata(sm: Any, deployment: str) -> dict[str, str]:
@@ -197,16 +280,7 @@ def get_login(sm: Any, deployment: str) -> EndpointLogin:
 
 
 def delete_login(sm: Any, deployment: str, report: Report, *, dry_run: bool) -> None:
-    name = naming.endpoint_secret(deployment)
-    owned = _owned(sm, name, deployment)
-    if owned is None:
-        return
-    if owned is False:
-        report.add("secret", name, "kept", "not tagged as aegc's")
-        return
-    if not dry_run:
-        sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
-    report.add("secret", name, "would-delete" if dry_run else "deleted")
+    delete_owned_secret(sm, naming.endpoint_secret(deployment), deployment, report, dry_run=dry_run)
 
 
 def exists(sm: Any, deployment: str) -> bool:
