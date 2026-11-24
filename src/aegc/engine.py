@@ -189,6 +189,7 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
         #: Pool -> when a worker last said anything (started, result, failure) for one of this
         #: process's tasks there: a Lambda pool's stall breaker counts from it (#81).
         self._pool_progress: dict[str, float] = {}
+        self._triggers_checked = -1e18
         self._paused_until: dict[str, float] = {}
         self._starved_since: dict[str, float] = {}
         self._blocked_since: dict[str, float] = {}
@@ -218,7 +219,7 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
             sess = awsutil.session(self.aws_profile, self.region)
             self.region = self.region or (sess.region_name or "")
             for svc in ("sqs", "s3", "ssm", "autoscaling", "ec2", "scheduler", "lambda",
-                        "cloudwatch"):  # fmt: skip
+                        "cloudwatch", "events"):  # fmt: skip
                 if svc not in self._clients:  # tests inject clients before start()
                     self._clients[svc] = awsutil.client(sess, svc)
             if "pricing" not in self._clients:  # the Price List API lives in us-east-1
@@ -1100,11 +1101,32 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
             if lambda_pools.is_lambda(p) and n in snap.pools
         )
 
+    def _reconcile_triggers(self, now: float) -> None:
+        """S3-event triggers' rules follow the state too (#83), checked at most every minute
+        (one ListRules)."""
+        from aegc import triggers
+
+        events = self._clients.get("events")
+        if events is None or now - self._triggers_checked < 60:
+            return
+        self._triggers_checked = now
+        try:
+            _, changes = triggers.reconcile(
+                events, self.deployment, self._state.running,
+                confirm=lambda: self.refresh_state(now, force=True).running,
+            )  # fmt: skip
+        except Exception as e:
+            log.warning("couldn't check the S3-event triggers: %s", e)
+            return
+        for name, change in changes.items():
+            log.info("trigger %s: %s", name, change)
+
     def _reconcile_mappings(
         self, pools: dict[str, dict[str, Any]], snap: _Snapshot, now: float
     ) -> None:
         """Lambda pools' mappings follow the state: enabled while running, else disabled (a cap
         whose period ends reads as running with nobody to enable them)."""
+        self._reconcile_triggers(now)
         lam = self._clients.get("lambda")
         if lam is None or not lambda_pools.mappings(pools):
             return
@@ -1197,6 +1219,7 @@ class AWSEngine(GlobusComputeEngineBase):  # type: ignore[misc]
             by="engine",
             lam=self._clients.get("lambda"),
             mappings=lambda_pools.mappings(pools),
+            events=self._clients.get("events"),  # S3-event triggers (#83)
         )
         if error is not None:  # still stop this process's spending
             self._local_cap = st
